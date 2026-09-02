@@ -1,0 +1,41 @@
+{
+  "gateway": "http://127.0.0.1:19461",
+  "branch": "fix/webchat-omitted-image-placeholder",
+  "commit": "0643c6a0b7ae7bf9d3e4d3df3d1db9279fd45df1",
+  "assertions": {
+    "omittedNoUrl": {
+      "canonicalUrl": "http://127.0.0.1:19461/chat/main/omitted-no-url",
+      "placeholderCount": 1,
+      "text": "Image History · Omitted from history · 12 KB",
+      "containsImage": true,
+      "containsHistory": true,
+      "contains12KB": true,
+      "interactiveMediaCount": 0,
+      "pass": true
+    },
+    "retainedUrl": {
+      "canonicalUrl": "http://127.0.0.1:19461/chat/main/retained-url",
+      "retainedImageCount": 1,
+      "retainedImageSrcs": [
+        "http://127.0.0.1:19461/favicon.ico"
+      ],
+      "exactRetainedUrlCount": 1,
+      "omittedPlaceholderCount": 0,
+      "pass": true
+    }
+  },
+  "consoleErrors": [
+    "Failed to load resource: the server responded with a status of 404 (Not Found)",
+    "Failed to load resource: the server responded with a status of 404 (Not Found)"
+  ],
+  "httpErrors": [
+    {
+      "status": 404,
+      "url": "http://127.0.0.1:19461/__openclaw__/workspace-icon/agent%3Amain%3Aomitted-no-url"
+    },
+    {
+      "status": 404,
+      "url": "http://127.0.0.1:19461/__openclaw__/workspace-icon/agent%3Amain%3Aretained-url"
+    }
+  ]
+}
