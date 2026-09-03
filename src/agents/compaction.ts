@@ -18,6 +18,7 @@ import {
   computeAdaptiveChunkRatio,
   estimateMessagesTokens,
   MIN_CHUNK_RATIO,
+  resolveSummaryOutputTokens,
   SAFETY_MARGIN,
   SUMMARIZATION_OVERHEAD_TOKENS,
 } from "./compaction-planning.js";
@@ -120,10 +121,15 @@ async function summarizeChunks(params: CompactionSummaryParams): Promise<string>
     return params.previousSummary ?? DEFAULT_SUMMARY_FALLBACK;
   }
 
+  const summaryOutputTokens = resolveSummaryOutputTokens({
+    reserveTokens: params.reserveTokens,
+    modelMaxTokens: params.model.maxTokens,
+  });
   const chunks = await buildSummaryChunksWithWorker({
     messages: params.messages,
     maxChunkTokens: params.maxChunkTokens,
     contextWindow: params.contextWindow,
+    summaryOutputTokens,
     signal: params.signal,
   });
   let summary = params.previousSummary;
@@ -305,12 +311,17 @@ export async function summarizeInStages(
     return await summarizeWithFallback(params);
   }
 
+  const summaryOutputTokens = resolveSummaryOutputTokens({
+    reserveTokens: params.reserveTokens,
+    modelMaxTokens: params.model.maxTokens,
+  });
   const plan = await buildStageSplitPlanWithWorker({
     messages,
     maxChunkTokens: params.maxChunkTokens,
     parts: params.parts,
     minMessagesForSplit: params.minMessagesForSplit,
     contextWindow: params.contextWindow,
+    summaryOutputTokens,
     signal: params.signal,
   });
 

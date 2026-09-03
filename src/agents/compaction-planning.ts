@@ -226,11 +226,35 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
   return BASE_CHUNK_RATIO;
 }
 
+export function resolveSummaryOutputTokens(params: {
+  reserveTokens: number;
+  modelMaxTokens: number;
+}): number {
+  return Math.min(
+    Math.floor(0.8 * params.reserveTokens),
+    params.modelMaxTokens > 0 ? params.modelMaxTokens : Number.POSITIVE_INFINITY,
+  );
+}
+
+function fitsSingleSummarizationRequest(params: {
+  inputTokens: number;
+  contextWindow: number;
+  summaryOutputTokens?: number;
+}): boolean {
+  return (
+    params.inputTokens * SAFETY_MARGIN +
+      SUMMARIZATION_OVERHEAD_TOKENS +
+      (params.summaryOutputTokens ?? 0) <=
+    params.contextWindow
+  );
+}
+
 /** Builds sanitized chunks for summarization prompts. */
 export function buildSummaryChunks(params: {
   messages: AgentMessage[];
   maxChunkTokens: number;
   contextWindow?: number;
+  summaryOutputTokens?: number;
 }): AgentMessage[][] {
   // SECURITY: never feed toolResult.details or runtime-context transcript entries into summarization prompts.
   const safeMessages = sanitizeCompactionMessages(params.messages);
@@ -239,7 +263,13 @@ export function buildSummaryChunks(params: {
   // share; keep one chunk when the sanitized history fits the whole window.
   if (params.contextWindow !== undefined) {
     const totalTokens = perMessageTokens.reduce((sum, tokens) => sum + tokens, 0);
-    if (totalTokens * SAFETY_MARGIN + SUMMARIZATION_OVERHEAD_TOKENS <= params.contextWindow) {
+    if (
+      fitsSingleSummarizationRequest({
+        inputTokens: totalTokens,
+        contextWindow: params.contextWindow,
+        summaryOutputTokens: params.summaryOutputTokens,
+      })
+    ) {
       return safeMessages.length > 0 ? [safeMessages] : [];
     }
   }
@@ -293,6 +323,7 @@ export function buildStageSplitPlan(params: {
   parts?: number;
   minMessagesForSplit?: number;
   contextWindow?: number;
+  summaryOutputTokens?: number;
 }): StageSplitPlan {
   const minMessagesForSplit = Math.max(2, params.minMessagesForSplit ?? 4);
   const parts = normalizeCompactionParts(params.parts ?? DEFAULT_PARTS, params.messages.length);
@@ -311,7 +342,11 @@ export function buildStageSplitPlan(params: {
   // cold prefills and forfeits prefix-cache reuse for no budget benefit.
   if (
     params.contextWindow !== undefined &&
-    totalTokens * SAFETY_MARGIN + SUMMARIZATION_OVERHEAD_TOKENS <= params.contextWindow
+    fitsSingleSummarizationRequest({
+      inputTokens: totalTokens,
+      contextWindow: params.contextWindow,
+      summaryOutputTokens: params.summaryOutputTokens,
+    })
   ) {
     return { mode: "single" };
   }

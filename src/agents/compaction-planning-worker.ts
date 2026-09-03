@@ -87,6 +87,7 @@ export async function buildSummaryChunksWithWorker(params: {
   messages: AgentMessage[];
   maxChunkTokens: number;
   contextWindow?: number;
+  summaryOutputTokens?: number;
   signal?: AbortSignal;
 }): Promise<AgentMessage[][]> {
   const { signal, ...planningInput } = params;
@@ -124,6 +125,7 @@ export async function buildStageSplitPlanWithWorker(params: {
   parts?: number;
   minMessagesForSplit?: number;
   contextWindow?: number;
+  summaryOutputTokens?: number;
   signal?: AbortSignal;
 }): Promise<StageSplitPlan> {
   const { signal, ...planningInput } = params;

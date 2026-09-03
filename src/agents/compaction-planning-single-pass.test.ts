@@ -12,6 +12,7 @@ import type { AgentMessage } from "./runtime/index.js";
 
 // Mirrors the reported deployment: a 262K-window summarizer over a ~164K transcript.
 const LARGE_CONTEXT_WINDOW = 262_144;
+const LARGE_SUMMARY_OUTPUT_BUDGET = 65_536;
 
 function buildTranscript(messageCount: number, charsPerMessage: number): AgentMessage[] {
   return Array.from({ length: messageCount }, (_, index) => ({
@@ -52,6 +53,24 @@ describe("compaction single-pass fast path", () => {
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
       contextWindow: LARGE_CONTEXT_WINDOW,
+    });
+
+    expect(plan.mode).toBe("split");
+  });
+
+  it("splits when the generated summary would exceed the remaining window", () => {
+    const messages = buildTranscript(120, 5_500);
+    const totalTokens = estimateMessagesTokens(messages);
+    expect(totalTokens + SUMMARIZATION_OVERHEAD_TOKENS).toBeLessThan(LARGE_CONTEXT_WINDOW);
+    expect(
+      totalTokens * 1.2 + SUMMARIZATION_OVERHEAD_TOKENS + LARGE_SUMMARY_OUTPUT_BUDGET,
+    ).toBeGreaterThan(LARGE_CONTEXT_WINDOW);
+
+    const plan = buildStageSplitPlan({
+      messages,
+      maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
+      contextWindow: LARGE_CONTEXT_WINDOW,
+      summaryOutputTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
     });
 
     expect(plan.mode).toBe("split");
@@ -105,5 +124,18 @@ describe("single-pass chunk budget", () => {
       contextWindow: LARGE_CONTEXT_WINDOW,
     });
     expect(chunks).toHaveLength(1);
+  });
+
+  it("does not emit an over-budget single summarization chunk", () => {
+    const messages = buildTranscript(120, 5_500);
+    const maxChunkTokens = resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW);
+    const chunks = buildSummaryChunks({
+      messages,
+      maxChunkTokens,
+      contextWindow: LARGE_CONTEXT_WINDOW,
+      summaryOutputTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
+    });
+
+    expect(chunks.length).toBeGreaterThan(1);
   });
 });

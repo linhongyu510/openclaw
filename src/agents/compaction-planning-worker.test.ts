@@ -15,7 +15,11 @@ import {
   buildSummaryChunksWithWorker,
   computeAdaptiveChunkRatioWithWorker,
 } from "./compaction-planning-worker.js";
-import { buildSummaryChunks, estimateMessagesTokens } from "./compaction-planning.js";
+import {
+  buildSummaryChunks,
+  estimateMessagesTokens,
+  resolveSummaryOutputTokens,
+} from "./compaction-planning.js";
 import {
   type CompactionPlanningWorkerInput,
   runCompactionPlanningWorkerInput,
@@ -373,8 +377,13 @@ describe("compaction planning worker", () => {
 
     expect(summary).toBe("Compact summary.");
     expect(inputTokens.length).toBeGreaterThan(0);
-    expect(Math.max(...inputTokens)).toBeLessThanOrEqual(model.contextWindow);
-    expect(Math.max(...inputTokens)).toBeLessThanOrEqual(maxChunkTokens);
+    expect(
+      Math.max(...inputTokens) +
+        resolveSummaryOutputTokens({
+          reserveTokens: 4_096,
+          modelMaxTokens: model.maxTokens,
+        }),
+    ).toBeLessThanOrEqual(model.contextWindow);
     expect([...seen].toSorted()).toEqual(markers.toSorted());
     expect(omissionNotes).toBe(false);
     expect(summary).not.toMatch(/\[Large .*omitted from summary\]|\[Partial summary:/);
