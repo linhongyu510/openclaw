@@ -86,6 +86,7 @@ async function runCompactionPlan<TInput extends CompactionPlanningWorkerInput, T
 export async function buildSummaryChunksWithWorker(params: {
   messages: AgentMessage[];
   maxChunkTokens: number;
+  contextWindow?: number;
   signal?: AbortSignal;
 }): Promise<AgentMessage[][]> {
   const { signal, ...planningInput } = params;
@@ -122,6 +123,7 @@ export async function buildStageSplitPlanWithWorker(params: {
   maxChunkTokens: number;
   parts?: number;
   minMessagesForSplit?: number;
+  contextWindow?: number;
   signal?: AbortSignal;
 }): Promise<StageSplitPlan> {
   const { signal, ...planningInput } = params;

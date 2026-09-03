@@ -230,16 +230,22 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
 export function buildSummaryChunks(params: {
   messages: AgentMessage[];
   maxChunkTokens: number;
+  contextWindow?: number;
 }): AgentMessage[][] {
   // SECURITY: never feed toolResult.details or runtime-context transcript entries into summarization prompts.
   const safeMessages = sanitizeCompactionMessages(params.messages);
+  const perMessageTokens = estimatePerMessageTokens(safeMessages);
+  // A stage planned as single-pass must not be re-split here by the per-chunk
+  // share; keep one chunk when the sanitized history fits the whole window.
+  if (params.contextWindow !== undefined) {
+    const totalTokens = perMessageTokens.reduce((sum, tokens) => sum + tokens, 0);
+    if (totalTokens * SAFETY_MARGIN + SUMMARIZATION_OVERHEAD_TOKENS <= params.contextWindow) {
+      return safeMessages.length > 0 ? [safeMessages] : [];
+    }
+  }
   // The estimator can undercount Unicode/code tokens; indivisible tool batches may exceed this cap.
   const effectiveMax = Math.max(1, Math.floor(params.maxChunkTokens / SAFETY_MARGIN));
-  return chunkCompactionMessageGroups(
-    safeMessages,
-    effectiveMax,
-    estimatePerMessageTokens(safeMessages),
-  );
+  return chunkCompactionMessageGroups(safeMessages, effectiveMax, perMessageTokens);
 }
 
 /** Separates messages too large to summarize and emits compact placeholder notes for them. */
@@ -286,6 +292,7 @@ export function buildStageSplitPlan(params: {
   maxChunkTokens: number;
   parts?: number;
   minMessagesForSplit?: number;
+  contextWindow?: number;
 }): StageSplitPlan {
   const minMessagesForSplit = Math.max(2, params.minMessagesForSplit ?? 4);
   const parts = normalizeCompactionParts(params.parts ?? DEFAULT_PARTS, params.messages.length);
@@ -295,6 +302,16 @@ export function buildStageSplitPlan(params: {
     parts <= 1 ||
     params.messages.length < minMessagesForSplit ||
     totalTokens <= params.maxChunkTokens
+  ) {
+    return { mode: "single" };
+  }
+
+  // maxChunkTokens is a per-chunk share of the window, so it can force map-reduce
+  // even when one call would hold the whole history. Splitting then costs extra
+  // cold prefills and forfeits prefix-cache reuse for no budget benefit.
+  if (
+    params.contextWindow !== undefined &&
+    totalTokens * SAFETY_MARGIN + SUMMARIZATION_OVERHEAD_TOKENS <= params.contextWindow
   ) {
     return { mode: "single" };
   }

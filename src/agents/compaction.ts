@@ -123,6 +123,7 @@ async function summarizeChunks(params: CompactionSummaryParams): Promise<string>
   const chunks = await buildSummaryChunksWithWorker({
     messages: params.messages,
     maxChunkTokens: params.maxChunkTokens,
+    contextWindow: params.contextWindow,
     signal: params.signal,
   });
   let summary = params.previousSummary;
@@ -309,6 +310,7 @@ export async function summarizeInStages(
     maxChunkTokens: params.maxChunkTokens,
     parts: params.parts,
     minMessagesForSplit: params.minMessagesForSplit,
+    contextWindow: params.contextWindow,
     signal: params.signal,
   });
 
