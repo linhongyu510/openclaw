@@ -60,18 +60,26 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
     const maxResults = opts?.maxResults ?? this.settings.query.maxResults;
     const minScore = opts?.minScore ?? this.settings.query.minScore;
     const hasActiveProject = (opts?.activeProjectKeys?.length ?? 0) > 0;
+    // Fusion ranks only what the retrieval window already fetched, so a window that
+    // shrinks with the requested count changes which candidates compete and can make
+    // top-1 worse than the first row of a wider request. Floor the window at the
+    // configured default before project expansion, then trim to the caller's count.
+    const windowResults = Math.max(maxResults, this.settings.query.maxResults);
     const candidateMaxResults = hasActiveProject
-      ? Math.min(200, Math.max(maxResults, maxResults * 4))
-      : maxResults;
+      ? Math.min(200, windowResults * 4)
+      : windowResults;
     const candidateMinScore = hasActiveProject ? minScore / 1.15 : minScore;
     const results = await this.searchCandidates(normalizedQuery, {
       ...opts,
       maxResults: candidateMaxResults,
       minScore: candidateMinScore,
     });
+    // Only the project path relaxed minScore for retrieval, so only it re-applies the
+    // caller's threshold. Other callers keep the lexical-supplement rows that hybrid
+    // selection intentionally admits below it.
     return hasActiveProject
       ? results.filter((entry) => entry.score >= minScore).slice(0, maxResults)
-      : results;
+      : results.slice(0, maxResults);
   }
 
   private async searchCandidates(
@@ -267,16 +275,9 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
       // every other caller defaults to the configured search corpus.
       const sourceFilterList = searchSources ?? this.settings.searchSources;
       const hybrid = this.settings.query.hybrid;
-      // Both retrieval legs are capped by this pool, and fusion runs after it, so a
-      // pool that shrinks with the requested count hides chunks that only become
-      // top-ranked once vector and keyword scores combine: top-1 then differs from
-      // the first row of a wider request. Floor the pool at what the configured
-      // default result count already retrieves, so an explicit small-k caller ranks
-      // over the same candidates as the default path without widening worst-case cost.
-      const poolResults = Math.max(maxResults, this.settings.query.maxResults);
       const candidates = Math.min(
         200,
-        Math.max(1, Math.floor(poolResults * hybrid.candidateMultiplier)),
+        Math.max(1, Math.floor(maxResults * hybrid.candidateMultiplier)),
       );
 
       // FTS-only mode: no embedding provider available
