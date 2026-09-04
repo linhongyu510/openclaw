@@ -1,3 +1,4 @@
+import { resolveSummaryOutputTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import { CompactionError } from "../../packages/agent-core/src/harness/types.js";
 /**
  * Summarization and fallback helpers for transcript compaction.
@@ -18,7 +19,6 @@ import {
   computeAdaptiveChunkRatio,
   estimateMessagesTokens,
   MIN_CHUNK_RATIO,
-  resolveSummaryOutputTokens,
   SAFETY_MARGIN,
   SUMMARIZATION_OVERHEAD_TOKENS,
 } from "./compaction-planning.js";

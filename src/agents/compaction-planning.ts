@@ -226,16 +226,6 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
   return BASE_CHUNK_RATIO;
 }
 
-export function resolveSummaryOutputTokens(params: {
-  reserveTokens: number;
-  modelMaxTokens: number;
-}): number {
-  return Math.min(
-    Math.floor(0.8 * params.reserveTokens),
-    params.modelMaxTokens > 0 ? params.modelMaxTokens : Number.POSITIVE_INFINITY,
-  );
-}
-
 function fitsSingleSummarizationRequest(params: {
   inputTokens: number;
   contextWindow: number;

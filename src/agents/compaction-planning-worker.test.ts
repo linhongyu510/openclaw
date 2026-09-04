@@ -3,7 +3,10 @@ import { createAssistantMessageEventStream } from "@openclaw/llm-core";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { serializeConversation } from "openclaw/plugin-sdk/agent-core";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
+import {
+  estimateTokens,
+  resolveSummaryOutputTokens,
+} from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import * as compactionPlanningWorkerRuntime from "./compaction-planning-worker-runtime.js";
 import {
   CompactionPlanningWorkerError,
@@ -15,11 +18,7 @@ import {
   buildSummaryChunksWithWorker,
   computeAdaptiveChunkRatioWithWorker,
 } from "./compaction-planning-worker.js";
-import {
-  buildSummaryChunks,
-  estimateMessagesTokens,
-  resolveSummaryOutputTokens,
-} from "./compaction-planning.js";
+import { buildSummaryChunks, estimateMessagesTokens } from "./compaction-planning.js";
 import {
   type CompactionPlanningWorkerInput,
   runCompactionPlanningWorkerInput,
