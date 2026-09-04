@@ -253,29 +253,16 @@ function fitsSingleSummarizationRequest(params: {
 export function buildSummaryChunks(params: {
   messages: AgentMessage[];
   maxChunkTokens: number;
-  contextWindow?: number;
-  summaryOutputTokens?: number;
 }): AgentMessage[][] {
   // SECURITY: never feed toolResult.details or runtime-context transcript entries into summarization prompts.
   const safeMessages = sanitizeCompactionMessages(params.messages);
-  const perMessageTokens = estimatePerMessageTokens(safeMessages);
-  // A stage planned as single-pass must not be re-split here by the per-chunk
-  // share; keep one chunk when the sanitized history fits the whole window.
-  if (params.contextWindow !== undefined) {
-    const totalTokens = perMessageTokens.reduce((sum, tokens) => sum + tokens, 0);
-    if (
-      fitsSingleSummarizationRequest({
-        inputTokens: totalTokens,
-        contextWindow: params.contextWindow,
-        summaryOutputTokens: params.summaryOutputTokens,
-      })
-    ) {
-      return safeMessages.length > 0 ? [safeMessages] : [];
-    }
-  }
   // The estimator can undercount Unicode/code tokens; indivisible tool batches may exceed this cap.
   const effectiveMax = Math.max(1, Math.floor(params.maxChunkTokens / SAFETY_MARGIN));
-  return chunkCompactionMessageGroups(safeMessages, effectiveMax, perMessageTokens);
+  return chunkCompactionMessageGroups(
+    safeMessages,
+    effectiveMax,
+    estimatePerMessageTokens(safeMessages),
+  );
 }
 
 /** Separates messages too large to summarize and emits compact placeholder notes for them. */

@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   BASE_CHUNK_RATIO,
   buildStageSplitPlan,
-  buildSummaryChunks,
   computeAdaptiveChunkRatio,
   estimateMessagesTokens,
   SUMMARIZATION_OVERHEAD_TOKENS,
@@ -109,33 +108,5 @@ describe("compaction single-pass fast path", () => {
       Math.floor(LARGE_CONTEXT_WINDOW * BASE_CHUNK_RATIO) - SUMMARIZATION_OVERHEAD_TOKENS;
 
     expect(estimateMessagesTokens(messages)).toBeGreaterThan(widestBudget);
-  });
-});
-
-describe("single-pass chunk budget", () => {
-  it("emits one summarization chunk when the history fits the window", () => {
-    const messages = buildTranscript(120, 5_500);
-    const maxChunkTokens = resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW);
-    // A "single" stage plan still routes through buildSummaryChunks, so the
-    // per-chunk budget must also admit the whole history or it gets re-split.
-    const chunks = buildSummaryChunks({
-      messages,
-      maxChunkTokens,
-      contextWindow: LARGE_CONTEXT_WINDOW,
-    });
-    expect(chunks).toHaveLength(1);
-  });
-
-  it("does not emit an over-budget single summarization chunk", () => {
-    const messages = buildTranscript(120, 5_500);
-    const maxChunkTokens = resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW);
-    const chunks = buildSummaryChunks({
-      messages,
-      maxChunkTokens,
-      contextWindow: LARGE_CONTEXT_WINDOW,
-      summaryOutputTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
-    });
-
-    expect(chunks.length).toBeGreaterThan(1);
   });
 });

@@ -88,6 +88,7 @@ type CompactionSummaryParams = {
   thinkingLevel?: ThinkingLevel;
   streamFn?: StreamFn;
   usageSink?: SessionModelUsageSink;
+  singlePass?: boolean;
 };
 
 function resolveIdentifierPreservationInstructions(
@@ -121,15 +122,9 @@ async function summarizeChunks(params: CompactionSummaryParams): Promise<string>
     return params.previousSummary ?? DEFAULT_SUMMARY_FALLBACK;
   }
 
-  const summaryOutputTokens = resolveSummaryOutputTokens({
-    reserveTokens: params.reserveTokens,
-    modelMaxTokens: params.model.maxTokens,
-  });
   const chunks = await buildSummaryChunksWithWorker({
     messages: params.messages,
-    maxChunkTokens: params.maxChunkTokens,
-    contextWindow: params.contextWindow,
-    summaryOutputTokens,
+    maxChunkTokens: params.singlePass ? Number.MAX_SAFE_INTEGER : params.maxChunkTokens,
     signal: params.signal,
   });
   let summary = params.previousSummary;
@@ -326,7 +321,7 @@ export async function summarizeInStages(
   });
 
   if (plan.mode === "single") {
-    return await summarizeWithFallback(params);
+    return await summarizeWithFallback({ ...params, singlePass: true });
   }
 
   const partialSummaries: string[] = [];
