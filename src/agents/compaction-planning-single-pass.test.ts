@@ -1,5 +1,6 @@
 // Compaction must not force map-reduce when the whole history fits one summarizer call.
 import { describe, expect, it } from "vitest";
+import { resolveSummaryOutputTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import {
   BASE_CHUNK_RATIO,
   buildStageSplitPlan,
@@ -27,6 +28,11 @@ function resolveMaxChunkTokens(messages: AgentMessage[], contextWindow: number):
 }
 
 describe("compaction single-pass fast path", () => {
+  it("uses the completion owner's generated-summary budget", () => {
+    expect(resolveSummaryOutputTokens({ reserveTokens: 100, modelMaxTokens: 64 })).toBe(64);
+    expect(resolveSummaryOutputTokens({ reserveTokens: 100, modelMaxTokens: 0 })).toBe(80);
+  });
+
   it("summarizes in one call when the whole history fits the summarizer window", () => {
     const messages = buildTranscript(120, 5_500);
     const totalTokens = estimateMessagesTokens(messages);

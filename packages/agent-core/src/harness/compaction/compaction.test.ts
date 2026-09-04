@@ -12,7 +12,6 @@ import {
   generateSummary,
   getLastAssistantUsage,
   prepareCompaction,
-  resolveSummaryOutputTokens,
   shouldCompact,
 } from "./compaction.js";
 import { createFileOps } from "./utils.js";
@@ -98,16 +97,6 @@ function createProjectedEntry(
     ? { ...common, type, customType: "test", content, display: true }
     : { ...common, type, fromId: common.parentId ?? common.id, summary: content };
 }
-
-describe("resolveSummaryOutputTokens", () => {
-  it("caps generated summary output at the model limit", () => {
-    expect(resolveSummaryOutputTokens({ reserveTokens: 100, modelMaxTokens: 64 })).toBe(64);
-  });
-
-  it("uses the reserve budget when the model has no finite output limit", () => {
-    expect(resolveSummaryOutputTokens({ reserveTokens: 100, modelMaxTokens: 0 })).toBe(80);
-  });
-});
 
 describe("shouldCompact", () => {
   it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
