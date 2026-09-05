@@ -308,8 +308,18 @@ describe("single-pass framing cost per role", () => {
       content: "ok",
       timestamp: 1_000 + index,
     })) as AgentMessage[];
-    const asAssistant = asUser.map((message) => ({ ...message, role: "assistant" }));
-    // 24,576 sits between the two: user framing needs ~21,920, assistant ~27,920.
+    // Assistant content must be blocks: the estimator counts zero tokens for a
+    // string, which would let the legacy totalTokens shortcut answer before any
+    // framing is evaluated and make the assertion vacuous.
+    const asAssistant = asUser.map((message) => ({
+      ...message,
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+    })) as AgentMessage[];
+    // maxChunkTokens stays below the 4,000-token content estimate so the legacy
+    // totalTokens shortcut cannot answer before the fit check runs; verified by probe
+    // that both roles reach the fit branch. 24,576 then separates them: the user
+    // history is approved and the assistant history is declined purely on framing.
     const window = 24_576;
 
     // Same content, same count: only the role labels differ, and [Assistant]:
