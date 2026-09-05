@@ -137,7 +137,8 @@ export async function buildStageSplitPlanWithWorker(params: {
             mode: "split",
             chunks: value.chunkIndexes.map((indexes) => restoreIndexedMessages(messages, indexes)),
           }
-        : { mode: "single" },
+        : // Dropping this flag here would silently re-bound a verified single-pass plan.
+          { mode: "single", fitsWholeRequest: value.fitsWholeRequest },
   });
 }
 

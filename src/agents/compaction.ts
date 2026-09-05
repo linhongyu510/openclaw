@@ -321,7 +321,9 @@ export async function summarizeInStages(
   });
 
   if (plan.mode === "single") {
-    return await summarizeWithFallback({ ...params, singlePass: true });
+    // Only a verified whole-request fit may bypass the chunk budget; the planner's
+    // legacy single-stage shortcuts still need bounded requests.
+    return await summarizeWithFallback({ ...params, singlePass: plan.fitsWholeRequest === true });
   }
 
   const partialSummaries: string[] = [];

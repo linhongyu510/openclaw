@@ -32,6 +32,10 @@ export const SUMMARIZATION_OVERHEAD_TOKENS = 4096;
 export type StageSplitPlan =
   | {
       mode: "single";
+      // True only when the whole history was verified to fit one request. Legacy
+      // single-stage shortcuts (too few messages, parts<=1) leave this false and
+      // must keep their bounded chunk budget.
+      fitsWholeRequest?: boolean;
     }
   | {
       mode: "split";
@@ -311,7 +315,9 @@ export function buildStageSplitPlan(params: {
     params.messages.length < minMessagesForSplit ||
     totalTokens <= params.maxChunkTokens
   ) {
-    return { mode: "single" };
+    // These shortcuts predate the fit check and say nothing about window capacity,
+    // so callers must keep chunking within maxChunkTokens.
+    return { mode: "single", fitsWholeRequest: false };
   }
 
   // maxChunkTokens is a per-chunk share of the window, so it can force map-reduce
@@ -325,13 +331,15 @@ export function buildStageSplitPlan(params: {
       summaryOutputTokens: params.summaryOutputTokens,
     })
   ) {
-    return { mode: "single" };
+    return { mode: "single", fitsWholeRequest: true };
   }
 
   const chunks = splitMessagesByTokenShare(params.messages, parts).filter(
     (chunk) => chunk.length > 0,
   );
-  return chunks.length > 1 ? { mode: "split", chunks } : { mode: "single" };
+  return chunks.length > 1
+    ? { mode: "split", chunks }
+    : { mode: "single", fitsWholeRequest: false };
 }
 
 /** Drops oldest token-share chunks until history fits the requested context share. */

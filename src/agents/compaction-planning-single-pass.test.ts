@@ -4,10 +4,11 @@ import { resolveSummaryOutputTokens } from "../../packages/agent-core/src/harnes
 import {
   BASE_CHUNK_RATIO,
   buildStageSplitPlan,
-  computeAdaptiveChunkRatio,
   estimateMessagesTokens,
+  computeAdaptiveChunkRatio,
   SUMMARIZATION_OVERHEAD_TOKENS,
 } from "./compaction-planning.js";
+import { runCompactionPlanningWorkerInput } from "./compaction-planning.worker.js";
 import type { AgentMessage } from "./runtime/index.js";
 
 // Mirrors the reported deployment: a 262K-window summarizer over a ~164K transcript.
@@ -114,5 +115,73 @@ describe("compaction single-pass fast path", () => {
       Math.floor(LARGE_CONTEXT_WINDOW * BASE_CHUNK_RATIO) - SUMMARIZATION_OVERHEAD_TOKENS;
 
     expect(estimateMessagesTokens(messages)).toBeGreaterThan(widestBudget);
+  });
+});
+
+describe("single-pass budget gating", () => {
+  it("does not lift the chunk budget for the small-message shortcut", () => {
+    // Three ~25K messages against a 65,536-token summarizer: the transcript does
+    // NOT fit, but messages.length < minMessagesForSplit already returned "single"
+    // before any fit check. Lifting the chunk cap here sends ~75K in one request.
+    const smallWindow = 65_536;
+    const messages = buildTranscript(3, 200_000);
+    const totalTokens = estimateMessagesTokens(messages);
+    expect(messages).toHaveLength(3);
+    expect(totalTokens).toBeGreaterThan(smallWindow);
+
+    const plan = buildStageSplitPlan({
+      messages,
+      maxChunkTokens: resolveMaxChunkTokens(messages, smallWindow),
+      contextWindow: smallWindow,
+      summaryOutputTokens: 0,
+    });
+
+    // The planner must tell callers whether the whole request was verified to fit,
+    // so a legacy single-stage shortcut keeps its bounded chunk budget.
+    expect(plan.mode).toBe("single");
+    expect((plan as { fitsWholeRequest?: boolean }).fitsWholeRequest ?? false).toBe(false);
+  });
+
+  it("marks a verified whole-request fit", () => {
+    const messages = buildTranscript(120, 5_500);
+    const plan = buildStageSplitPlan({
+      messages,
+      maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
+      contextWindow: LARGE_CONTEXT_WINDOW,
+      summaryOutputTokens: 0,
+    });
+
+    expect(plan.mode).toBe("single");
+    expect((plan as { fitsWholeRequest?: boolean }).fitsWholeRequest).toBe(true);
+  });
+});
+
+describe("single-pass plan serialization", () => {
+  it("survives the worker round trip", () => {
+    // The worker returns indexes, not messages, so the flag must be serialized
+    // explicitly or a verified single-pass plan silently becomes bounded again.
+    const messages = buildTranscript(120, 5_500);
+    const value = runCompactionPlanningWorkerInput({
+      kind: "stageSplit",
+      messages,
+      maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
+      contextWindow: LARGE_CONTEXT_WINDOW,
+      summaryOutputTokens: 0,
+    });
+
+    expect(value).toMatchObject({ kind: "stageSplit", mode: "single", fitsWholeRequest: true });
+  });
+
+  it("does not mark the small-message shortcut as a verified fit", () => {
+    const messages = buildTranscript(3, 200_000);
+    const value = runCompactionPlanningWorkerInput({
+      kind: "stageSplit",
+      messages,
+      maxChunkTokens: resolveMaxChunkTokens(messages, 65_536),
+      contextWindow: 65_536,
+      summaryOutputTokens: 0,
+    });
+
+    expect(value).toMatchObject({ kind: "stageSplit", mode: "single", fitsWholeRequest: false });
   });
 });
