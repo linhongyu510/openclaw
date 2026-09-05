@@ -6,6 +6,7 @@ import {
   buildStageSplitPlan,
   estimateMessagesTokens,
   computeAdaptiveChunkRatio,
+  SAFETY_MARGIN,
   SUMMARIZATION_OVERHEAD_TOKENS,
 } from "./compaction-planning.js";
 import { runCompactionPlanningWorkerInput } from "./compaction-planning.worker.js";
@@ -183,5 +184,56 @@ describe("single-pass plan serialization", () => {
     });
 
     expect(value).toMatchObject({ kind: "stageSplit", mode: "single", fitsWholeRequest: false });
+  });
+});
+
+describe("single-pass serialization overhead", () => {
+  // Per-message role labels and separators are invisible to estimateTokens() but
+  // real in the request: 10,000 two-character messages estimate at 10,000 tokens
+  // and serialize to 36,250.
+  function buildShortMessages(pairs: number): AgentMessage[] {
+    return Array.from({ length: pairs * 2 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: "ok",
+      timestamp: 1_000 + index,
+    })) as AgentMessage[];
+  }
+
+  it("declines a whole-history request that only fits before serialization", () => {
+    const messages = buildShortMessages(7_000);
+    const contextWindow = 32_768;
+    const summaryOutputTokens = 4_096;
+    const contentEstimate = estimateMessagesTokens(messages);
+
+    // The content estimate alone clears the window with room to spare.
+    expect(
+      contentEstimate * SAFETY_MARGIN + SUMMARIZATION_OVERHEAD_TOKENS + summaryOutputTokens,
+    ).toBeLessThan(contextWindow);
+
+    // Keep the chunk budget under the transcript so the legacy shortcut cannot
+    // answer first and the fit check is the branch under test.
+    const plan = buildStageSplitPlan({
+      messages,
+      maxChunkTokens: 2_048,
+      contextWindow,
+      summaryOutputTokens,
+    });
+
+    // Serialized, the same history overflows, so chunking must stay bounded.
+    expect(plan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
+  });
+
+  it("still approves a history that fits once serialization is counted", () => {
+    const messages = buildShortMessages(200);
+    // Below maxChunkTokens the legacy shortcut answers first, so keep the chunk
+    // budget under the transcript to exercise the fit check itself.
+    const plan = buildStageSplitPlan({
+      messages,
+      maxChunkTokens: 64,
+      contextWindow: LARGE_CONTEXT_WINDOW,
+      summaryOutputTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
+    });
+
+    expect(plan).toMatchObject({ mode: "single", fitsWholeRequest: true });
   });
 });

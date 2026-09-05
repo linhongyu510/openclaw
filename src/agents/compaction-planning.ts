@@ -4,6 +4,11 @@
  * while splitting history for summaries.
  */
 import { estimateTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
+import { serializeConversation } from "../../packages/agent-core/src/harness/compaction/utils.js";
+import {
+  convertToLlm,
+  type HarnessMessage,
+} from "../../packages/agent-core/src/harness/messages.js";
 import { createToolCallOccurrenceQueue } from "../../packages/agent-core/src/harness/session/tool-result-pairing.js";
 import {
   projectCompactionPlanningMessages,
@@ -21,6 +26,8 @@ export const MIN_CHUNK_RATIO = 0.15;
 /** Buffer for estimateTokens() inaccuracy. */
 export const SAFETY_MARGIN = 1.2;
 const DEFAULT_PARTS = 2;
+/** Matches the estimator's chars-per-token ratio so both sides stay comparable. */
+const CHARS_PER_TOKEN = 4;
 
 /**
  * Overhead reserved for summary prompt, system prompt, prior summary, wrapper
@@ -230,6 +237,18 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
   return BASE_CHUNK_RATIO;
 }
 
+/**
+ * Estimates the prompt the summarizer will actually send. Per-message role labels
+ * and separators are pure overhead that estimateTokens() never sees, and on short
+ * conversations they dominate: 10,000 "ok" messages estimate at 10,000 tokens but
+ * serialize to 36,250, so approving a whole-history request on the content
+ * estimate alone can overflow the window.
+ */
+function estimateSerializedRequestTokens(messages: AgentMessage[]): number {
+  const serialized = serializeConversation(convertToLlm(messages as HarnessMessage[]));
+  return Math.ceil(serialized.length / CHARS_PER_TOKEN);
+}
+
 function fitsSingleSummarizationRequest(params: {
   inputTokens: number;
   contextWindow: number;
@@ -326,7 +345,9 @@ export function buildStageSplitPlan(params: {
   if (
     params.contextWindow !== undefined &&
     fitsSingleSummarizationRequest({
-      inputTokens: totalTokens,
+      // Measure the serialized prompt, not the content estimate: short-message
+      // histories carry enough per-message overhead to overflow on their own.
+      inputTokens: Math.max(totalTokens, estimateSerializedRequestTokens(params.messages)),
       contextWindow: params.contextWindow,
       summaryOutputTokens: params.summaryOutputTokens,
     })
