@@ -329,3 +329,73 @@ describe("single-pass framing cost per role", () => {
     expect(assistantPlan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
   });
 });
+
+describe("single-pass framing for combined assistant turns", () => {
+  // serializeConversation emits [Assistant]: and [Assistant tool calls]: as two
+  // separate sections, so a turn carrying text and calls costs both frames.
+  function buildToolTurns(turns: number): AgentMessage[] {
+    const messages: AgentMessage[] = [];
+    for (let index = 0; index < turns; index += 1) {
+      messages.push({
+        role: "assistant",
+        content: [
+          { type: "text", text: "abcdefghijklmnopqrst" },
+          { type: "toolCall", id: `call-${index}`, name: "f", input: {} },
+        ],
+        timestamp: 1_000 + index * 2,
+      } as unknown as AgentMessage);
+      messages.push({
+        role: "toolResult",
+        content: [{ type: "text", text: "abcdefghijklmnopqrst" }],
+        toolCallId: `call-${index}`,
+        timestamp: 1_001 + index * 2,
+      } as unknown as AgentMessage);
+    }
+    return messages;
+  }
+
+  it("declines a tool-heavy history that only fits when one frame is ignored", () => {
+    // Charging one assistant frame needs ~61,000 tokens here; charging both needs
+    // ~76,600. A 65,536 window is approved by the former and must be declined by
+    // the latter.
+    const plan = buildStageSplitPlan({
+      messages: buildToolTurns(2_000),
+      maxChunkTokens: 8_192,
+      contextWindow: 65_536,
+      summaryOutputTokens: 6_553,
+    });
+
+    expect(plan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
+  });
+
+  it("charges a text-and-calls turn more than a text-only turn", () => {
+    const withCalls = buildToolTurns(1_200);
+    const textOnly = withCalls.map((message) =>
+      (message as { role?: string }).role === "assistant"
+        ? {
+            ...message,
+            content: [{ type: "text", text: "abcdefghijklmnopqrst" }],
+          }
+        : message,
+    ) as AgentMessage[];
+    // 36,864 sits between the two: text-only needs ~32,064, text+calls ~41,424.
+    const window = 36_864;
+
+    expect(
+      buildStageSplitPlan({
+        messages: textOnly,
+        maxChunkTokens: 4_096,
+        contextWindow: window,
+        summaryOutputTokens: 2_048,
+      }),
+    ).toMatchObject({ mode: "single", fitsWholeRequest: true });
+    expect(
+      buildStageSplitPlan({
+        messages: withCalls,
+        maxChunkTokens: 4_096,
+        contextWindow: window,
+        summaryOutputTokens: 2_048,
+      }),
+    ).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
+  });
+});

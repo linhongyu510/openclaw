@@ -25,12 +25,15 @@ const DEFAULT_PARTS = 2;
 const CHARS_PER_TOKEN = 4;
 /** Measured cost of the role label and separator serializeConversation() adds. */
 /**
- * Exact serialization framing per message, mirroring serializeConversation():
- * `[User]: ` is 8 chars, `[Tool result]: ` is 15, `[Assistant]: ` is 13, and
- * every entry is joined by a 2-char separator.
+ * Exact serialization framing per emitted section, mirroring serializeConversation():
+ * `[User]: ` is 8 chars, `[Tool result]: ` is 15, `[Assistant]: ` is 13 and
+ * `[Assistant tool calls]: ` is 24. Every section is joined by a 2-char separator,
+ * and one assistant message emits *both* assistant sections when the turn carries
+ * text and tool calls together.
  */
 const SERIALIZED_FRAMING_CHARS = {
   assistant: 13 + 2,
+  assistantToolCalls: 24 + 2,
   toolResult: 15 + 2,
   user: 8 + 2,
 } as const;
@@ -261,7 +264,21 @@ function estimateSerializationOverheadTokens(messages: AgentMessage[]): number {
   for (const message of messages) {
     const role = (message as { role?: string }).role;
     if (role === "assistant") {
-      chars += SERIALIZED_FRAMING_CHARS.assistant;
+      // One assistant turn can emit two sections, so charge whichever it will emit.
+      const blocks = (message as { content?: unknown }).content;
+      const parts = Array.isArray(blocks) ? blocks : [];
+      const hasToolCalls = parts.some(
+        (block) => (block as { type?: string })?.type === "toolCall",
+      );
+      const hasText = parts.length === 0 || !hasToolCalls
+        ? true
+        : parts.some((block) => (block as { type?: string })?.type === "text");
+      if (hasText) {
+        chars += SERIALIZED_FRAMING_CHARS.assistant;
+      }
+      if (hasToolCalls) {
+        chars += SERIALIZED_FRAMING_CHARS.assistantToolCalls;
+      }
     } else if (role === "toolResult") {
       chars += SERIALIZED_FRAMING_CHARS.toolResult;
     } else {
