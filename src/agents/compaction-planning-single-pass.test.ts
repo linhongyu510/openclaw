@@ -5,6 +5,7 @@ import {
   BASE_CHUNK_RATIO,
   buildStageSplitPlan,
   estimateMessagesTokens,
+  projectCompactionMessagesForPlanning,
   computeAdaptiveChunkRatio,
   SAFETY_MARGIN,
   SUMMARIZATION_OVERHEAD_TOKENS,
@@ -235,5 +236,45 @@ describe("single-pass serialization overhead", () => {
     });
 
     expect(plan).toMatchObject({ mode: "single", fitsWholeRequest: true });
+  });
+});
+
+describe("single-pass overhead across the worker projection", () => {
+  // Histories at or above the worker threshold reach the planner already
+  // shortened, so serialization overhead has to be derived from the message
+  // count rather than measured on the projected text.
+  it("keeps counting per-message overhead when the projection truncates content", () => {
+    const messages = Array.from({ length: 20_000 }, (_, index) => ({
+      role: "user",
+      content: `${index}`.padStart(6, "0").padEnd(20, "x"),
+      timestamp: 1_000 + index,
+    })) as AgentMessage[];
+    const projected = projectCompactionMessagesForPlanning(messages);
+    const contextWindow = 131_072;
+    const summaryOutputTokens = 6_553;
+
+    // The projection really does shorten the transcript it hands the planner.
+    const projectedChars = projected.reduce(
+      (sum, message) => sum + JSON.stringify(message.content ?? "").length,
+      0,
+    );
+    const originalChars = messages.reduce(
+      (sum, message) => sum + JSON.stringify(message.content ?? "").length,
+      0,
+    );
+    expect(projectedChars).toBeLessThan(originalChars);
+
+    // Keep the chunk budget under the transcript so the legacy shortcut cannot
+    // answer first; the fit check is the branch under test.
+    const plan = buildStageSplitPlan({
+      messages: projected,
+      maxChunkTokens: 32_768,
+      contextWindow,
+      summaryOutputTokens,
+    });
+
+    // 20,000 messages carry ~20,000 tokens of role labels alone, so the whole
+    // history cannot be approved for one request.
+    expect(plan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
   });
 });

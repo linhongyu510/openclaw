@@ -4,11 +4,6 @@
  * while splitting history for summaries.
  */
 import { estimateTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
-import { serializeConversation } from "../../packages/agent-core/src/harness/compaction/utils.js";
-import {
-  convertToLlm,
-  type HarnessMessage,
-} from "../../packages/agent-core/src/harness/messages.js";
 import { createToolCallOccurrenceQueue } from "../../packages/agent-core/src/harness/session/tool-result-pairing.js";
 import {
   projectCompactionPlanningMessages,
@@ -28,6 +23,8 @@ export const SAFETY_MARGIN = 1.2;
 const DEFAULT_PARTS = 2;
 /** Matches the estimator's chars-per-token ratio so both sides stay comparable. */
 const CHARS_PER_TOKEN = 4;
+/** Measured cost of the role label and separator serializeConversation() adds. */
+const SERIALIZED_CHARS_PER_MESSAGE = 4;
 
 /**
  * Overhead reserved for summary prompt, system prompt, prior summary, wrapper
@@ -238,15 +235,19 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
 }
 
 /**
- * Estimates the prompt the summarizer will actually send. Per-message role labels
- * and separators are pure overhead that estimateTokens() never sees, and on short
- * conversations they dominate: 10,000 "ok" messages estimate at 10,000 tokens but
- * serialize to 36,250, so approving a whole-history request on the content
- * estimate alone can overflow the window.
+ * Serialization overhead the estimator never sees: convertToLlm() prefixes every
+ * message with a role label and separates it with a blank line. Measured at ~4
+ * chars per message, and it scales with message *count*, not content size, so on
+ * short conversations it dominates.
+ *
+ * This is deliberately additive rather than a serialized measurement of the
+ * planning projection. Long histories reach the planner already shortened, with
+ * the discarded content restored through omittedChars accounting. Serializing
+ * that projection would measure the truncated text, and no Math.max() can
+ * recombine a restored content cost with a truncated overhead cost.
  */
-function estimateSerializedRequestTokens(messages: AgentMessage[]): number {
-  const serialized = serializeConversation(convertToLlm(messages as HarnessMessage[]));
-  return Math.ceil(serialized.length / CHARS_PER_TOKEN);
+function estimateSerializationOverheadTokens(messages: AgentMessage[]): number {
+  return Math.ceil((messages.length * SERIALIZED_CHARS_PER_MESSAGE) / CHARS_PER_TOKEN);
 }
 
 function fitsSingleSummarizationRequest(params: {
@@ -345,9 +346,10 @@ export function buildStageSplitPlan(params: {
   if (
     params.contextWindow !== undefined &&
     fitsSingleSummarizationRequest({
-      // Measure the serialized prompt, not the content estimate: short-message
-      // histories carry enough per-message overhead to overflow on their own.
-      inputTokens: Math.max(totalTokens, estimateSerializedRequestTokens(params.messages)),
+      // Content estimate plus serialization overhead. The two are additive: the
+      // estimate already restores content omitted by the planning projection,
+      // while the overhead depends only on how many messages get serialized.
+      inputTokens: totalTokens + estimateSerializationOverheadTokens(params.messages),
       contextWindow: params.contextWindow,
       summaryOutputTokens: params.summaryOutputTokens,
     })
