@@ -10,6 +10,8 @@ import {
   SAFETY_MARGIN,
   SUMMARIZATION_OVERHEAD_TOKENS,
 } from "./compaction-planning.js";
+import { serializeConversation } from "../../packages/agent-core/src/harness/compaction/utils.js";
+import { convertToLlm } from "../../packages/agent-core/src/harness/messages.js";
 import { runCompactionPlanningWorkerInput } from "./compaction-planning.worker.js";
 import type { AgentMessage } from "./runtime/index.js";
 
@@ -330,29 +332,30 @@ describe("single-pass framing cost per role", () => {
   });
 });
 
+function buildToolTurns(turns: number): AgentMessage[] {
+  const messages: AgentMessage[] = [];
+  for (let index = 0; index < turns; index += 1) {
+    messages.push({
+      role: "assistant",
+      content: [
+        { type: "text", text: "abcdefghijklmnopqrst" },
+        { type: "toolCall", id: `call-${index}`, name: "f", arguments: {} },
+      ],
+      timestamp: 1_000 + index * 2,
+    } as unknown as AgentMessage);
+    messages.push({
+      role: "toolResult",
+      content: [{ type: "text", text: "abcdefghijklmnopqrst" }],
+      toolCallId: `call-${index}`,
+      timestamp: 1_001 + index * 2,
+    } as unknown as AgentMessage);
+  }
+  return messages;
+}
+
 describe("single-pass framing for combined assistant turns", () => {
   // serializeConversation emits [Assistant]: and [Assistant tool calls]: as two
   // separate sections, so a turn carrying text and calls costs both frames.
-  function buildToolTurns(turns: number): AgentMessage[] {
-    const messages: AgentMessage[] = [];
-    for (let index = 0; index < turns; index += 1) {
-      messages.push({
-        role: "assistant",
-        content: [
-          { type: "text", text: "abcdefghijklmnopqrst" },
-          { type: "toolCall", id: `call-${index}`, name: "f", input: {} },
-        ],
-        timestamp: 1_000 + index * 2,
-      } as unknown as AgentMessage);
-      messages.push({
-        role: "toolResult",
-        content: [{ type: "text", text: "abcdefghijklmnopqrst" }],
-        toolCallId: `call-${index}`,
-        timestamp: 1_001 + index * 2,
-      } as unknown as AgentMessage);
-    }
-    return messages;
-  }
 
   it("declines a tool-heavy history that only fits when one frame is ignored", () => {
     // Charging one assistant frame needs ~61,000 tokens here; charging both needs
@@ -397,5 +400,20 @@ describe("single-pass framing for combined assistant turns", () => {
         summaryOutputTokens: 2_048,
       }),
     ).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
+  });
+});
+
+describe("single-pass fixtures survive real conversion", () => {
+  // Guards the fixture contract itself: toolCall blocks carry `arguments`, and
+  // serializeConversation() reads it via Object.entries, so a wrong field name
+  // throws instead of quietly under-measuring.
+  it("serializes tool turns through the real conversion path", () => {
+    const messages = buildToolTurns(3);
+    const serialized = serializeConversation(convertToLlm(messages));
+
+    expect(serialized).toContain("[Assistant]:");
+    expect(serialized).toContain("[Assistant tool calls]:");
+    expect(serialized).toContain("f()");
+    expect(serialized).toContain("[Tool result]:");
   });
 });
