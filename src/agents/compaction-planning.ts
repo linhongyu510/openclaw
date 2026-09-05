@@ -24,7 +24,16 @@ const DEFAULT_PARTS = 2;
 /** Matches the estimator's chars-per-token ratio so both sides stay comparable. */
 const CHARS_PER_TOKEN = 4;
 /** Measured cost of the role label and separator serializeConversation() adds. */
-const SERIALIZED_CHARS_PER_MESSAGE = 4;
+/**
+ * Exact serialization framing per message, mirroring serializeConversation():
+ * `[User]: ` is 8 chars, `[Tool result]: ` is 15, `[Assistant]: ` is 13, and
+ * every entry is joined by a 2-char separator.
+ */
+const SERIALIZED_FRAMING_CHARS = {
+  assistant: 13 + 2,
+  toolResult: 15 + 2,
+  user: 8 + 2,
+} as const;
 
 /**
  * Overhead reserved for summary prompt, system prompt, prior summary, wrapper
@@ -236,9 +245,10 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
 
 /**
  * Serialization overhead the estimator never sees: convertToLlm() prefixes every
- * message with a role label and separates it with a blank line. Measured at ~4
- * chars per message, and it scales with message *count*, not content size, so on
- * short conversations it dominates.
+ * message with a role label and separates it with a blank line. It scales with
+ * message *count*, not content size, so on short conversations it dominates:
+ * 5,000 user/assistant pairs of "ok" carry 125,000 chars of framing against
+ * 20,000 chars of content.
  *
  * This is deliberately additive rather than a serialized measurement of the
  * planning projection. Long histories reach the planner already shortened, with
@@ -247,7 +257,18 @@ export function computeAdaptiveChunkRatio(messages: AgentMessage[], contextWindo
  * recombine a restored content cost with a truncated overhead cost.
  */
 function estimateSerializationOverheadTokens(messages: AgentMessage[]): number {
-  return Math.ceil((messages.length * SERIALIZED_CHARS_PER_MESSAGE) / CHARS_PER_TOKEN);
+  let chars = 0;
+  for (const message of messages) {
+    const role = (message as { role?: string }).role;
+    if (role === "assistant") {
+      chars += SERIALIZED_FRAMING_CHARS.assistant;
+    } else if (role === "toolResult") {
+      chars += SERIALIZED_FRAMING_CHARS.toolResult;
+    } else {
+      chars += SERIALIZED_FRAMING_CHARS.user;
+    }
+  }
+  return Math.ceil(chars / CHARS_PER_TOKEN);
 }
 
 function fitsSingleSummarizationRequest(params: {

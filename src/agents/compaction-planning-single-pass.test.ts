@@ -278,3 +278,54 @@ describe("single-pass overhead across the worker projection", () => {
     expect(plan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
   });
 });
+
+describe("single-pass framing cost per role", () => {
+  it("declines the 5,000-pair history the serializer estimates at 36,250 tokens", () => {
+    // [User]: is 8 chars, [Assistant]: is 13, each entry adds a 2-char separator.
+    // 5,000 pairs therefore carry 125,000 chars of framing over 20,000 of content.
+    const messages = Array.from({ length: 10_000 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: "ok",
+      timestamp: 1_000 + index,
+    })) as AgentMessage[];
+
+    const plan = buildStageSplitPlan({
+      messages,
+      // Below the content estimate so the fit check is the branch under test.
+      maxChunkTokens: 2_048,
+      contextWindow: 32_768,
+      summaryOutputTokens: 4_096,
+    });
+
+    expect(plan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
+  });
+
+  it("charges assistant framing more than user framing", () => {
+    const asUser = Array.from({ length: 4_000 }, (_, index) => ({
+      role: "user",
+      content: "ok",
+      timestamp: 1_000 + index,
+    })) as AgentMessage[];
+    const asAssistant = asUser.map((message) => ({ ...message, role: "assistant" }));
+    // 24,576 sits between the two: user framing needs ~21,920, assistant ~27,920.
+    const window = 24_576;
+
+    // Same content, same count: only the role labels differ, and [Assistant]:
+    // is wide enough to push this history over the window.
+    const userPlan = buildStageSplitPlan({
+      messages: asUser,
+      maxChunkTokens: 1_024,
+      contextWindow: window,
+      summaryOutputTokens: 1_024,
+    });
+    const assistantPlan = buildStageSplitPlan({
+      messages: asAssistant as AgentMessage[],
+      maxChunkTokens: 1_024,
+      contextWindow: window,
+      summaryOutputTokens: 1_024,
+    });
+
+    expect(userPlan).toMatchObject({ mode: "single", fitsWholeRequest: true });
+    expect(assistantPlan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
+  });
+});
