@@ -106,7 +106,7 @@ describe("compaction identifier-preservation instructions", () => {
       maxChunkTokens: 1000,
       parts: 2,
       minMessagesForSplit: 4,
-      contextWindow: 8000,
+      contextWindow: 1_000,
     });
 
     expect(mockGenerateSummary).toHaveBeenCalledTimes(3);
@@ -130,7 +130,7 @@ describe("compaction identifier-preservation instructions", () => {
       maxChunkTokens: 1000,
       parts: 2,
       minMessagesForSplit: 4,
-      contextWindow: 8000,
+      contextWindow: 1_000,
       customInstructions: "Prioritize customer-visible regressions.",
     });
 
@@ -330,7 +330,7 @@ describe("compaction staged summarization failures", () => {
       maxChunkTokens: 1000,
       parts: 3,
       minMessagesForSplit: 2,
-      contextWindow: 8000,
+      contextWindow: 1_000,
     });
 
   beforeEach(() => {

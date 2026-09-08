@@ -123,7 +123,8 @@ export async function buildStageSplitPlanWithWorker(params: {
   parts?: number;
   minMessagesForSplit?: number;
   contextWindow?: number;
-  summaryOutputTokens?: number;
+  singlePassInputTokens?: number;
+  completionAllowanceTokens?: number;
   signal?: AbortSignal;
 }): Promise<StageSplitPlan> {
   const { signal, ...planningInput } = params;

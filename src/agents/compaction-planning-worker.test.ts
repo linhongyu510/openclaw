@@ -3,10 +3,7 @@ import { createAssistantMessageEventStream } from "@openclaw/llm-core";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { serializeConversation } from "openclaw/plugin-sdk/agent-core";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  estimateTokens,
-  resolveSummaryOutputTokens,
-} from "../../packages/agent-core/src/harness/compaction/compaction.js";
+import { estimateTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import { makeTextToolResult } from "../../test/helpers/text-tool-result.js";
 import * as compactionPlanningWorkerRuntime from "./compaction-planning-worker-runtime.js";
 import {
@@ -325,6 +322,7 @@ describe("compaction planning worker", () => {
       ),
     );
     const inputTokens: number[] = [];
+    const outputAllowances: number[] = [];
     const seen = new Set<string>();
     let omissionNotes = false;
     const maxChunkTokens = 395_904;
@@ -337,12 +335,13 @@ describe("compaction planning worker", () => {
       reserveTokens: 4_096,
       maxChunkTokens,
       contextWindow: model.contextWindow,
-      streamFn: (_model, context) => {
+      streamFn: (_model, context, options) => {
         const tokens = context.messages.reduce(
           (sum, message) => sum + estimateTokens(message),
           estimateTokens(makeMessage(0, context.systemPrompt ?? "")),
         );
         inputTokens.push(tokens);
+        outputAllowances.push(options?.maxTokens ?? 0);
         const text = context.messages
           .map((message) =>
             typeof message.content === "string"
@@ -377,13 +376,10 @@ describe("compaction planning worker", () => {
 
     expect(summary).toBe("Compact summary.");
     expect(inputTokens.length).toBeGreaterThan(0);
-    expect(
-      Math.max(...inputTokens) +
-        resolveSummaryOutputTokens({
-          reserveTokens: 4_096,
-          modelMaxTokens: model.maxTokens,
-        }),
-    ).toBeLessThanOrEqual(model.contextWindow);
+    expect(outputAllowances).toEqual(inputTokens.map(() => Math.floor(4_096 * 0.8)));
+    expect(Math.max(...inputTokens) + Math.max(...outputAllowances)).toBeLessThanOrEqual(
+      model.contextWindow,
+    );
     expect([...seen].toSorted()).toEqual(markers.toSorted());
     expect(omissionNotes).toBe(false);
     expect(summary).not.toMatch(/\[Large .*omitted from summary\]|\[Partial summary:/);

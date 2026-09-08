@@ -1,4 +1,4 @@
-import { resolveSummaryOutputTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
+import { resolveSummarizationRequestBudget } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import { CompactionError } from "../../packages/agent-core/src/harness/types.js";
 /**
  * Summarization and fallback helpers for transcript compaction.
@@ -20,6 +20,7 @@ import {
   estimateMessagesTokens,
   MIN_CHUNK_RATIO,
   SAFETY_MARGIN,
+  sanitizeCompactionMessages,
   SUMMARIZATION_OVERHEAD_TOKENS,
 } from "./compaction-planning.js";
 import { DEFAULT_CONTEXT_TOKENS } from "./defaults.js";
@@ -306,9 +307,17 @@ export async function summarizeInStages(
     return await summarizeWithFallback(params);
   }
 
-  const summaryOutputTokens = resolveSummaryOutputTokens({
+  const requestBudget = resolveSummarizationRequestBudget({
+    messages: sanitizeCompactionMessages(messages),
+    customInstructions: buildCompactionSummarizationInstructions(
+      params.customInstructions,
+      params.summarizationInstructions,
+    ),
+    previousSummary: params.previousSummary,
+    summaryPrompt: params.summaryPrompt,
+    model: params.model,
     reserveTokens: params.reserveTokens,
-    modelMaxTokens: params.model.maxTokens,
+    thinkingLevel: params.thinkingLevel,
   });
   const plan = await buildStageSplitPlanWithWorker({
     messages,
@@ -316,7 +325,8 @@ export async function summarizeInStages(
     parts: params.parts,
     minMessagesForSplit: params.minMessagesForSplit,
     contextWindow: params.contextWindow,
-    summaryOutputTokens,
+    singlePassInputTokens: requestBudget.singlePassInputTokens,
+    completionAllowanceTokens: requestBudget.completionAllowanceTokens,
     signal: params.signal,
   });
 

@@ -1,5 +1,7 @@
+import { adjustMaxTokensForThinking } from "@openclaw/ai/providers";
 import {
   resolveClaudeFable5ModelIdentity,
+  supportsClaudeAdaptiveThinking,
   type Model,
   type SimpleStreamOptions,
   type StreamFn,
@@ -682,6 +684,56 @@ function createSummarizationOptions(
   return options;
 }
 
+function buildSummarizationPromptText(params: {
+  messages: AgentMessage[];
+  prompt: string;
+  customInstructions?: string;
+  previousSummary?: string;
+}): string {
+  const conversationText = serializeConversation(convertToLlm(params.messages));
+  let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+  if (params.previousSummary) {
+    promptText += `<previous-summary>\n${params.previousSummary}\n</previous-summary>\n\n`;
+  }
+  promptText += params.prompt;
+  // SDK callers also pass generated policy here; the host bounds raw operator focus.
+  if (params.customInstructions) {
+    promptText += `\n\nAdditional focus: ${params.customInstructions}`;
+  }
+  return promptText;
+}
+
+function resolveSummarizationCompletionAllowance(params: {
+  model: Model;
+  maxTokens: number;
+  thinkingLevel?: ThinkingLevel;
+}): number {
+  const options = createSummarizationOptions(
+    params.model,
+    params.maxTokens,
+    undefined,
+    undefined,
+    undefined,
+    params.thinkingLevel,
+  );
+  const reasoning = options.reasoning;
+  if (
+    params.model.api !== "anthropic-messages" ||
+    !reasoning ||
+    reasoning === "off" ||
+    supportsClaudeAdaptiveThinking(params.model)
+  ) {
+    return params.maxTokens;
+  }
+  const adjusted = adjustMaxTokensForThinking(
+    params.maxTokens,
+    params.model.maxTokens,
+    reasoning === "max" ? "high" : reasoning,
+    options.thinkingBudgets,
+  );
+  return adjusted.thinkingBudget >= 1024 ? adjusted.maxTokens : params.maxTokens;
+}
+
 /** Runs one summarization completion and maps abort/error stops to CompactionError. */
 async function runSummarizationCompletion(params: {
   messages: AgentMessage[];
@@ -698,16 +750,7 @@ async function runSummarizationCompletion(params: {
   runtime?: AgentCoreCompletionRuntimeDeps;
   errorLabel: string;
 }): Promise<Result<string, CompactionError>> {
-  const conversationText = serializeConversation(convertToLlm(params.messages));
-  let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-  if (params.previousSummary) {
-    promptText += `<previous-summary>\n${params.previousSummary}\n</previous-summary>\n\n`;
-  }
-  promptText += params.prompt;
-  // SDK callers also pass generated policy here; the host bounds raw operator focus.
-  if (params.customInstructions) {
-    promptText += `\n\nAdditional focus: ${params.customInstructions}`;
-  }
+  const promptText = buildSummarizationPromptText(params);
   const context = {
     systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
     messages: [
@@ -760,7 +803,7 @@ export type CompactionSummaryPrompt =
   | { kind: "custom"; instructions: string };
 
 /** Resolves the completion budget shared by compaction planning and execution. */
-export function resolveSummaryOutputTokens(params: {
+function resolveSummaryOutputTokens(params: {
   reserveTokens: number;
   modelMaxTokens: number;
   reserveRatio?: number;
@@ -769,6 +812,58 @@ export function resolveSummaryOutputTokens(params: {
     Math.floor((params.reserveRatio ?? 0.8) * params.reserveTokens),
     params.modelMaxTokens > 0 ? params.modelMaxTokens : Number.POSITIVE_INFINITY,
   );
+}
+
+function resolveSummaryPrompt(params: {
+  previousSummary?: string;
+  summaryPrompt?: CompactionSummaryPrompt;
+}): string {
+  const selectedPrompt =
+    params.summaryPrompt?.kind === "turn-prefix"
+      ? TURN_PREFIX_SUMMARIZATION_PROMPT
+      : params.summaryPrompt?.instructions;
+  return params.summaryPrompt
+    ? [
+        params.previousSummary &&
+          "Update the previous summary with the new conversation. Preserve relevant facts, decisions, and unresolved asks; remove stale or duplicate detail. Use the format below.",
+        selectedPrompt,
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    : params.previousSummary
+      ? UPDATE_SUMMARIZATION_PROMPT
+      : SUMMARIZATION_PROMPT;
+}
+
+/** The exact request pressure consumed by the summarization completion owner. */
+export function resolveSummarizationRequestBudget(params: {
+  messages: AgentMessage[];
+  customInstructions?: string;
+  previousSummary?: string;
+  summaryPrompt?: CompactionSummaryPrompt;
+  model: Model;
+  reserveTokens: number;
+  thinkingLevel?: ThinkingLevel;
+}): { singlePassInputTokens: number; completionAllowanceTokens: number } {
+  const maxTokens = resolveSummaryOutputTokens({
+    reserveTokens: params.reserveTokens,
+    modelMaxTokens: params.model.maxTokens,
+    reserveRatio: params.summaryPrompt?.kind === "turn-prefix" ? 0.5 : 0.8,
+  });
+  const promptText = buildSummarizationPromptText({
+    ...params,
+    prompt: resolveSummaryPrompt(params),
+  });
+  const inputChars =
+    estimateStringChars(SUMMARIZATION_SYSTEM_PROMPT) + estimateStringChars(promptText);
+  return {
+    singlePassInputTokens: Math.ceil(inputChars / CHARS_PER_TOKEN_ESTIMATE),
+    completionAllowanceTokens: resolveSummarizationCompletionAllowance({
+      model: params.model,
+      maxTokens,
+      thinkingLevel: params.thinkingLevel,
+    }),
+  };
 }
 
 /** Generate or update a conversation summary for compaction. */
@@ -791,21 +886,7 @@ export async function generateSummary(
     modelMaxTokens: model.maxTokens,
     reserveRatio: summaryPrompt?.kind === "turn-prefix" ? 0.5 : 0.8,
   });
-  const selectedPrompt =
-    summaryPrompt?.kind === "turn-prefix"
-      ? TURN_PREFIX_SUMMARIZATION_PROMPT
-      : summaryPrompt?.instructions;
-  const prompt = summaryPrompt
-    ? [
-        previousSummary &&
-          "Update the previous summary with the new conversation. Preserve relevant facts, decisions, and unresolved asks; remove stale or duplicate detail. Use the format below.",
-        selectedPrompt,
-      ]
-        .filter(Boolean)
-        .join("\n\n")
-    : previousSummary
-      ? UPDATE_SUMMARIZATION_PROMPT
-      : SUMMARIZATION_PROMPT;
+  const prompt = resolveSummaryPrompt({ previousSummary, summaryPrompt });
   return await runSummarizationCompletion({
     messages: currentMessages,
     prompt,

@@ -1,6 +1,15 @@
 // Compaction must not force map-reduce when the whole history fits one summarizer call.
-import { describe, expect, it } from "vitest";
-import { resolveSummaryOutputTokens } from "../../packages/agent-core/src/harness/compaction/compaction.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type * as agentSessions from "./sessions/index.js";
+
+vi.mock("./sessions/index.js", async () => {
+  const actual = await vi.importActual<typeof agentSessions>("./sessions/index.js");
+  return {
+    ...actual,
+    generateSummary: vi.fn(),
+  };
+});
+import { resolveSummarizationRequestBudget } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import { serializeConversation } from "../../packages/agent-core/src/harness/compaction/utils.js";
 import { convertToLlm } from "../../packages/agent-core/src/harness/messages.js";
 import {
@@ -15,9 +24,30 @@ import {
 import { runCompactionPlanningWorkerInput } from "./compaction-planning.worker.js";
 import type { AgentMessage } from "./runtime/index.js";
 
+const { generateSummary } = await import("./sessions/index.js");
+const { summarizeInStages } = await import("./compaction.js");
+const mockGenerateSummary = vi.mocked(generateSummary);
+
+beforeEach(() => {
+  mockGenerateSummary.mockReset();
+  mockGenerateSummary.mockResolvedValue("summary");
+});
+
 // Mirrors the reported deployment: a 262K-window summarizer over a ~164K transcript.
 const LARGE_CONTEXT_WINDOW = 262_144;
 const LARGE_SUMMARY_OUTPUT_BUDGET = 65_536;
+const TEST_MODEL = {
+  id: "test-summary-model",
+  name: "Test Summary Model",
+  api: "openai-responses",
+  provider: "openai",
+  baseUrl: "https://example.test",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: LARGE_CONTEXT_WINDOW,
+  maxTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
+} satisfies Parameters<typeof resolveSummarizationRequestBudget>[0]["model"];
 
 function buildTranscript(messageCount: number, charsPerMessage: number): AgentMessage[] {
   return Array.from({ length: messageCount }, (_, index) => ({
@@ -27,15 +57,147 @@ function buildTranscript(messageCount: number, charsPerMessage: number): AgentMe
   }));
 }
 
+function buildShellMessages(count: number): AgentMessage[] {
+  return Array.from({ length: count }, (_, index) => ({
+    role: "bashExecution",
+    command: `printf shell-${index}`,
+    output: "ok",
+    exitCode: index === count - 1 ? 1 : 0,
+    cancelled: false,
+    truncated: index === count - 1,
+    fullOutputPath: index === count - 1 ? "/tmp/full-output.log" : undefined,
+    timestamp: 1_000 + index,
+  })) as AgentMessage[];
+}
+
+function buildPlainShellOutputMessages(shellMessages: AgentMessage[]): AgentMessage[] {
+  return shellMessages.map((message) => ({
+    role: "user",
+    content: message.role === "bashExecution" ? message.output : "ok",
+    timestamp: message.timestamp,
+  })) as AgentMessage[];
+}
+
+async function summarizeAndCountCalls(params: {
+  messages: AgentMessage[];
+  model?: Parameters<typeof summarizeInStages>[0]["model"];
+  reserveTokens?: number;
+  contextWindow: number;
+  maxChunkTokens?: number;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+}): Promise<number> {
+  mockGenerateSummary.mockClear();
+  await summarizeInStages({
+    messages: params.messages,
+    model: params.model ?? TEST_MODEL,
+    apiKey: "test-key", // pragma: allowlist secret
+    reserveTokens: params.reserveTokens ?? 0,
+    maxChunkTokens: params.maxChunkTokens ?? 1,
+    contextWindow: params.contextWindow,
+    thinkingLevel: params.thinkingLevel,
+    summarizationInstructions: { identifierPolicy: "off" },
+    signal: new AbortController().signal,
+  });
+  return mockGenerateSummary.mock.calls.length;
+}
+
+function resolveRequestBudget(
+  messages: AgentMessage[],
+  options: {
+    model?: Parameters<typeof resolveSummarizationRequestBudget>[0]["model"];
+    reserveTokens?: number;
+    thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+    previousSummary?: string;
+    customInstructions?: string;
+  } = {},
+) {
+  return resolveSummarizationRequestBudget({
+    messages,
+    model: options.model ?? TEST_MODEL,
+    reserveTokens: options.reserveTokens ?? 0,
+    thinkingLevel: options.thinkingLevel,
+    previousSummary: options.previousSummary,
+    customInstructions: options.customInstructions,
+  });
+}
+
+function resolvePlan(params: Parameters<typeof buildStageSplitPlan>[0]) {
+  return buildStageSplitPlan({
+    ...resolveRequestBudget(params.messages),
+    ...params,
+  });
+}
+
 function resolveMaxChunkTokens(messages: AgentMessage[], contextWindow: number): number {
   const ratio = computeAdaptiveChunkRatio(messages, contextWindow);
   return Math.max(1, Math.floor(contextWindow * ratio) - SUMMARIZATION_OVERHEAD_TOKENS);
 }
 
 describe("compaction single-pass fast path", () => {
-  it("uses the completion owner's generated-summary budget", () => {
-    expect(resolveSummaryOutputTokens({ reserveTokens: 100, modelMaxTokens: 64 })).toBe(64);
-    expect(resolveSummaryOutputTokens({ reserveTokens: 100, modelMaxTokens: 0 })).toBe(80);
+  it("reserves the provider's effective high-reasoning allowance", async () => {
+    const anthropicModel = {
+      ...TEST_MODEL,
+      id: "claude-3-5-sonnet-20241022",
+      api: "anthropic-messages",
+      provider: "anthropic",
+      reasoning: true,
+    } satisfies Parameters<typeof resolveSummarizationRequestBudget>[0]["model"];
+    const messages = buildTranscript(10, 2_000);
+    const reserveTokens = 20_000;
+    const withoutThinking = resolveRequestBudget(messages, {
+      model: anthropicModel,
+      reserveTokens,
+      thinkingLevel: "off",
+    });
+    const withThinking = resolveRequestBudget(messages, {
+      model: anthropicModel,
+      reserveTokens,
+      thinkingLevel: "high",
+    });
+
+    expect(withThinking.completionAllowanceTokens).toBeGreaterThan(
+      withoutThinking.completionAllowanceTokens,
+    );
+    const contextWindow = Math.floor(
+      messages.length > 0
+        ? withThinking.singlePassInputTokens * SAFETY_MARGIN +
+            (withoutThinking.completionAllowanceTokens + withThinking.completionAllowanceTokens) / 2
+        : 1,
+    );
+    expect(
+      await summarizeAndCountCalls({
+        messages,
+        model: anthropicModel,
+        reserveTokens,
+        contextWindow,
+        thinkingLevel: "off",
+      }),
+    ).toBe(1);
+    expect(
+      await summarizeAndCountCalls({
+        messages,
+        model: anthropicModel,
+        reserveTokens,
+        contextWindow,
+        thinkingLevel: "high",
+      }),
+    ).toBeGreaterThan(1);
+  });
+
+  it("budgets the converted shell transcript rather than its raw output only", async () => {
+    const shellMessages = buildShellMessages(1_024);
+    const plainMessages = buildPlainShellOutputMessages(shellMessages);
+    const shellBudget = resolveRequestBudget(shellMessages);
+    const plainBudget = resolveRequestBudget(plainMessages, { customInstructions: "" });
+
+    expect(shellBudget.singlePassInputTokens).toBeGreaterThan(plainBudget.singlePassInputTokens);
+    const contextWindow = 12_000;
+    expect(plainBudget.singlePassInputTokens * SAFETY_MARGIN).toBeLessThan(contextWindow);
+    expect(shellBudget.singlePassInputTokens * SAFETY_MARGIN).toBeGreaterThan(contextWindow);
+    expect(await summarizeAndCountCalls({ messages: plainMessages, contextWindow })).toBe(1);
+    expect(
+      await summarizeAndCountCalls({ messages: shellMessages, contextWindow }),
+    ).toBeGreaterThan(1);
   });
 
   it("summarizes in one call when the whole history fits the summarizer window", () => {
@@ -45,7 +207,7 @@ describe("compaction single-pass fast path", () => {
     expect(totalTokens).toBeGreaterThan(120_000);
     expect(totalTokens + SUMMARIZATION_OVERHEAD_TOKENS).toBeLessThan(LARGE_CONTEXT_WINDOW);
 
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
       contextWindow: LARGE_CONTEXT_WINDOW,
@@ -59,7 +221,7 @@ describe("compaction single-pass fast path", () => {
     const totalTokens = estimateMessagesTokens(messages);
     expect(totalTokens + SUMMARIZATION_OVERHEAD_TOKENS).toBeGreaterThan(LARGE_CONTEXT_WINDOW);
 
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
       contextWindow: LARGE_CONTEXT_WINDOW,
@@ -76,11 +238,11 @@ describe("compaction single-pass fast path", () => {
       totalTokens * 1.2 + SUMMARIZATION_OVERHEAD_TOKENS + LARGE_SUMMARY_OUTPUT_BUDGET,
     ).toBeGreaterThan(LARGE_CONTEXT_WINDOW);
 
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
       contextWindow: LARGE_CONTEXT_WINDOW,
-      summaryOutputTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
+      completionAllowanceTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
     });
 
     expect(plan.mode).toBe("split");
@@ -91,7 +253,7 @@ describe("compaction single-pass fast path", () => {
     const messages = buildTranscript(120, 5_500);
     const smallWindow = 32_768;
 
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, smallWindow),
       contextWindow: smallWindow,
@@ -106,7 +268,7 @@ describe("compaction single-pass fast path", () => {
     const maxChunkTokens = resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW);
     expect(estimateMessagesTokens(messages)).toBeGreaterThan(maxChunkTokens);
 
-    const plan = buildStageSplitPlan({ messages, maxChunkTokens });
+    const plan = resolvePlan({ messages, maxChunkTokens });
 
     expect(plan.mode).toBe("split");
   });
@@ -133,11 +295,11 @@ describe("single-pass budget gating", () => {
     expect(messages).toHaveLength(3);
     expect(totalTokens).toBeGreaterThan(smallWindow);
 
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, smallWindow),
       contextWindow: smallWindow,
-      summaryOutputTokens: 0,
+      completionAllowanceTokens: 0,
     });
 
     // The planner must tell callers whether the whole request was verified to fit,
@@ -148,11 +310,11 @@ describe("single-pass budget gating", () => {
 
   it("marks a verified whole-request fit", () => {
     const messages = buildTranscript(120, 5_500);
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
       contextWindow: LARGE_CONTEXT_WINDOW,
-      summaryOutputTokens: 0,
+      completionAllowanceTokens: 0,
     });
 
     expect(plan.mode).toBe("single");
@@ -165,12 +327,14 @@ describe("single-pass plan serialization", () => {
     // The worker returns indexes, not messages, so the flag must be serialized
     // explicitly or a verified single-pass plan silently becomes bounded again.
     const messages = buildTranscript(120, 5_500);
+    const budget = resolveRequestBudget(messages);
     const value = runCompactionPlanningWorkerInput({
       kind: "stageSplit",
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, LARGE_CONTEXT_WINDOW),
       contextWindow: LARGE_CONTEXT_WINDOW,
-      summaryOutputTokens: 0,
+      singlePassInputTokens: budget.singlePassInputTokens,
+      completionAllowanceTokens: budget.completionAllowanceTokens,
     });
 
     expect(value).toMatchObject({ kind: "stageSplit", mode: "single", fitsWholeRequest: true });
@@ -178,12 +342,14 @@ describe("single-pass plan serialization", () => {
 
   it("does not mark the small-message shortcut as a verified fit", () => {
     const messages = buildTranscript(3, 200_000);
+    const budget = resolveRequestBudget(messages);
     const value = runCompactionPlanningWorkerInput({
       kind: "stageSplit",
       messages,
       maxChunkTokens: resolveMaxChunkTokens(messages, 65_536),
       contextWindow: 65_536,
-      summaryOutputTokens: 0,
+      singlePassInputTokens: budget.singlePassInputTokens,
+      completionAllowanceTokens: budget.completionAllowanceTokens,
     });
 
     expect(value).toMatchObject({ kind: "stageSplit", mode: "single", fitsWholeRequest: false });
@@ -204,7 +370,7 @@ describe("single-pass serialization overhead", () => {
 
   it("declines a whole-history request that only fits before serialization", () => {
     const messages = buildShortMessages(7_000);
-    const contextWindow = 32_768;
+    const contextWindow = 24_000;
     const summaryOutputTokens = 4_096;
     const contentEstimate = estimateMessagesTokens(messages);
 
@@ -215,11 +381,11 @@ describe("single-pass serialization overhead", () => {
 
     // Keep the chunk budget under the transcript so the legacy shortcut cannot
     // answer first and the fit check is the branch under test.
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: 2_048,
       contextWindow,
-      summaryOutputTokens,
+      completionAllowanceTokens: summaryOutputTokens,
     });
 
     // Serialized, the same history overflows, so chunking must stay bounded.
@@ -230,11 +396,11 @@ describe("single-pass serialization overhead", () => {
     const messages = buildShortMessages(200);
     // Below maxChunkTokens the legacy shortcut answers first, so keep the chunk
     // budget under the transcript to exercise the fit check itself.
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       maxChunkTokens: 64,
       contextWindow: LARGE_CONTEXT_WINDOW,
-      summaryOutputTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
+      completionAllowanceTokens: LARGE_SUMMARY_OUTPUT_BUDGET,
     });
 
     expect(plan).toMatchObject({ mode: "single", fitsWholeRequest: true });
@@ -252,7 +418,7 @@ describe("single-pass overhead across the worker projection", () => {
       timestamp: 1_000 + index,
     })) as AgentMessage[];
     const projected = projectCompactionMessagesForPlanning(messages);
-    const contextWindow = 131_072;
+    const contextWindow = 40_000;
     const summaryOutputTokens = 6_553;
 
     // The projection really does shorten the transcript it hands the planner.
@@ -270,11 +436,11 @@ describe("single-pass overhead across the worker projection", () => {
 
     // Keep the chunk budget under the transcript so the legacy shortcut cannot
     // answer first; the fit check is the branch under test.
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages: projected,
       maxChunkTokens: 32_768,
       contextWindow,
-      summaryOutputTokens,
+      completionAllowanceTokens: summaryOutputTokens,
     });
 
     // 20,000 messages carry ~20,000 tokens of role labels alone, so the whole
@@ -293,12 +459,12 @@ describe("single-pass framing cost per role", () => {
       timestamp: 1_000 + index,
     })) as AgentMessage[];
 
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages,
       // Below the content estimate so the fit check is the branch under test.
       maxChunkTokens: 2_048,
-      contextWindow: 32_768,
-      summaryOutputTokens: 4_096,
+      contextWindow: 22_000,
+      completionAllowanceTokens: 4_096,
     });
 
     expect(plan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
@@ -322,21 +488,21 @@ describe("single-pass framing cost per role", () => {
     // totalTokens shortcut cannot answer before the fit check runs; verified by probe
     // that both roles reach the fit branch. 24,576 then separates them: the user
     // history is approved and the assistant history is declined purely on framing.
-    const window = 24_576;
+    const window = 19_000;
 
     // Same content, same count: only the role labels differ, and [Assistant]:
     // is wide enough to push this history over the window.
-    const userPlan = buildStageSplitPlan({
+    const userPlan = resolvePlan({
       messages: asUser,
       maxChunkTokens: 1_024,
       contextWindow: window,
-      summaryOutputTokens: 1_024,
+      completionAllowanceTokens: 1_024,
     });
-    const assistantPlan = buildStageSplitPlan({
+    const assistantPlan = resolvePlan({
       messages: asAssistant as AgentMessage[],
       maxChunkTokens: 1_024,
       contextWindow: window,
-      summaryOutputTokens: 1_024,
+      completionAllowanceTokens: 1_024,
     });
 
     expect(userPlan).toMatchObject({ mode: "single", fitsWholeRequest: true });
@@ -373,11 +539,11 @@ describe("single-pass framing for combined assistant turns", () => {
     // Charging one assistant frame needs ~61,000 tokens here; charging both needs
     // ~76,600. A 65,536 window is approved by the former and must be declined by
     // the latter.
-    const plan = buildStageSplitPlan({
+    const plan = resolvePlan({
       messages: buildToolTurns(2_000),
       maxChunkTokens: 8_192,
       contextWindow: 65_536,
-      summaryOutputTokens: 6_553,
+      completionAllowanceTokens: 6_553,
     });
 
     expect(plan).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
@@ -397,19 +563,19 @@ describe("single-pass framing for combined assistant turns", () => {
     const window = 36_864;
 
     expect(
-      buildStageSplitPlan({
+      resolvePlan({
         messages: textOnly,
         maxChunkTokens: 4_096,
         contextWindow: window,
-        summaryOutputTokens: 2_048,
+        completionAllowanceTokens: 2_048,
       }),
     ).toMatchObject({ mode: "single", fitsWholeRequest: true });
     expect(
-      buildStageSplitPlan({
+      resolvePlan({
         messages: withCalls,
         maxChunkTokens: 4_096,
         contextWindow: window,
-        summaryOutputTokens: 2_048,
+        completionAllowanceTokens: 2_048,
       }),
     ).not.toMatchObject({ mode: "single", fitsWholeRequest: true });
   });
