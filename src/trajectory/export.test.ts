@@ -5,6 +5,7 @@ import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import type { Message, Usage } from "openclaw/plugin-sdk/llm";
 import { afterAll, describe, expect, it } from "vitest";
+import { createReadTool } from "../agents/sessions/tools/read.js";
 import { formatSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
 import {
   replaceSessionEntry,
@@ -806,9 +807,21 @@ describe("exportTrajectoryBundle", () => {
   it("preserves paginated read evidence in exported trajectory events", async () => {
     const tmpDir = makeTempDir();
     const sessionFile = path.join(tmpDir, "session.jsonl");
+    const sourceFile = path.join(tmpDir, "evidence.txt");
     const outputDir = path.join(tmpDir, "bundle");
-    const paginationNotice = "[12 more lines in file. Use offset=34 to continue.]";
-    writeToolCallSessionFile(sessionFile, `Project: Orion\nOwner: Vega\n\n${paginationNotice}`);
+    fs.writeFileSync(
+      sourceFile,
+      `${Array.from({ length: 15 }, (_, index) => `evidence-line-${index + 1}`).join("\n")}\n`,
+      "utf8",
+    );
+    const readResult = await createReadTool(tmpDir).execute("call_1", {
+      path: "evidence.txt",
+      offset: 1,
+      limit: 3,
+    });
+    const resultText = readResult.content.find((part) => part.type === "text")?.text;
+    expect(resultText).toContain("[12 more lines in file. Use offset=4 to continue.]");
+    writeToolCallSessionFile(sessionFile, resultText ?? "");
 
     await exportTrajectoryBundle({
       outputDir,
@@ -827,7 +840,7 @@ describe("exportTrajectoryBundle", () => {
     expect(toolResult?.data).toMatchObject({
       message: {
         isError: false,
-        content: [{ type: "text", text: `Project: Orion\nOwner: Vega\n\n${paginationNotice}` }],
+        content: [{ type: "text", text: resultText }],
       },
     });
   });

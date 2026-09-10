@@ -230,6 +230,11 @@ describe("sanitizeDiagnosticPayload", () => {
     "[2 more lines in file. Use offset=3 to continue.]",
     "[12 more lines in file. Use offset=34 to continue.]",
     "[0 records matched the query.]",
+    "[[reply_to_current]] Hello",
+    "[[audio_as_voice]] Voice note",
+    "[false-positive]",
+    "[true-story]",
+    "[null-value]",
   ])("preserves plain bracketed diagnostic text", (value) => {
     expect(sanitizeDiagnosticPayload(value)).toBe(value);
   });

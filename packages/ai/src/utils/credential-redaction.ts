@@ -36,7 +36,7 @@ const MEDIA_DATA_URL_RE =
 const MAX_DIAGNOSTIC_JSON_LENGTH = 16 * 1024;
 const PLAIN_BRACKET_TAG_RE = /^\[[A-Za-z0-9][A-Za-z0-9 _.-]*\]$/u;
 const JSON_ARRAY_START_RE =
-  /\[\s*(?:[[{"\]]|(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)(?![\d.eE+-])(?=\s*(?:,|\]|[[{"-]|\d|true\b|false\b|null\b)))/u;
+  /\[\s*(?:[{"\]]|(?:true|false|null)(?![\w-])(?=\s*(?:,|\]|[[{"-]|\d|true\b|false\b|null\b))|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\d.eE+-])(?=\s*(?:,|\]|[[{"-]|\d|true\b|false\b|null\b)))/u;
 const MALFORMED_JSON_RE =
   /\{|(?:"[^"]+"|\b(?:b64_json|data|(?:input|output)?(?:audio|image|video)[\w-]*))\s*:/iu;
 
