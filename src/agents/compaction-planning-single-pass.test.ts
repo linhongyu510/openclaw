@@ -57,6 +57,34 @@ function buildTranscript(messageCount: number, charsPerMessage: number): AgentMe
   }));
 }
 
+function buildAlternatingTextMessages(pairs: number): AgentMessage[] {
+  return Array.from({ length: pairs * 2 }, (_, index) =>
+    index % 2 === 0
+      ? {
+          role: "user" as const,
+          content: "ok",
+          timestamp: 1_000 + index,
+        }
+      : {
+          role: "assistant" as const,
+          content: [{ type: "text" as const, text: "ok" }],
+          api: "openai-responses" as const,
+          provider: "openai",
+          model: "test-summary-model",
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop" as const,
+          timestamp: 1_000 + index,
+        },
+  ) as AgentMessage[];
+}
+
 function buildShellMessages(count: number): AgentMessage[] {
   return Array.from({ length: count }, (_, index) => ({
     role: "bashExecution",
@@ -357,27 +385,23 @@ describe("single-pass plan serialization", () => {
 });
 
 describe("single-pass serialization overhead", () => {
-  // Per-message role labels and separators are invisible to estimateTokens() but
-  // real in the request: 10,000 two-character messages estimate at 10,000 tokens
-  // and serialize to 36,250.
-  function buildShortMessages(pairs: number): AgentMessage[] {
-    return Array.from({ length: pairs * 2 }, (_, index) => ({
-      role: index % 2 === 0 ? "user" : "assistant",
-      content: "ok",
-      timestamp: 1_000 + index,
-    })) as AgentMessage[];
-  }
-
   it("declines a whole-history request that only fits before serialization", () => {
-    const messages = buildShortMessages(7_000);
-    const contextWindow = 24_000;
-    const summaryOutputTokens = 4_096;
+    const messages = buildAlternatingTextMessages(7_000);
+    const requestBudget = resolveRequestBudget(messages);
     const contentEstimate = estimateMessagesTokens(messages);
+    const contextWindow = Math.floor(
+      (contentEstimate * SAFETY_MARGIN + requestBudget.singlePassInputTokens * SAFETY_MARGIN) / 2 +
+        requestBudget.completionAllowanceTokens,
+    );
 
-    // The content estimate alone clears the window with room to spare.
+    // The content-only estimate approves this window, but the real serialized
+    // request (including both valid user and assistant sections) does not.
+    expect(contentEstimate * SAFETY_MARGIN + requestBudget.completionAllowanceTokens).toBeLessThan(
+      contextWindow,
+    );
     expect(
-      contentEstimate * SAFETY_MARGIN + SUMMARIZATION_OVERHEAD_TOKENS + summaryOutputTokens,
-    ).toBeLessThan(contextWindow);
+      requestBudget.singlePassInputTokens * SAFETY_MARGIN + requestBudget.completionAllowanceTokens,
+    ).toBeGreaterThan(contextWindow);
 
     // Keep the chunk budget under the transcript so the legacy shortcut cannot
     // answer first and the fit check is the branch under test.
@@ -385,7 +409,7 @@ describe("single-pass serialization overhead", () => {
       messages,
       maxChunkTokens: 2_048,
       contextWindow,
-      completionAllowanceTokens: summaryOutputTokens,
+      completionAllowanceTokens: requestBudget.completionAllowanceTokens,
     });
 
     // Serialized, the same history overflows, so chunking must stay bounded.
@@ -393,7 +417,7 @@ describe("single-pass serialization overhead", () => {
   });
 
   it("still approves a history that fits once serialization is counted", () => {
-    const messages = buildShortMessages(200);
+    const messages = buildAlternatingTextMessages(200);
     // Below maxChunkTokens the legacy shortcut answers first, so keep the chunk
     // budget under the transcript to exercise the fit check itself.
     const plan = resolvePlan({
@@ -453,11 +477,10 @@ describe("single-pass framing cost per role", () => {
   it("declines the 5,000-pair history the serializer estimates at 36,250 tokens", () => {
     // [User]: is 8 chars, [Assistant]: is 13, each entry adds a 2-char separator.
     // 5,000 pairs therefore carry 125,000 chars of framing over 20,000 of content.
-    const messages = Array.from({ length: 10_000 }, (_, index) => ({
-      role: index % 2 === 0 ? "user" : "assistant",
-      content: "ok",
-      timestamp: 1_000 + index,
-    })) as AgentMessage[];
+    const messages = buildAlternatingTextMessages(5_000);
+    const serialized = serializeConversation(convertToLlm(messages));
+    expect(serialized.match(/^\[User\]: ok$/gmu)).toHaveLength(5_000);
+    expect(serialized.match(/^\[Assistant\]: ok$/gmu)).toHaveLength(5_000);
 
     const plan = resolvePlan({
       messages,
