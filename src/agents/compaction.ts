@@ -25,6 +25,7 @@ import {
 } from "./compaction-planning.js";
 import { DEFAULT_CONTEXT_TOKENS } from "./defaults.js";
 import { isTimeoutError } from "./failover-error.js";
+import { isContextOverflowError } from "./failover/context-overflow.js";
 import type {
   AgentMessage,
   CompactionSummaryPrompt,
@@ -333,7 +334,25 @@ export async function summarizeInStages(
   if (plan.mode === "single") {
     // Only a verified whole-request fit may bypass the chunk budget; the planner's
     // legacy single-stage shortcuts still need bounded requests.
-    return await summarizeWithFallback({ ...params, singlePass: plan.fitsWholeRequest === true });
+    const singlePass = plan.fitsWholeRequest === true;
+    try {
+      return await summarizeWithFallback({ ...params, singlePass });
+    } catch (err) {
+      if (
+        !singlePass ||
+        params.signal.aborted ||
+        (!isTimeoutError(err) && !isContextOverflowError(formatErrorMessage(err)))
+      ) {
+        throw err;
+      }
+      log.warn(
+        "single-pass summarization exceeded the provider request budget; retrying in chunks",
+        {
+          err,
+        },
+      );
+      return await summarizeWithFallback({ ...params, singlePass: false });
+    }
   }
 
   const partialSummaries: string[] = [];

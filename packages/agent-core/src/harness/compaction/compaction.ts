@@ -1,6 +1,7 @@
 import { adjustMaxTokensForThinking } from "@openclaw/ai/providers";
 import {
   resolveClaudeFable5ModelIdentity,
+  resolveClaudeModelIdentity,
   supportsClaudeAdaptiveThinking,
   type Model,
   type SimpleStreamOptions,
@@ -703,6 +704,24 @@ function buildSummarizationPromptText(params: {
   return promptText;
 }
 
+function isClaudeBedrockModel(model: Model): boolean {
+  if (model.api !== "bedrock-converse-stream") {
+    return false;
+  }
+  if (resolveClaudeModelIdentity(model).startsWith("claude-")) {
+    return true;
+  }
+  const id = model.id.toLowerCase();
+  const name = model.name?.toLowerCase() ?? "";
+  return (
+    id.includes("anthropic.claude") ||
+    id.includes("anthropic/claude") ||
+    name.includes("anthropic.claude") ||
+    name.includes("anthropic/claude") ||
+    name.includes("claude")
+  );
+}
+
 function resolveSummarizationCompletionAllowance(params: {
   model: Model;
   maxTokens: number;
@@ -718,9 +737,9 @@ function resolveSummarizationCompletionAllowance(params: {
   );
   const reasoning = options.reasoning;
   if (
-    params.model.api !== "anthropic-messages" ||
     !reasoning ||
     reasoning === "off" ||
+    (params.model.api !== "anthropic-messages" && !isClaudeBedrockModel(params.model)) ||
     supportsClaudeAdaptiveThinking(params.model)
   ) {
     return params.maxTokens;

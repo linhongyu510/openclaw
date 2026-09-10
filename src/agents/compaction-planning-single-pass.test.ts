@@ -212,6 +212,89 @@ describe("compaction single-pass fast path", () => {
     ).toBeGreaterThan(1);
   });
 
+  it("reserves the Bedrock adapter's effective high-reasoning allowance", async () => {
+    const bedrockModel = {
+      ...TEST_MODEL,
+      id: "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+      name: "Claude 3.5 Sonnet",
+      api: "bedrock-converse-stream",
+      provider: "amazon-bedrock",
+      reasoning: true,
+    } satisfies Parameters<typeof resolveSummarizationRequestBudget>[0]["model"];
+    const messages = buildTranscript(10, 2_000);
+    const reserveTokens = 20_000;
+    const withoutThinking = resolveRequestBudget(messages, {
+      model: bedrockModel,
+      reserveTokens,
+      thinkingLevel: "off",
+    });
+    const withThinking = resolveRequestBudget(messages, {
+      model: bedrockModel,
+      reserveTokens,
+      thinkingLevel: "high",
+    });
+
+    expect(withThinking.completionAllowanceTokens).toBeGreaterThan(
+      withoutThinking.completionAllowanceTokens,
+    );
+    const contextWindow = Math.floor(
+      withThinking.singlePassInputTokens * SAFETY_MARGIN +
+        (withoutThinking.completionAllowanceTokens + withThinking.completionAllowanceTokens) / 2,
+    );
+    expect(
+      await summarizeAndCountCalls({
+        messages,
+        model: bedrockModel,
+        reserveTokens,
+        contextWindow,
+        thinkingLevel: "off",
+      }),
+    ).toBe(1);
+    expect(
+      await summarizeAndCountCalls({
+        messages,
+        model: bedrockModel,
+        reserveTokens,
+        contextWindow,
+        thinkingLevel: "high",
+      }),
+    ).toBeGreaterThan(1);
+  });
+
+  it("falls back to bounded chunks when a verified single-pass request overflows", async () => {
+    const messages = buildTranscript(120, 5_500);
+    const contextWindow = LARGE_CONTEXT_WINDOW;
+    const maxChunkTokens = resolveMaxChunkTokens(messages, contextWindow);
+    const contextOverflow = new Error(
+      "This model's maximum context length was exceeded by the request",
+    );
+    mockGenerateSummary.mockReset();
+    mockGenerateSummary
+      .mockRejectedValueOnce(contextOverflow)
+      .mockRejectedValueOnce(contextOverflow)
+      .mockRejectedValueOnce(contextOverflow)
+      .mockResolvedValue("bounded summary");
+
+    await expect(
+      summarizeInStages({
+        messages,
+        model: TEST_MODEL,
+        apiKey: "test-key", // pragma: allowlist secret
+        reserveTokens: 0,
+        maxChunkTokens,
+        contextWindow,
+        summarizationInstructions: { identifierPolicy: "off" },
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toBe("bounded summary");
+
+    const requestSizes = mockGenerateSummary.mock.calls.map(
+      ([requestMessages]) => requestMessages.length,
+    );
+    expect(requestSizes.slice(0, 3)).toEqual([messages.length, messages.length, messages.length]);
+    expect(requestSizes.slice(3).some((size) => size < messages.length)).toBe(true);
+  });
+
   it("budgets the converted shell transcript rather than its raw output only", async () => {
     const shellMessages = buildShellMessages(1_024);
     const plainMessages = buildPlainShellOutputMessages(shellMessages);
