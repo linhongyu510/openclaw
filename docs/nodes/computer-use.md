@@ -85,6 +85,8 @@ Browser targets, pages, page elements, and dialogs are opaque capabilities. Reta
 
 The repository includes a development rig that preserves the real vertical path: agent-facing `computer` tool, Gateway `node.invoke`, paired node, and the selected node-local provider. It is deliberately isolated from the operator app and Gateway. The macOS path uses the signed app node; the Linux path uses the opt-in `cua-computer` plugin in a real X11 session.
 
+Both paths generate a fresh proof-only token in private config files: `gateway.auth.token` for the isolated Gateway and `gateway.remote.token` for the app or node. The Gateway launches with `--auth token --bind loopback`. The rig clears inherited Gateway credentials, URL/port overrides, and config/state/profile overrides so operator settings cannot replace the proof setup. Tokens never appear in emitted commands or `rig.json`; do not publish the generated configs or the whole scratch directory as proof.
+
 #### macOS
 
 Build a signed app from a clean, committed checkout, choose a fresh profile and non-default loopback port, and prepare the two config views:
@@ -97,7 +99,7 @@ scripts/dev/computer-use-macos-live-rig.sh prepare \
 
 Run the emitted `gateway` and `app` commands in separate terminals. The split config is intentional: the externally launched daemon reads a scratch config with `gateway.mode: "local"`, while the app profile reads `gateway.mode: "remote"`, direct transport, and the daemon's loopback URL. If the app reads local mode, its Port Guardian owns the route instead of joining the external daemon. The rig keeps its validated launch fields in non-executable `rig.json`; later commands reject unknown fields or paths that do not match the scratch/profile layout. It also seeds a dedicated `node` identity, completed onboarding, unpaused state, Computer Control, and the checkout path used to start the debug node worker. There is no separate node-mode toggle.
 
-In a third terminal, rerun the emitted `nodes` command until the paired entry is connected and advertises `computer.act` plus a `computerUse` descriptor. No operator-device approval step is involved: the loopback gateway silently pairs the rig's CLI identity on its first connect, and the proof runner is admitted as a local backend client without pairing at all. The rig keeps those two identities in separate state directories (`cli-state` and `agent-state`) because a paired operator device is pinned to the scopes of its first connect, and a CLI pairing would otherwise cap the proof client below `operator.write`.
+In a third terminal, rerun the emitted `nodes` command until the paired entry is connected and advertises `computer.act` plus a `computerUse` descriptor. No operator-device approval step is involved: the read-only CLI does not create an identity in fresh `cli-state`, and the proof token authenticates its loopback operator calls. The proof runner uses the same token as a local backend client in separate `agent-state`, retaining `operator.write`. Node device identity and pairing checks remain enabled; do not copy identities or disable device authentication to bootstrap the rig.
 
 If the node's command surface is still pending approval, take `.pending[0].requestId` from that `nodes` output and run `scripts/dev/computer-use-macos-live-rig.sh approve "$scratch" <request-id>`.
 
@@ -139,6 +141,8 @@ scripts/dev/computer-use-macos-live-rig.sh proof \
 
 The result and `window-before.png` / `window-after.png` stay under the scratch directory. A confirmed mutation must preserve the sentinel as the active X11 window and leave the pointer unchanged. An upstream `background_unavailable` or `background_occluded` result is valid refusal evidence only when it remains structured and no foreground retry is attempted. The rig rejects native Wayland even when `DISPLAY` is also present for XWayland; switch to X11 instead of claiming Wayland coverage.
 
+After either proof, stop only the Gateway, app/node, and fixture processes you launched for the rig. Retain only inspected proof results and synthetic captures, then remove the task-owned scratch directory. On macOS, also remove the fresh proof profile directory (`~/.openclaw-<profile>`) and its `ai.openclaw.mac.profile.<profile>` defaults domain. Never clean up the operator profile or Gateway.
+
 ### Windows and Linux (experimental, direct SDK)
 
 The bundled `cua-computer` plugin loads its Gateway policy by default on every platform. Local computer control remains opt-in on Windows and Linux; loading the policy alone does not start a native driver, register local computer commands, or probe local driver artifacts. macOS keeps its default CUA integration with the app-owned daemon. Explicitly disabling the plugin also disables its cloud computer policy.
@@ -175,7 +179,7 @@ To enable the experimental Windows or Linux node fulfiller, which uses the pinne
 
 This fulfiller currently controls only the primary display. `hold_key`, `left_mouse_down`, and `left_mouse_up` are unavailable because the CUA Driver SDK has no desktop-scope held-input contract. Modifier-held clicks, scrolling, and dragging are rejected because the typed desktop methods do not accept modifiers. The `key` action accepts named keys, letters, and modifier combos (for example `cmd+c` or `Return`); digit and punctuation keys are rejected because the driver drops their layout-dependent shift state, so send that text through the `type` action instead. Cancellation is passed to the SDK for each node invocation.
 
-The plugin calls `CuaDriver.createConfigured`, never bare `create()`. Its authorization ceiling, trusted session identity, TTLs, and action targets are owned by OpenClaw; model-facing `screen.snapshot` and `computer.act` inputs cannot select a native session or widen its authority. Because the driver reports no stable display identity, frame authorization binds to the trusted session generation plus live primary-display geometry. A new session invalidates outstanding frames, but a same-geometry primary-display substitution inside one session cannot be detected; prefer a stable single-display session for this fulfiller.
+The plugin calls `CuaDriver.createConfigured`, never bare `create()`. Its authorization ceiling, trusted session identity, TTLs, and action targets are owned by OpenClaw; model-facing `screen.snapshot` and `computer.act` inputs cannot select a native session or widen its authority. Because the driver reports no stable display identity, frame authorization binds to the trusted session generation plus live primary-display geometry. Lazy SDK loading does not change that generation, so `list_windows` can be the first action in a fresh execution. A new session invalidates outstanding frames, but a same-geometry primary-display substitution inside one session cannot be detected; prefer a stable single-display session for this fulfiller.
 
 On Windows and Linux this is a hard replacement of the former 0.10 daemon/MCP integration: OpenClaw does not spawn a CUA process or proxy an MCP client. macOS deliberately uses the app-owned embedded daemon described above so the driver remains in `OpenClaw.app`'s TCC responsibility chain. Neither path falls back to another provider for an individual action.
 
@@ -261,4 +265,4 @@ If the status says **Accessibility grant may be stale**, OpenClaw may already ap
 
 ## Relationship to other desktop-control paths
 
-This is the agent-driven path. See [Peekaboo bridge](/platforms/mac/peekaboo) for how it relates to the PeekabooBridge host, Codex Computer Use, and the direct `cua-driver` MCP.
+This is the agent-driven path. See [Peekaboo bridge](/platforms/mac/peekaboo) for how it relates to the PeekabooBridge host, [Codex Computer Use](/plugins/codex-computer-use), and the direct `cua-driver` MCP.

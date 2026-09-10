@@ -6,6 +6,7 @@ import {
   parsePackageOpenClawSchemaVersions,
   type OpenClawSchemaVersions,
 } from "../state/openclaw-schema-versions.js";
+import { gitNullConfigPath } from "./git-exec.js";
 import { isBetaTag, isStableTag, type UpdateChannel } from "./update-channels.js";
 import { compareSemverStrings } from "./update-check.js";
 import { runGitCandidatePreflight } from "./update-runner-git-preflight.js";
@@ -96,7 +97,7 @@ export async function withGitTargetInspectionRoot<T>(
               env: {
                 ...options.env,
                 GIT_CONFIG_NOSYSTEM: "1",
-                GIT_CONFIG_GLOBAL: os.devNull,
+                GIT_CONFIG_GLOBAL: gitNullConfigPath(),
                 GIT_CONFIG_COUNT: "0",
               },
             }
@@ -205,6 +206,23 @@ async function listGitTags(
     timeoutMs,
   }).catch(() => null);
   return result?.code === 0 ? normalizeStringEntries(result.stdout.split("\n")) : [];
+}
+
+/**
+ * Picks the single remote release tags are force-fetched from. The checkout's
+ * retained tracking remote (`branch.<main>.remote`) wins when it is still
+ * declared, because a detached release checkout keeps that config and a fork
+ * `origin` can be tag-less; otherwise the clone's canonical `origin`, then the
+ * only declared remote. Multiple non-origin remotes need explicit tracking.
+ */
+export function resolveReleaseTagRemote(
+  remotes: readonly string[],
+  trackedUpdateRemote: string,
+): string | undefined {
+  if (trackedUpdateRemote && remotes.includes(trackedUpdateRemote)) {
+    return trackedUpdateRemote;
+  }
+  return remotes.includes("origin") ? "origin" : remotes.length === 1 ? remotes[0] : undefined;
 }
 
 export async function resolveChannelTag(

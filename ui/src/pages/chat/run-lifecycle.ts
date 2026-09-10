@@ -16,6 +16,7 @@ import {
   isUiGlobalScopeConfigured,
   isUiGlobalSessionKey,
   resolveUiGlobalAliasAgentId,
+  resolveUiSelectedSessionAgentId,
   uiSessionRowMatchesSelectedChat,
   type UiSessionDefaultsHost,
 } from "../../lib/sessions/session-key.ts";
@@ -34,7 +35,7 @@ import type {
   WaitingApprovalStatus,
 } from "./tool-stream-contract.ts";
 // Control UI chat module implements run lifecycle behavior.
-import { resetToolStream, resetToolStreamRun } from "./tool-stream.ts";
+import { resetToolStream, resetToolStreamRun } from "./tool-stream-state.ts";
 
 export const CHAT_RUN_STATUS_TOAST_DURATION_MS = 5_000;
 
@@ -56,9 +57,11 @@ type TerminalSessionRunStatus = Exclude<SessionRunStatus, "running">;
 
 export type LocalTerminalReconcile = {
   sessionKey: string;
+  agentId?: string;
   runId: string | null;
   phase: ChatRunUiStatus["phase"];
   sessionStatus: TerminalSessionRunStatus;
+  errorMessage?: string;
 };
 
 type TimerHandle = ReturnType<typeof globalThis.setTimeout>;
@@ -93,8 +96,10 @@ type RunLifecycleHost = Omit<
 type ReconcileOptions = {
   outcome?: ChatRunUiStatus["phase"];
   sessionStatus?: TerminalSessionRunStatus;
+  errorMessage?: string;
   runId?: string | null;
   sessionKey?: string | null;
+  agentId?: string;
   sessionKeys?: readonly (string | null | undefined)[];
   clearLocalRun?: boolean;
   clearChatStream?: boolean;
@@ -493,8 +498,10 @@ function reconcileSessionRows(
     options.sessionStatus ?? (options.outcome === "done" ? ("done" as const) : ("killed" as const));
   const terminal: SessionRunTerminal = {
     sessionKeys: [...keys],
+    agentId: options.agentId,
     runId: options.runId ?? host.chatRunId ?? null,
     status,
+    errorMessage: options.errorMessage,
     endedAt: occurredAt,
   };
   if (host.sessionsResult) {
@@ -513,6 +520,7 @@ function reconcileYieldedSessionRows(
   }
   const terminal: SessionRunTerminal = {
     sessionKeys: [...sessionKeysFor(host, options)],
+    agentId: options.agentId,
     runId: options.runId ?? host.chatRunId ?? null,
     status: "running",
     endedAt: occurredAt,
@@ -527,6 +535,8 @@ export function reconcileChatRunLifecycle(host: RunLifecycleHost, options: Recon
   const occurredAt = Date.now();
   const runId = options.runId ?? host.chatRunId ?? null;
   const sessionKey = toSessionKey(options.sessionKey) ?? host.sessionKey;
+  const agentId = options.agentId ?? resolveUiSelectedSessionAgentId(host, sessionKey);
+  const sessionOptions = { ...options, agentId };
 
   if (options.clearIndicators ?? true) {
     clearRunIndicators(host, runId);
@@ -556,13 +566,15 @@ export function reconcileChatRunLifecycle(host: RunLifecycleHost, options: Recon
       sessionKey,
       occurredAt,
     };
-    reconcileSessionRows(host, options, occurredAt);
+    reconcileSessionRows(host, sessionOptions, occurredAt);
     if (options.armLocalTerminalReconcile) {
       host.lastLocalTerminalReconcile = {
         sessionKey,
+        agentId,
         runId,
         phase: options.outcome,
         sessionStatus: options.sessionStatus ?? (options.outcome === "done" ? "done" : "killed"),
+        errorMessage: options.errorMessage,
       };
     }
     if (options.publishRunStatus !== false) {
@@ -570,7 +582,7 @@ export function reconcileChatRunLifecycle(host: RunLifecycleHost, options: Recon
       scheduleRunStatusClear(host, status);
     }
   } else if (options.yielded) {
-    reconcileYieldedSessionRows(host, options, occurredAt);
+    reconcileYieldedSessionRows(host, sessionOptions, occurredAt);
     host.lastLocalTerminalReconcile = null;
     clearChatRunStatus(host);
   } else if (options.clearRunStatus) {
@@ -596,7 +608,11 @@ function currentSessionRow(host: RunLifecycleHost) {
 // safe time bound. (#87875)
 function reconcileStaleSelectedSessionRunAfterLocalCompletion(host: RunLifecycleHost): boolean {
   const recent = host.lastLocalTerminalReconcile;
-  if (!recent || recent.sessionKey !== host.sessionKey) {
+  if (
+    !recent ||
+    recent.sessionKey !== host.sessionKey ||
+    (recent.agentId !== undefined && recent.agentId !== resolveUiSelectedSessionAgentId(host))
+  ) {
     return false;
   }
   const row = currentSessionRow(host);
@@ -626,7 +642,9 @@ function reconcileStaleSelectedSessionRunAfterLocalCompletion(host: RunLifecycle
     {
       outcome: recent.phase,
       sessionStatus: recent.sessionStatus,
+      errorMessage: recent.errorMessage,
       sessionKey: recent.sessionKey,
+      agentId: recent.agentId,
       runId: recent.runId,
     },
     Date.now(),

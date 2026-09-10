@@ -336,6 +336,7 @@ export const validateTaskSuggestionsAcceptParams = compile(S.TaskSuggestionsAcce
 export const validateTaskSuggestionsDismissParams = compile(S.TaskSuggestionsDismissParamsSchema);
 export const validateTasksListParams = compile(S.TasksListParamsSchema);
 export const validateTasksGetParams = compile(S.TasksGetParamsSchema);
+export const validateTasksHistoryParams = compile(S.TasksHistoryParamsSchema);
 export const validateTasksCancelParams = compile(S.TasksCancelParamsSchema);
 export const validateTasksRecoveryParams = compile(S.TasksRecoveryParamsSchema);
 export const validateConfigGetParams = compile(S.ConfigGetParamsSchema);
@@ -503,6 +504,11 @@ export const validatePluginsListParams = compile(S.PluginsListParamsSchema);
 export const validatePluginsInspectParams = compile(S.PluginsInspectParamsSchema);
 export const validatePluginsRefreshParams = compile(S.PluginsRefreshParamsSchema);
 export const validatePluginsSearchParams = compile(S.PluginsSearchParamsSchema);
+export const validatePluginsCatalogBrowseParams = compile(S.PluginsCatalogBrowseParamsSchema);
+export const validatePluginsCatalogCategoriesParams = compile(
+  S.PluginsCatalogCategoriesParamsSchema,
+);
+export const validatePluginsCatalogGetParams = compile(S.PluginsCatalogGetParamsSchema);
 export const validatePluginsInstallParams = compile(S.PluginsInstallParamsSchema);
 export const validatePluginsSetEnabledParams = compile(S.PluginsSetEnabledParamsSchema);
 export const validatePluginsUninstallParams = compile(S.PluginsUninstallParamsSchema);

@@ -1,6 +1,7 @@
 import type { OpenClawConfig } from "../../config/types.js";
 import { withTimeout } from "../../infra/fs-safe.js";
 import type { WorkerProvider } from "../../plugins/types.js";
+import type { DesktopObserveRequester } from "../desktop/observe-requester.js";
 import {
   StaleWorkerBuildError,
   verifyWorkerAdmissionHandshake,
@@ -8,6 +9,8 @@ import {
 } from "./admission.js";
 import type { WorkerNodeDesktopCarrier } from "./node-desktop-carrier.js";
 import type { NodeWorkerTunnelManager } from "./node-worker-tunnel.js";
+import { readWorkerProjectPreparation } from "./preparation-identity.js";
+import type { WorkerProviderLifecycleInputOptions } from "./provider-lifecycle.types.js";
 import type { WorkerDesktopLaunchResult, WorkerDesktopObserveResult } from "./service-contract.js";
 import type { WorkerEnvironmentState } from "./state.js";
 import type { WorkerEnvironmentRecord, WorkerEnvironmentStore } from "./store.js";
@@ -21,6 +24,7 @@ type WorkerEnvironmentAccessOptions = {
   store: WorkerEnvironmentStore;
   getConfig: () => OpenClawConfig;
   prepareCurrentBundle: () => Promise<ExpectedWorkerBuild>;
+  bindPreparedWorkspace?: WorkerProviderLifecycleInputOptions["bindPreparedWorkspace"];
   tunnelManager?: WorkerTunnelManager;
   nodeTunnelManager?: NodeWorkerTunnelManager;
   nodeDesktopCarrier?: WorkerNodeDesktopCarrier;
@@ -103,6 +107,37 @@ export function createWorkerEnvironmentAccess(options: WorkerEnvironmentAccessOp
           ? nodeTunnelStatus
           : (tunnels?.status(record.environmentId) ?? nodeTunnelStatus ?? ("stopped" as const)),
     };
+  };
+
+  const bindPreparedWorkspace = async (
+    request: Parameters<NonNullable<WorkerEnvironmentAccessOptions["bindPreparedWorkspace"]>>[0],
+  ) => {
+    const bind = options.bindPreparedWorkspace;
+    const assertCurrent = () => {
+      request.signal?.throwIfAborted();
+      request.assertCurrent();
+      const record = requireCurrentRecord(request.environmentId);
+      const preparation = readWorkerProjectPreparation(record.profileSnapshot.project);
+      if (
+        record.state !== "attached" ||
+        record.ownerEpoch !== request.ownerEpoch ||
+        record.attachedSessionIds.length !== 1 ||
+        record.attachedSessionIds[0] !== request.sessionId ||
+        record.destroyRequestedAtMs !== null ||
+        record.sharedHost !== false ||
+        preparation?.key !== request.preparationKey ||
+        preparation.cacheKey !== request.cacheKey
+      ) {
+        throw new Error("Prepared workspace lost its exact attached environment owner");
+      }
+    };
+    assertCurrent();
+    if (!bind) {
+      throw new Error("Prepared workspace node transport is unavailable");
+    }
+    const prepared = await bind({ ...request, assertCurrent });
+    assertCurrent();
+    return prepared;
   };
 
   const startTunnel = async (request: WorkerTunnelRequest): Promise<WorkerTunnelHandle> => {
@@ -227,6 +262,7 @@ export function createWorkerEnvironmentAccess(options: WorkerEnvironmentAccessOp
   const observeDesktop = async (request: {
     environmentId: string;
     control: boolean;
+    requester?: DesktopObserveRequester;
   }): Promise<WorkerDesktopObserveResult> => {
     const stopping = options.isStopping();
     if (options.getConfig().cloudWorkers?.desktop !== true) {
@@ -265,6 +301,7 @@ export function createWorkerEnvironmentAccess(options: WorkerEnvironmentAccessOp
         nodeStartup = nodeDesktop.observe({
           record,
           control: request.control,
+          requester: request.requester,
         });
         return;
       }
@@ -283,6 +320,7 @@ export function createWorkerEnvironmentAccess(options: WorkerEnvironmentAccessOp
       sourceKey: request.environmentId,
       ownerEpoch,
       control: request.control,
+      requester: request.requester,
       attachment: acquired.attachment,
       nowMs: now(),
     });
@@ -407,6 +445,7 @@ export function createWorkerEnvironmentAccess(options: WorkerEnvironmentAccessOp
   };
 
   return {
+    bindPreparedWorkspace,
     get: (environmentId: string) => {
       const record = store.get(environmentId);
       return record ? project(record) : undefined;

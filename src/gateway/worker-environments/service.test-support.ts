@@ -193,7 +193,9 @@ export function createService(
       | "projectNamespace"
       | "resolveSshIdentity"
       | "ensureNodeWorkerBundle"
+      | "registerPreparedWorkspace"
       | "prepareNodeBootstrap"
+      | "prepareNodeArtifacts"
       | "prepareNodeRuntime"
       | "closeNodeRuntime"
       | "prepareNodeEnrollment"
@@ -220,6 +222,9 @@ export function createService(
     resolveProvider: (providerId) =>
       testState.providersEnabled && providerId === provider.id ? provider : undefined,
     prepareInstallation: testState.prepareInstallation,
+    ...(provider.requiresNodeEnrollment
+      ? { prepareNodeBootstrap: async () => NODE_BOOTSTRAP.sha256 }
+      : {}),
     bootstrapWorker: testState.bootstrapWorker,
     resolveSshIdentity: async () => ({ kind: "path", path: "/keys/worker" }),
     generateWorkerCredential: () => CREDENTIAL,

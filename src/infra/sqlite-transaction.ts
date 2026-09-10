@@ -1,6 +1,7 @@
 // Provides SQLite transaction helpers with nested savepoints.
 import type { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
+import { isMainThread, threadId } from "node:worker_threads";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { createSubsystemLogger, type SubsystemLogger } from "../logging/subsystem.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
@@ -107,6 +108,8 @@ export type SqliteTransactionOptions = {
   logger?: Pick<SubsystemLogger, "warn">;
   operationLabel?: string;
   slowTransactionHoldMs?: number;
+  /** Enclose the physical commit in an owner's synchronous authority guard. */
+  withCommit?: (commit: () => void) => void;
 };
 
 type SqliteTransactionStep = "begin" | "commit";
@@ -179,8 +182,10 @@ function logSlowTransactionHold(params: {
     async: false,
     ...(params.options?.databaseLabel ? { database: params.options.databaseLabel } : {}),
     elapsedMs: params.elapsedMs,
+    isMainThread,
     ...(params.options?.operationLabel ? { operation: params.options.operationLabel } : {}),
     pid: process.pid,
+    threadId,
     thresholdMs: slowTransactionHoldThresholdMs(params.options),
   });
 }
@@ -200,9 +205,11 @@ function logSlowTransactionStep(params: {
       : {}),
     ...(params.options?.databaseLabel ? { database: params.options.databaseLabel } : {}),
     elapsedMs: params.elapsedMs,
+    isMainThread,
     ...(params.options?.operationLabel ? { operation: params.options.operationLabel } : {}),
     pid: process.pid,
     step: params.step,
+    threadId,
   });
 }
 
@@ -240,11 +247,13 @@ function execTimedTransactionStep(params: {
         code: sqliteErrorCode(error),
         elapsedMs,
         failureKind: "lock-contention",
+        isMainThread,
         ...(params.options?.operationLabel ? { operation: params.options.operationLabel } : {}),
         pid: process.pid,
         ...(sqliteErrcode !== undefined ? { sqliteErrcode } : {}),
         ...(sqlitePrimaryCode !== undefined ? { sqlitePrimaryCode } : {}),
         step: params.step,
+        threadId,
       });
     }
     throw error;
@@ -344,7 +353,13 @@ function runSqliteTransactionSync<T>(
       elapsedMs: Date.now() - transactionStartedAt,
       options,
     });
-    commitImmediateTransaction(db, options);
+    if (options?.withCommit) {
+      assertSyncTransactionResult(
+        options.withCommit(() => commitImmediateTransaction(db, options)),
+      );
+    } else {
+      commitImmediateTransaction(db, options);
+    }
     return result;
   } catch (error) {
     abortImmediateTransaction(db, error);

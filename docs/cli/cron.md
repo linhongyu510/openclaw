@@ -8,14 +8,14 @@ title: "Automations (cron)"
 
 # `openclaw automations`
 
-Manage automation jobs for the Gateway scheduler. `openclaw automations` is the primary command; `openclaw cron` remains an alias, and every subcommand below works with either spelling.
+Manage automation jobs for the Gateway scheduler. The command registers as `openclaw cron` with `openclaw automations` as an alias; every subcommand below works with either spelling.
 
 <Tip>
 Run `openclaw automations --help` for the full command surface. See [Automations](/automation/cron-jobs) for the conceptual guide.
 </Tip>
 
 <Note>
-All automation mutations (`add`/`create`, `update`/`edit`, `remove`, `run`) require `operator.admin`. Command-payload runs execute directly in the Gateway process, not as an agent `tools.exec` tool call; `tools.exec.*` and exec approvals still govern model-visible exec tools.
+All automation mutations (`add`/`create`, `edit`, `remove`, `run`) require `operator.admin`. Command-payload runs execute directly in the Gateway process, not as an agent `tools.exec` tool call; `tools.exec.*` and exec approvals still govern model-visible exec tools.
 </Note>
 
 Every automation subcommand accepts the shared Gateway connection options. Use
@@ -63,6 +63,36 @@ that label with `automations add|edit --display-name`. Use
 `automations edit <job-id> --clear-display-name` to remove the label and restore
 the stable name in list and detail views. The set and clear options cannot be
 combined.
+
+## Schedule types
+
+As an alternative to positional creation syntax, `automations add|create`
+accepts one of these schedule flags. `automations edit` uses the same flags
+to replace a job's schedule:
+
+- `--at <when>` schedules one run from an ISO timestamp or a duration such
+  as `20m`. Offset-less timestamps use UTC unless `--tz <iana>` is supplied.
+- `--every <duration>` sets a recurring interval such as `10m`, `1h`, or
+  `1d`.
+- `--cron <expression>` sets a five- or six-field cron schedule. Use
+  `--tz <iana>` for the evaluation timezone, `--exact` to disable staggering,
+  or `--stagger <duration>` to set a stagger window.
+- `--on-exit <shell>` starts a watched command and fires the job once when it
+  exits. `--on-exit-cwd <path>` sets that command's working directory and
+  requires `--on-exit`.
+- `--stream-command <json>` takes a nonempty JSON array of nonempty strings as the
+  arguments for a supervised long-lived command and fires the job from its
+  batched output. `--stream-cwd <path>` sets the source's working directory.
+  `--stream-mode line|match` selects every line or only matching lines;
+  match mode requires `--stream-match <regex>`, which is invalid in line mode.
+  `--stream-batch-ms <n>` sets the quiet-window delay in milliseconds, and
+  `--stream-max-batch-bytes <n>` sets the maximum UTF-8 bytes per batch.
+
+`--tz` applies to cron schedules and offset-less `--at` timestamps, while
+`--exact` and `--stagger` apply only to cron schedules. None of these three
+flags is valid with exit or stream schedules. See
+[Automation schedules](/automation/cron-jobs/schedules#schedule-types) for stream lifecycle,
+batching limits, and trigger details.
 
 ## Sessions
 
@@ -333,7 +363,13 @@ openclaw automations runs <job-id> --run-id <run-id>
 `automations runs` is the preferred spelling. `cron runs` and the leaf-local
 `--id <job-id>` form remain supported compatibility aliases.
 
-`openclaw automations list` shows enabled jobs by default. Pass `--all` to include disabled jobs, or `--agent <id>` to show only jobs whose effective normalized agent id matches; jobs without a stored agent id count as the configured default agent.
+`openclaw automations list` shows enabled jobs across agents by default, including jobs whose owner cannot be resolved. Pass `--all` to include disabled jobs, or `--agent <id>` to filter by the effective normalized agent ID. Ownership resolves from the job's declared agent, its agent-scoped session key, then the configured system-agent owner. Unresolved jobs do not match an agent filter. The `cron list` alias has the same behavior.
+
+The human-readable Agent ID column shows the effective owner. JSON list rows preserve the declared `agentId` and include `effectiveAgentId`, which is `null` when ownership is unresolved.
+
+Existing main-session jobs can still be renamed, disabled, or rescheduled after their agent stops being the system default. Creating a main-session job or explicitly setting its agent, session target, or payload kind revalidates the current main-session rules.
+
+An unresolved owner does not stop the scheduler: that job is skipped with an explanation in `state.lastError`, while other jobs continue. Run `openclaw doctor --fix` to repair unresolved multi-agent legacy ownership, set `agents.defaults.systemAgent.agentId`, or use `openclaw cron edit <job-id> --agent <id>` to repair the job. Sole-agent rosters and legacy default markers honored by the runtime already resolve an owner and need no owner migration. The explanation stays on the job; no agent run-history entry is created because no agent run starts.
 
 `--json` always requests JSON output. Commands whose product is already a machine-readable result emit JSON results by default: `add`/`create`, `status`, `enable`, `disable`, `rm`/`remove`/`delete`, `run`, `edit`, `get`, and `runs`. They accept `--json` as the explicit machine-output spelling. `openclaw automations get <job-id>` returns the stored job JSON directly; use `automations show <job-id>` when you want the human-readable view with delivery-route preview.
 

@@ -19,7 +19,7 @@ or [Provider Plugins](/plugins/sdk-provider-plugins) instead.
 
 ## Requirements
 
-- Node 22.22.3+, Node 24.15+, or Node 25.9+.
+- Node 24.16+ or Node 26.1+.
 - TypeScript ESM package output.
 - `typebox` in `dependencies` (not just `devDependencies` - the generated
   plugin imports it at runtime).
@@ -504,6 +504,7 @@ Check these in order:
 ## See also
 
 - [Building plugins](/plugins/building-plugins)
+- [Plugin SDK overview](/plugins/sdk-overview)
 - [Plugin entry points](/plugins/sdk-entrypoints)
 - [Plugin SDK subpaths](/plugins/sdk-subpaths)
 - [Plugin manifest](/plugins/manifest)

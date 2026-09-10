@@ -7,8 +7,11 @@ title: "Update troubleshooting"
 ---
 
 Failed updates enter built-in triage after update recovery settles. In an
-interactive terminal, OpenClaw collects sanitized diagnostics and opens the
-[triage agent picker](/cli/triage). With `--yes`, `--json`, or no interactive
+interactive terminal, OpenClaw shows the selected agent, saved prompt path when
+available, and use of your own account/tokens, then asks before launching
+[triage](/cli/triage). Enter or `y` proceeds, `n` preserves diagnostics and prints
+handoff commands, and no answer within 30 seconds proceeds as Yes with a notice.
+With `--yes`, `--json`, or no interactive
 terminal, it prepares diagnostics and handoff commands without launching an
 agent. The original update failure and exit status remain authoritative;
 diagnostics do not turn a failed update into a successful one.
@@ -80,6 +83,14 @@ the CLI fallback on the Gateway host.
 ## Reason codes
 
 - `dirty`, `no-upstream`: repair the source checkout before retrying.
+- `plugin-target-unavailable`: an enabled configured npm plugin has no resolvable
+  target for the selected core, or its registry metadata could not be read. The
+  refusal identifies the plugin, package target, and registry error before the
+  serving Gateway stops or the core package changes. Retry after publication or
+  registry recovery, use `openclaw update --tag <older-version>`, or disable the
+  affected plugin and retry. If the core version is unknown, select an exact
+  registry version. Extended-stable rejects `--tag`; retry later or explicitly
+  switch channels. `--dry-run` performs the same availability check.
 - `preflight-insufficient-space`: free space on the filesystems containing
   preflight staging (the checkout's `.artifacts` area on POSIX) and the
   package-manager store, then retry. The updater stops on

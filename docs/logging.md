@@ -306,8 +306,60 @@ The structured warning also includes `pid`, Node's `threadId`, and `isMainThread
 for the opener emitting it. Inspect each `openclaw logs --json` event's original
 `raw` record; ordinary console text omits structured metadata.
 An opener on the main thread may have awaited an integrity Worker, so these
-fields do not identify the thread performing every phase. Correlate the process
-ID with the log timestamp and current process; PIDs can be reused after exit.
+fields do not identify the thread performing every phase. `admissionMode` records
+the actual `sync` or `async` open driver. Async admission offloads its initial
+integrity check; resumed validation and repair can still run on the opener.
+Correlate the process ID with the log timestamp and current process; PIDs can be
+reused after exit.
+
+SQLite reclamation Workers also emit `slow SQLite reclamation Worker operation`
+at `warn` when their joined operation takes at least one second. The record is
+emitted after Worker exit and parent admission settlement. It includes the
+parent's `pid`, `threadId` and `isMainThread`, the actual Node `workerThreadId`,
+`reclamationKind`, `elapsedMs`, terminal `outcome` (`resolved` or `rejected`), and
+`exitCode`. Timing starts after admission to the archive Worker queue and includes
+startup, validation, admission waits, work, and cleanup. It does not measure CPU
+time or isolate a validation phase. Short writer sections can therefore remain
+quiet while this whole-operation warning exposes slow preparation between them.
+The record inherits an existing parent trace when available; it contains no
+database path, session identifier, plan content, or raw error.
+
+### SQLite transaction timing
+
+The `sqlite/transaction` warnings `slow SQLite transaction hold`,
+`slow SQLite transaction lock wait`, and `SQLite transaction lock wait failed`
+include `pid`, Node's `threadId`, and `isMainThread` for the thread executing the
+transaction. Inspect the original `raw` record in `openclaw logs --json` to
+distinguish the main thread from Workers sharing the same process. `async: false`
+describes the synchronous transaction helper; it does not identify the thread.
+
+Hold time covers the synchronous callback and its result checks after `BEGIN`
+and before `COMMIT`, including any JavaScript consumer work inside that callback.
+It excludes database opening and the separately timed begin and commit steps.
+These elapsed durations do not measure SQL CPU time or establish a causal link
+to a nearby request.
+
+### SQLite session writes
+
+The `session-sqlite` subsystem emits `slow SQLite session write` when total
+elapsed time reaches 1000 ms, and `SQLite session write failed` when a write
+fails. Both warnings include `operation`, a label from a fixed set of semantic
+operation names identifying the callback that owns the SQLite writer lane.
+
+The timing fields separate the elapsed interval into:
+
+- `queueWaitMs`: time waiting to enter the writer lane.
+- `writerExecutionMs`: the owning callback's duration, including asynchronous waits.
+- `completionDelayMs`: time between callback completion and the caller resuming.
+
+These fields are available when the queued callback started and finished;
+`elapsedMs` records the total duration. Inspect the original `raw` record in
+`openclaw logs --json` to see the structured fields.
+
+Use `operation` to locate the owning code path. It does not identify a specific
+SQL statement, measure CPU time or lock contention, or establish that a nearby
+RPC caused the delay. Older records may lack `operation`; do not infer it from
+adjacent log messages.
 
 ### Slow reply preparation
 
@@ -323,6 +375,11 @@ flags, they warn at 10 seconds elapsed or 5 seconds in one preparation stage. Co
 logs each completed slow stage immediately, including failures, and emits a
 `native-turn-handoff` summary before submitting the native turn. Timing records
 contain stage names and identifiers, not prompts or tool arguments.
+
+Embedded-run startup, prep, core-plugin-tool and auth stage summaries include
+`pid`, `threadId` and `isMainThread` in the message to distinguish emitters sharing
+a log file. These identify the summary emitter, not where every timed operation
+ran. Elapsed stage time can include asynchronous waits and is not CPU time.
 
 Use the first `turn_accepted`, `model_call_started`, `tool_execution_started`, and
 `assistant_output_started` milestones to separate startup from later activity.
@@ -446,3 +503,4 @@ For OTLP export to a collector, see [OpenTelemetry export](/gateway/opentelemetr
 - [Diagnostics flags](/diagnostics/flags) — targeted debug-log flags
 - [Gateway logging internals](/gateway/logging) — WS log styles, subsystem prefixes, and console capture
 - [Configuration reference](/gateway/config-observability#diagnostics) — full `diagnostics.*` field reference
+- [`openclaw logs`](/cli/logs) — tail Gateway logs over RPC from the CLI
