@@ -269,11 +269,7 @@ describe("compaction single-pass fast path", () => {
       "This model's maximum context length was exceeded by the request",
     );
     mockGenerateSummary.mockReset();
-    mockGenerateSummary
-      .mockRejectedValueOnce(contextOverflow)
-      .mockRejectedValueOnce(contextOverflow)
-      .mockRejectedValueOnce(contextOverflow)
-      .mockResolvedValue("bounded summary");
+    mockGenerateSummary.mockRejectedValueOnce(contextOverflow).mockResolvedValue("bounded summary");
 
     await expect(
       summarizeInStages({
@@ -291,8 +287,9 @@ describe("compaction single-pass fast path", () => {
     const requestSizes = mockGenerateSummary.mock.calls.map(
       ([requestMessages]) => requestMessages.length,
     );
-    expect(requestSizes.slice(0, 3)).toEqual([messages.length, messages.length, messages.length]);
-    expect(requestSizes.slice(3).some((size) => size < messages.length)).toBe(true);
+    expect(requestSizes[0]).toBe(messages.length);
+    expect(requestSizes.slice(1).length).toBeGreaterThan(0);
+    expect(requestSizes.slice(1).every((size) => size < messages.length)).toBe(true);
   });
 
   it("budgets the converted shell transcript rather than its raw output only", async () => {

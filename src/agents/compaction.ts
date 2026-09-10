@@ -1,4 +1,3 @@
-import { resolveSummarizationRequestBudget } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import { CompactionError } from "../../packages/agent-core/src/harness/types.js";
 /**
  * Summarization and fallback helpers for transcript compaction.
@@ -11,7 +10,7 @@ import { retryAsync } from "../infra/retry.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   buildOversizedFallbackPlanWithWorker,
-  buildStageSplitPlanWithWorker,
+  buildSummarizationStagePlanWithWorker,
   buildSummaryChunksWithWorker,
 } from "./compaction-planning-worker.js";
 import {
@@ -20,12 +19,14 @@ import {
   estimateMessagesTokens,
   MIN_CHUNK_RATIO,
   SAFETY_MARGIN,
-  sanitizeCompactionMessages,
   SUMMARIZATION_OVERHEAD_TOKENS,
 } from "./compaction-planning.js";
 import { DEFAULT_CONTEXT_TOKENS } from "./defaults.js";
 import { isTimeoutError } from "./failover-error.js";
-import { isContextOverflowError } from "./failover/context-overflow.js";
+import {
+  isContextOverflowError,
+  isLikelyContextOverflowError,
+} from "./failover/context-overflow.js";
 import type {
   AgentMessage,
   CompactionSummaryPrompt,
@@ -164,7 +165,9 @@ async function summarizeChunks(params: CompactionSummaryParams): Promise<string>
           // Caller aborts and transport timeouts are terminal; provider-side
           // AbortErrors without caller cancellation remain retryable.
           shouldRetry: (err) =>
-            !params.signal.aborted && (isAbortError(err) || !isTimeoutError(err)),
+            !params.signal.aborted &&
+            !isLikelyContextOverflowError(formatErrorMessage(err)) &&
+            (isAbortError(err) || !isTimeoutError(err)),
         },
       );
     } catch (err) {
@@ -215,7 +218,10 @@ async function summarizeWithFallback(params: CompactionSummaryParams): Promise<s
     return await summarizeChunks(params);
   } catch (err) {
     lastError = err;
-    if (params.signal.aborted) {
+    if (
+      params.signal.aborted ||
+      (params.singlePass && isContextOverflowError(formatErrorMessage(lastError)))
+    ) {
       throw lastError;
     }
     log.warn(`Full summarization failed: ${formatErrorMessage(lastError)}`);
@@ -308,8 +314,12 @@ export async function summarizeInStages(
     return await summarizeWithFallback(params);
   }
 
-  const requestBudget = resolveSummarizationRequestBudget({
-    messages: sanitizeCompactionMessages(messages),
+  const plan = await buildSummarizationStagePlanWithWorker({
+    messages,
+    maxChunkTokens: params.maxChunkTokens,
+    parts: params.parts,
+    minMessagesForSplit: params.minMessagesForSplit,
+    contextWindow: params.contextWindow,
     customInstructions: buildCompactionSummarizationInstructions(
       params.customInstructions,
       params.summarizationInstructions,
@@ -319,15 +329,6 @@ export async function summarizeInStages(
     model: params.model,
     reserveTokens: params.reserveTokens,
     thinkingLevel: params.thinkingLevel,
-  });
-  const plan = await buildStageSplitPlanWithWorker({
-    messages,
-    maxChunkTokens: params.maxChunkTokens,
-    parts: params.parts,
-    minMessagesForSplit: params.minMessagesForSplit,
-    contextWindow: params.contextWindow,
-    singlePassInputTokens: requestBudget.singlePassInputTokens,
-    completionAllowanceTokens: requestBudget.completionAllowanceTokens,
     signal: params.signal,
   });
 

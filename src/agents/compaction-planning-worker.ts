@@ -1,3 +1,5 @@
+import type { Model } from "@openclaw/llm-core";
+import { resolveSummarizationRequestBudget } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import {
   CompactionPlanningWorkerError,
   runCompactionPlanningWorker,
@@ -20,7 +22,7 @@ import type {
   CompactionPlanningWorkerInput,
   CompactionPlanningWorkerValue,
 } from "./compaction-planning.worker.js";
-import type { AgentMessage } from "./runtime/index.js";
+import type { AgentMessage, CompactionSummaryPrompt, ThinkingLevel } from "./runtime/index.js";
 
 // Worker startup is more expensive than local planning for tiny histories.
 // Keep small compactions synchronous; move only starvation-sized plans off-thread.
@@ -39,9 +41,29 @@ function restoreIndexedMessages(source: AgentMessage[], indexes: number[]): Agen
   });
 }
 
+function replacePlanningMessages(
+  input: CompactionPlanningWorkerInput,
+  messages: AgentMessage[],
+): CompactionPlanningWorkerInput {
+  switch (input.kind) {
+    case "summaryChunks":
+    case "oversizedFallback":
+    case "stageSplit":
+    case "summarizationStagePlan":
+    case "adaptiveChunkRatio":
+      return { ...input, messages };
+    default:
+      throw new CompactionPlanningWorkerError(
+        "unsupported compaction planning input kind",
+        "failed",
+      );
+  }
+}
+
 async function runCompactionPlan<TInput extends CompactionPlanningWorkerInput, TResult>(params: {
   input: TInput;
   signal?: AbortSignal;
+  projectWorkerMessages?: boolean;
   fallback: (messages: AgentMessage[]) => TResult;
   restore: (
     value: Extract<CompactionPlanningWorkerValue, { kind: TInput["kind"] }>,
@@ -51,15 +73,16 @@ async function runCompactionPlan<TInput extends CompactionPlanningWorkerInput, T
   params.signal?.throwIfAborted();
   const messages = sanitizeCompactionMessages(params.input.messages);
   if (messages.length < COMPACTION_PLANNING_WORKER_MIN_MESSAGES) {
-    return params.fallback(params.input.messages);
+    return params.fallback(messages);
   }
 
   try {
+    const workerMessages =
+      params.projectWorkerMessages === false
+        ? messages
+        : projectCompactionMessagesForPlanning(messages);
     const value = await runCompactionPlanningWorker({
-      input: {
-        ...params.input,
-        messages: projectCompactionMessagesForPlanning(messages),
-      },
+      input: replacePlanningMessages(params.input, workerMessages),
       signal: params.signal,
     });
     params.signal?.throwIfAborted();
@@ -116,30 +139,41 @@ export async function buildOversizedFallbackPlanWithWorker(params: {
   });
 }
 
-/** Builds a staged summarization split plan with worker fallback. */
-export async function buildStageSplitPlanWithWorker(params: {
+/**
+ * Computes the exact whole-request budget and stage split together. Large histories
+ * stay off the runtime thread; small histories and unavailable workers keep the
+ * completion owner's synchronous fallback semantics.
+ */
+export async function buildSummarizationStagePlanWithWorker(params: {
   messages: AgentMessage[];
   maxChunkTokens: number;
   parts?: number;
   minMessagesForSplit?: number;
   contextWindow?: number;
-  singlePassInputTokens?: number;
-  completionAllowanceTokens?: number;
+  customInstructions?: string;
+  previousSummary?: string;
+  summaryPrompt?: CompactionSummaryPrompt;
+  model: Model;
+  reserveTokens: number;
+  thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
 }): Promise<StageSplitPlan> {
   const { signal, ...planningInput } = params;
   return runCompactionPlan({
-    input: { kind: "stageSplit", ...planningInput },
+    input: { kind: "summarizationStagePlan", ...planningInput },
     signal,
-    fallback: (messages) => buildStageSplitPlan({ ...planningInput, messages }),
+    projectWorkerMessages: false,
+    fallback: (messages) => {
+      const requestBudget = resolveSummarizationRequestBudget({ ...planningInput, messages });
+      return buildStageSplitPlan({ ...planningInput, messages, ...requestBudget });
+    },
     restore: (value, messages) =>
       value.mode === "split"
         ? {
             mode: "split",
             chunks: value.chunkIndexes.map((indexes) => restoreIndexedMessages(messages, indexes)),
           }
-        : // Dropping this flag here would silently re-bound a verified single-pass plan.
-          { mode: "single", fitsWholeRequest: value.fitsWholeRequest },
+        : { mode: "single", fitsWholeRequest: value.fitsWholeRequest },
   });
 }
 

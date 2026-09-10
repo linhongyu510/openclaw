@@ -12,7 +12,7 @@ import {
 } from "./compaction-planning-worker-runtime.js";
 import {
   buildOversizedFallbackPlanWithWorker,
-  buildStageSplitPlanWithWorker,
+  buildSummarizationStagePlanWithWorker,
   buildSummaryChunksWithWorker,
   computeAdaptiveChunkRatioWithWorker,
 } from "./compaction-planning-worker.js";
@@ -39,6 +39,19 @@ function createSyntheticWorkerUrl(source: string): URL {
   return new URL(`data:text/javascript,${encodeURIComponent(source)}`);
 }
 
+const TEST_MODEL = {
+  id: "gpt-5.6-luna",
+  name: "Synthetic context-limit model",
+  api: "openai-responses",
+  provider: "openai",
+  baseUrl: "https://unused.invalid",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 1_000_000,
+  maxTokens: 8_192,
+} satisfies Parameters<typeof summarizeInStages>[0]["model"];
+
 const cancellablePlanningOperations = [
   {
     operation: "summary chunks",
@@ -51,9 +64,16 @@ const cancellablePlanningOperations = [
       buildOversizedFallbackPlanWithWorker({ messages, contextWindow: 1_200, signal }),
   },
   {
-    operation: "stage splitting",
+    operation: "stage request budgeting",
     run: (messages: AgentMessage[], signal: AbortSignal) =>
-      buildStageSplitPlanWithWorker({ messages, maxChunkTokens: 1_200, signal }),
+      buildSummarizationStagePlanWithWorker({
+        messages,
+        maxChunkTokens: 1_200,
+        contextWindow: TEST_MODEL.contextWindow,
+        model: TEST_MODEL,
+        reserveTokens: 4_096,
+        signal,
+      }),
   },
   {
     operation: "adaptive chunk sizing",
@@ -117,6 +137,26 @@ describe("compaction planning worker", () => {
       await expect(run(messages, signal)).rejects.toBe(reason);
     },
   );
+
+  it("does not inspect large history after compaction is already cancelled", async () => {
+    const reason = new Error("operator cancelled before planning");
+    const unreadableMessages = new Proxy([] as AgentMessage[], {
+      get() {
+        throw new Error("history should remain unread");
+      },
+    });
+
+    await expect(
+      buildSummarizationStagePlanWithWorker({
+        messages: unreadableMessages,
+        maxChunkTokens: 1_200,
+        contextWindow: TEST_MODEL.contextWindow,
+        model: TEST_MODEL,
+        reserveTokens: 4_096,
+        signal: AbortSignal.abort(reason),
+      }),
+    ).rejects.toBe(reason);
+  });
 
   it("does not resume cancelled compaction when its worker becomes unavailable", async () => {
     const controller = new AbortController();
@@ -297,18 +337,7 @@ describe("compaction planning worker", () => {
   );
 
   it("summarizes CJK history after ASCII exhausts the worker projection budget", async () => {
-    const model = {
-      id: "gpt-5.6-luna",
-      name: "Synthetic context-limit model",
-      api: "openai-responses",
-      provider: "openai",
-      baseUrl: "https://unused.invalid",
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 1_000_000,
-      maxTokens: 8_192,
-    } satisfies Parameters<typeof summarizeInStages>[0]["model"];
+    const model = TEST_MODEL;
     const markers = Array.from(
       { length: 64 },
       (_, index) => `[history-${String(index).padStart(2, "0")}]`,
@@ -400,6 +429,19 @@ describe("compaction planning worker", () => {
     expect(value.chunkIndexes.length).toBeGreaterThan(1);
   });
 
+  it("budgets and plans a summarization stage for worker input", () => {
+    const value = runCompactionPlanningWorkerInput({
+      kind: "summarizationStagePlan",
+      messages: Array.from({ length: 64 }, (_, index) => makeMessage(index + 1)),
+      maxChunkTokens: 1_200,
+      contextWindow: TEST_MODEL.contextWindow,
+      model: TEST_MODEL,
+      reserveTokens: 4_096,
+    });
+
+    expect(value).toMatchObject({ kind: "summarizationStagePlan" });
+  });
+
   it.each([
     { kind: "oversizedFallback", messages: [makeMessage(1)], contextWindow: 1200 },
     { kind: "stageSplit", messages: [makeMessage(1)], maxChunkTokens: 1200 },
@@ -480,6 +522,73 @@ describe("compaction planning worker", () => {
       code: "unavailable",
     });
   });
+
+  it("dispatches exact request budgeting with stage planning", async () => {
+    const workerKinds: string[] = [];
+    const worker = vi
+      .spyOn(compactionPlanningWorkerRuntime, "runCompactionPlanningWorker")
+      .mockImplementation(async ({ input }) => {
+        workerKinds.push(input.kind);
+        if (input.kind === "summarizationStagePlan") {
+          return { kind: input.kind, mode: "single", fitsWholeRequest: true };
+        }
+        if (input.kind === "summaryChunks") {
+          return {
+            kind: input.kind,
+            chunkIndexes: [input.messages.map((_, index) => index)],
+          };
+        }
+        throw new Error(`unexpected worker input: ${input.kind}`);
+      });
+    try {
+      const summary = await summarizeInStages({
+        messages: Array.from({ length: 64 }, (_, index) => makeMessage(index + 1)),
+        model: TEST_MODEL,
+        apiKey: "synthetic-no-credential", // pragma: allowlist secret
+        reserveTokens: 4_096,
+        maxChunkTokens: 1_200,
+        contextWindow: TEST_MODEL.contextWindow,
+        signal: AbortSignal.timeout(30_000),
+        streamFn: () => {
+          const stream = createAssistantMessageEventStream();
+          stream.push({
+            type: "done",
+            reason: "stop",
+            message: makeAgentAssistantMessage({
+              content: [{ type: "text", text: "Compact summary." }],
+            }),
+          });
+          stream.end();
+          return stream;
+        },
+      });
+
+      expect(summary).toBe("Compact summary.");
+      expect(workerKinds[0]).toBe("summarizationStagePlan");
+    } finally {
+      worker.mockRestore();
+    }
+  });
+
+  it("keeps timers responsive while budgeting exact large-history requests", async () => {
+    const messages = Array.from({ length: 180 }, (_, index) =>
+      makeMessage(index + 1, "x".repeat(12_000)),
+    );
+    const timer = new Promise<"timer">((resolve) => {
+      setTimeout(() => resolve("timer"), 0);
+    });
+    const planning = buildSummarizationStagePlanWithWorker({
+      messages,
+      maxChunkTokens: 8_000,
+      parts: 4,
+      contextWindow: TEST_MODEL.contextWindow,
+      model: TEST_MODEL,
+      reserveTokens: 4_096,
+    }).then(() => "planning" as const);
+
+    await expect(Promise.race([timer, planning])).resolves.toBe("timer");
+    await expect(planning).resolves.toBe("planning");
+  }, 30_000);
 
   it("keeps timers responsive while planning large histories", async () => {
     // Planning large histories must happen off the main event loop; a 0ms timer
