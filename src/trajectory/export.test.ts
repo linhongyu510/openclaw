@@ -823,7 +823,7 @@ describe("exportTrajectoryBundle", () => {
       });
       const resultText = readResult.content.find((part) => part.type === "text")?.text;
       expect(resultText).toContain("[12 more lines in file. Use offset=4 to continue.]");
-      writeToolCallSessionFile(sessionFile, expectDefined(resultText));
+      writeToolCallSessionFile(sessionFile, expectDefined(resultText, "read result text"));
 
       await exportTrajectoryBundle({
         outputDir,
