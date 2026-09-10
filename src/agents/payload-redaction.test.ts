@@ -224,6 +224,48 @@ describe("sanitizeDiagnosticPayload", () => {
     expect(sanitizeDiagnosticPayload(value)).toBe(value);
   });
 
+  it("preserves a long plain page and its pagination notice", () => {
+    const value = `${"read evidence\n".repeat(1500)}[[continue]]\n[2 more lines in file. Use offset=3 to continue.]`;
+    expect(sanitizeDiagnosticPayload(value)).toBe(value);
+  });
+
+  it.each([
+    ["", "[2 ordinary lines remain] token=<redacted>"],
+    ["=short-secret", "[Malformed diagnostic JSON redacted]"],
+  ])("requires a complete redaction marker before preserving prose (%s)", (suffix, expected) => {
+    expect(sanitizeDiagnosticPayload(`[2 ordinary lines remain] token=<redacted>${suffix}`)).toBe(
+      expected,
+    );
+  });
+
+  it.each([
+    '[true-story,"sk-synthetic-secret-value"]',
+    '[false-positive,"sk-synthetic-secret-value"]',
+    '[null-value,"sk-synthetic-secret-value"]',
+    "[1 note token=short-secret]",
+    "[1 note token=1234]",
+    "[1 note b64_json=QUJDRA==]",
+    "[1 note image=QUJDRA==]",
+    "[1 note type=image data=QUJDRA==]",
+    "[1 note data=QUJDRA== type=image]",
+    "[1 note status=token=short-secret]",
+    "[1 note status=b64_json=QUJDRA==]",
+    "[1 note token==short-secret]",
+    "[1 note b64_json==QUJDRA==]",
+    "[1 note type==image data=QUJDRA==]",
+    "[1 note token= =short-secret]",
+    '[[2 ordinary lines remain],"sk-synthetic-secret-value"]',
+    '[ [2 ordinary lines remain],"sk-synthetic-secret-value"]',
+    '[note [2 ordinary lines remain],"sk-synthetic-secret-value"]',
+  ])("keeps structured admission around prose: %s", (value) => {
+    expect(sanitizeDiagnosticPayload(value)).toBe("[Malformed diagnostic JSON redacted]");
+  });
+
+  it("preserves an ordinary comparison alongside numeric prose", () => {
+    const value = "count == 3\n[2 ordinary lines remain]";
+    expect(sanitizeDiagnosticPayload(value)).toBe(value);
+  });
+
   it.each([
     "[GoogleGenerativeAI Error]: provider unavailable",
     "[429] rate limited: retry later",
@@ -249,6 +291,16 @@ describe("sanitizeDiagnosticPayload", () => {
 
     expect(sanitized).not.toContain(MEDIA_DATA);
     expect(sanitized).toBe("[Malformed diagnostic JSON redacted]");
+  });
+
+  it.each([
+    '[note "-----BEGIN PRIVATE KEY-----\\nQUJDRA==\\n-----END PRIVATE KEY-----"] {"ok":true}',
+    '[note "sk-synthetic-secret-value"] {"ok":true}',
+    '[note "\\u002d\\u002d\\u002d\\u002d\\u002dBEGIN PRIVATE KEY-----QUJDRA=="] {"ok":true}',
+    '[note -----BEGIN PRIVATE KEY-----\nQUJDRA==\n-----END PRIVATE KEY-----] {"ok":true}',
+    '[note token=short-secret] {"ok":true}',
+  ])("fails closed for nonnumeric structured fragments: %s", (value) => {
+    expect(sanitizeDiagnosticPayload(value)).toBe("[Malformed diagnostic JSON redacted]");
   });
 
   it.each([

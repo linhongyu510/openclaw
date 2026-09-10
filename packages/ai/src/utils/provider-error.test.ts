@@ -4,6 +4,53 @@ import { configureProviderErrorRedactor, projectProviderError } from "./provider
 
 describe("projectProviderError", () => {
   it.each([
+    ["", "[2 ordinary lines remain] token=<redacted>"],
+    ["=short-secret", "[Malformed diagnostic JSON redacted]"],
+  ])("requires a complete redaction marker before preserving prose (%s)", (suffix, expected) => {
+    expect(
+      projectProviderError(`[2 ordinary lines remain] token=<redacted>${suffix}`).errorMessage,
+    ).toBe(expected);
+  });
+
+  it.each([
+    '[true-story,"sk-synthetic-secret-value"]',
+    '[false-positive,"sk-synthetic-secret-value"]',
+    '[null-value,"sk-synthetic-secret-value"]',
+    "[1 note token=short-secret]",
+    "[1 note token=1234]",
+    "[1 note b64_json=QUJDRA==]",
+    "[1 note image=QUJDRA==]",
+    "[1 note type=image data=QUJDRA==]",
+    "[1 note data=QUJDRA== type=image]",
+    "[1 note status=token=short-secret]",
+    "[1 note status=b64_json=QUJDRA==]",
+    "[1 note token==short-secret]",
+    "[1 note b64_json==QUJDRA==]",
+    "[1 note type==image data=QUJDRA==]",
+    "[1 note token= =short-secret]",
+    '[[2 ordinary lines remain],"sk-synthetic-secret-value"]',
+    '[ [2 ordinary lines remain],"sk-synthetic-secret-value"]',
+    '[note [2 ordinary lines remain],"sk-synthetic-secret-value"]',
+  ])("keeps structured admission around prose: %s", (error) => {
+    expect(projectProviderError(error).errorMessage).toBe("[Malformed diagnostic JSON redacted]");
+  });
+
+  it("preserves an ordinary comparison alongside numeric prose", () => {
+    const value = "count == 3\n[2 ordinary lines remain]";
+    expect(projectProviderError(value).errorMessage).toBe(value);
+  });
+
+  it.each([
+    '[note "-----BEGIN PRIVATE KEY-----\\nQUJDRA==\\n-----END PRIVATE KEY-----"] {"ok":true}',
+    '[note "sk-synthetic-secret-value"] {"ok":true}',
+    '[note "\\u002d\\u002d\\u002d\\u002d\\u002dBEGIN PRIVATE KEY-----QUJDRA=="] {"ok":true}',
+    '[note -----BEGIN PRIVATE KEY-----\nQUJDRA==\n-----END PRIVATE KEY-----] {"ok":true}',
+    '[note token=short-secret] {"ok":true}',
+  ])("fails closed for nonnumeric structured fragments: %s", (error) => {
+    expect(projectProviderError(error).errorMessage).toBe("[Malformed diagnostic JSON redacted]");
+  });
+
+  it.each([
     "\nQUJDRA==\n-----END PRIVATE KEY-----",
     "QUJDRA==-----END PRIVATE KEY-----",
     "QUJDRA==",
