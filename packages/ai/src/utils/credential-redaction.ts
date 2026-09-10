@@ -34,13 +34,19 @@ const LOOSE_CREDENTIAL_PAIR_RE =
 const MEDIA_DATA_URL_RE =
   /data:(?:audio|image|video)\/[a-z0-9.+-]+(?:;[^,;\s]+)*;base64,[ \t]*(?:\r?\n[ \t]*)?[a-z0-9+/_=-]+(?:[ \t]*\r?\n[ \t]*[a-z0-9+/_=-]+)*/giu;
 const MAX_DIAGNOSTIC_JSON_LENGTH = 16 * 1024;
-const PLAIN_BRACKET_TAG_RE = /^\[[A-Za-z0-9][A-Za-z0-9 _.-]*\]$/u;
-const JSON_ARRAY_START_RE = /\[\s*(?:[{"\d\]-]|true\b|false\b|null\b)/u;
+// Complete count-and-prose notices are not arrays; numeric grammar stays with JSON.parse.
+const NUMERIC_BRACKET_PROSE_RE =
+  /\[\s*\d+\s+(?!(?:true|false|null)(?![\w-]))[A-Za-z][^"'\\[\]{},:]*\]/gu;
+const PRIVATE_KEY_HEADER_RE = /-----BEGIN [A-Z ]*PRIVATE KEY/iu;
+const JSON_ARRAY_START_RE = /\[\s*(?:[{"\d\]-]|(?:true|false|null)(?![\w-]))/u;
 const MALFORMED_JSON_RE =
   /\{|(?:"[^"]+"|\b(?:b64_json|data|(?:input|output)?(?:audio|image|video)[\w-]*))\s*:/iu;
 
 function looksLikeDiagnosticJson(value: string): boolean {
-  return JSON_ARRAY_START_RE.test(value) || MALFORMED_JSON_RE.test(value);
+  const arrayText = value.replace(NUMERIC_BRACKET_PROSE_RE, (fragment) =>
+    PRIVATE_KEY_HEADER_RE.test(fragment) ? fragment : "[text]",
+  );
+  return JSON_ARRAY_START_RE.test(arrayText) || MALFORMED_JSON_RE.test(value);
 }
 
 function normalizeDiagnosticFieldName(value: string): string {
@@ -257,7 +263,7 @@ export function redactDiagnosticText(value: string): string {
       const projected = projectDiagnosticValue(parsed, {}, new WeakSet(), false, state);
       redacted += state.changed ? stableStringify(projected) : fragment.json;
     } catch {
-      if (!PLAIN_BRACKET_TAG_RE.test(fragment.json) || JSON_ARRAY_START_RE.test(fragment.json)) {
+      if (looksLikeDiagnosticJson(fragment.json)) {
         return "[Malformed diagnostic JSON redacted]";
       }
       redacted += fragment.json;

@@ -4,6 +4,27 @@ import { configureProviderErrorRedactor, projectProviderError } from "./provider
 
 describe("projectProviderError", () => {
   it.each([
+    "\nQUJDRA==\n-----END PRIVATE KEY-----",
+    "QUJDRA==-----END PRIVATE KEY-----",
+    "QUJDRA==",
+    "",
+  ])("fails closed for numeric prose containing a raw private key (%j)", (body) => {
+    const error = `[1 note -----BEGIN RSA PRIVATE KEY-----${body}]`;
+    expect(projectProviderError(error).errorMessage).toBe("[Malformed diagnostic JSON redacted]");
+  });
+
+  it.each(["-", "01", "1e+", "1x", "1x words", "1 words"])(
+    "redacts malformed numeric array %s without host strengthening",
+    (prefix) => {
+      const error = `[${prefix},"-----BEGIN PRIVATE KEY-----\\nQUJDRA==\\n-----END PRIVATE KEY-----"]`;
+      expect(projectProviderError(error)).toEqual({
+        stopReason: "error",
+        errorMessage: "[Malformed diagnostic JSON redacted]",
+      });
+    },
+  );
+
+  it.each([
     ["335", 7],
     ["8500", 8.5],
   ])(
