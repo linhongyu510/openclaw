@@ -187,7 +187,7 @@ function writeToolCallOnlySessionFile(sessionFile: string): void {
   );
 }
 
-function writeToolCallSessionFile(sessionFile: string): void {
+function writeToolCallSessionFile(sessionFile: string, toolResultText = "README contents"): void {
   const header = {
     type: "session",
     version: 3,
@@ -226,7 +226,7 @@ function writeToolCallSessionFile(sessionFile: string): void {
       id: "entry-tool-result",
       parentId: "entry-tool-call",
       timestamp: "2026-04-01T05:46:42.000Z",
-      message: toolResultMessage([{ type: "text", text: "README contents" }]),
+      message: toolResultMessage([{ type: "text", text: toolResultText }]),
     },
     {
       type: "message",
@@ -801,6 +801,35 @@ describe("exportTrajectoryBundle", () => {
     );
 
     expect(artifacts).toBeUndefined();
+  });
+
+  it("preserves paginated read evidence in exported trajectory events", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    const paginationNotice = "[12 more lines in file. Use offset=34 to continue.]";
+    writeToolCallSessionFile(sessionFile, `Project: Orion\nOwner: Vega\n\n${paginationNotice}`);
+
+    await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+    });
+
+    const exportedEvents = fs
+      .readFileSync(path.join(outputDir, "events.jsonl"), "utf8")
+      .trim()
+      .split(/\r?\n/u)
+      .map((line) => JSON.parse(line) as TrajectoryEvent);
+    const toolResult = exportedEvents.find((event) => event.type === "tool.result");
+
+    expect(toolResult?.data).toMatchObject({
+      message: {
+        isError: false,
+        content: [{ type: "text", text: `Project: Orion\nOwner: Vega\n\n${paginationNotice}` }],
+      },
+    });
   });
 
   it("preserves numeric transcript timestamps", async () => {

@@ -224,12 +224,15 @@ describe("sanitizeDiagnosticPayload", () => {
     expect(sanitizeDiagnosticPayload(value)).toBe(value);
   });
 
-  it.each(["[GoogleGenerativeAI Error]: provider unavailable", "[429] rate limited: retry later"])(
-    "preserves plain bracketed diagnostic text",
-    (value) => {
-      expect(sanitizeDiagnosticPayload(value)).toBe(value);
-    },
-  );
+  it.each([
+    "[GoogleGenerativeAI Error]: provider unavailable",
+    "[429] rate limited: retry later",
+    "[2 more lines in file. Use offset=3 to continue.]",
+    "[12 more lines in file. Use offset=34 to continue.]",
+    "[0 records matched the query.]",
+  ])("preserves plain bracketed diagnostic text", (value) => {
+    expect(sanitizeDiagnosticPayload(value)).toBe(value);
+  });
 
   it("fails closed for malformed JSON diagnostic strings", () => {
     const sanitized = sanitizeDiagnosticPayload('{"type":"video","data":"QUJDRA=="');
@@ -237,6 +240,13 @@ describe("sanitizeDiagnosticPayload", () => {
     expect(sanitized).not.toContain(MEDIA_DATA);
     expect(sanitized).toBe("[Malformed diagnostic JSON redacted]");
   });
+
+  it.each(["[0,1", "[true false]", '[null{"type":"video","data":"QUJDRA=="}]'])(
+    "fails closed for malformed JSON arrays",
+    (value) => {
+      expect(sanitizeDiagnosticPayload(value)).toBe("[Malformed diagnostic JSON redacted]");
+    },
+  );
 
   it("fails closed for hostile diagnostic properties", () => {
     const value = { type: "video", data: MEDIA_DATA };
