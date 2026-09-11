@@ -744,10 +744,21 @@ function resolveSummarizationCompletionAllowance(params: {
   ) {
     return params.maxTokens;
   }
+  // Anthropic's direct transport coerces non-adaptive "max" to "high" before
+  // adjustMaxTokensForThinking, so the budget must match that coercion. Bedrock's
+  // resolveSimpleBedrockOptions passes the requested level through unchanged,
+  // which means a Bedrock "max" request reserves the full 32 768-token budget.
+  // Coercing Bedrock "max" to "high" here would undercount by 16 384 tokens and
+  // let a near-window request bypass chunking only to overflow at the provider.
+  const budgetReasoning = isClaudeBedrockModel(params.model)
+    ? reasoning
+    : reasoning === "max"
+      ? "high"
+      : reasoning;
   const adjusted = adjustMaxTokensForThinking(
     params.maxTokens,
     params.model.maxTokens,
-    reasoning === "max" ? "high" : reasoning,
+    budgetReasoning,
     options.thinkingBudgets,
   );
   return adjusted.thinkingBudget >= 1024 ? adjusted.maxTokens : params.maxTokens;
