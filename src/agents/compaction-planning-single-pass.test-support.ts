@@ -12,6 +12,7 @@ vi.mock("./sessions/index.js", async () => {
 import { resolveSummarizationRequestBudget } from "../../packages/agent-core/src/harness/compaction/compaction.js";
 import { serializeConversation } from "../../packages/agent-core/src/harness/compaction/utils.js";
 import { convertToLlm } from "../../packages/agent-core/src/harness/messages.js";
+import { adjustMaxTokensForThinking } from "../../packages/ai/src/providers/simple-options.js";
 import {
   BASE_CHUNK_RATIO,
   buildStageSplitPlan,
@@ -261,62 +262,79 @@ describe("compaction single-pass fast path", () => {
     ).toBeGreaterThan(1);
   });
 
-  it("reserves Bedrock max-reasoning allowance instead of coercing to high", () => {
-    // Non-adaptive Claude on Bedrock passes reasoning "max" through to
-    // adjustMaxTokensForThinking (resolveSimpleBedrockOptions), reserving the
-    // 32 768-token max budget. The direct Anthropic transport coerces "max" to
-    // "high" (16 384). The compaction budget must match each transport.
-    const bedrockModel = {
-      ...TEST_MODEL,
-      id: "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-      name: "Claude 3.5 Sonnet",
-      api: "bedrock-converse-stream",
-      provider: "amazon-bedrock",
-      reasoning: true,
-    } satisfies Parameters<typeof resolveSummarizationRequestBudget>[0]["model"];
-    const anthropicModel = {
+  it("budgets each Anthropic transport's actual max-reasoning allowance", () => {
+    // adjustMaxTokensForThinking natively supports "max" (32 768) and only
+    // clamps "xhigh", so any max->high narrowing is a per-transport decision:
+    //   - streamSimpleAnthropic (packages/ai/src/providers/anthropic.ts) and
+    //     resolveSimpleBedrockOptions forward the requested level unchanged;
+    //   - the managed transport stream
+    //     (packages/ai/src/transports/anthropic-transport-stream.ts) coerces
+    //     "max" to "high", and only runs behind the
+    //     "openclaw-anthropic-messages-transport" alias.
+    // Assert against that contract rather than assuming Anthropic max == high.
+    const reserveTokens = 8_192;
+    const messages = buildTranscript(10, 2_000);
+    const summaryOutputTokens = Math.min(Math.floor(0.8 * reserveTokens), TEST_MODEL.maxTokens);
+
+    /** Allowance the given transport really requests for a thinking level. */
+    const transportAllowance = (level: "high" | "max") => {
+      const adjusted = adjustMaxTokensForThinking(summaryOutputTokens, TEST_MODEL.maxTokens, level);
+      return adjusted.thinkingBudget >= 1024 ? adjusted.maxTokens : summaryOutputTokens;
+    };
+
+    const baseClaude = {
       ...TEST_MODEL,
       id: "claude-3-5-sonnet-20241022",
-      api: "anthropic-messages",
-      provider: "anthropic",
+      name: "Claude 3.5 Sonnet",
       reasoning: true,
-    } satisfies Parameters<typeof resolveSummarizationRequestBudget>[0]["model"];
-    const messages = buildTranscript(10, 2_000);
-    const reserveTokens = 8_192;
+    };
+    const models = {
+      // Default simple-runtime route: forwards "max" unchanged.
+      anthropicDirect: {
+        ...baseClaude,
+        api: "anthropic-messages",
+        provider: "anthropic",
+      },
+      // Managed transport alias: coerces "max" to "high".
+      anthropicManagedTransport: {
+        ...baseClaude,
+        api: "openclaw-anthropic-messages-transport",
+        provider: "anthropic",
+      },
+      // Bedrock adapter: forwards "max" unchanged.
+      bedrock: {
+        ...baseClaude,
+        id: "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        api: "bedrock-converse-stream",
+        provider: "amazon-bedrock",
+      },
+    } as const;
 
-    const bedrockMax = resolveRequestBudget(messages, {
-      model: bedrockModel,
-      reserveTokens,
-      thinkingLevel: "max",
-    });
-    const anthropicMax = resolveRequestBudget(messages, {
-      model: anthropicModel,
-      reserveTokens,
-      thinkingLevel: "max",
-    });
-    const bedrockHigh = resolveRequestBudget(messages, {
-      model: bedrockModel,
-      reserveTokens,
-      thinkingLevel: "high",
-    });
+    const budgetFor = (
+      model: Parameters<typeof resolveSummarizationRequestBudget>[0]["model"],
+      thinkingLevel: "high" | "max",
+    ) =>
+      resolveRequestBudget(messages, { model, reserveTokens, thinkingLevel })
+        .completionAllowanceTokens;
 
-    // Bedrock "max" must reserve the full 32 768 budget; Anthropic "max"
-    // matches its transport's max→high coercion (16 384). The gap is exactly
-    // the 16 384-token difference between max and high thinking budgets.
-    expect(bedrockMax.completionAllowanceTokens - anthropicMax.completionAllowanceTokens).toBe(
-      16_384,
+    // Transports that forward "max" must budget the full max allowance.
+    expect(budgetFor(models.anthropicDirect, "max")).toBe(transportAllowance("max"));
+    expect(budgetFor(models.bedrock, "max")).toBe(transportAllowance("max"));
+    // The managed transport narrows "max" to "high", so its budget must too.
+    expect(budgetFor(models.anthropicManagedTransport, "max")).toBe(transportAllowance("high"));
+    // "high" is never narrowed, so every route agrees on it.
+    for (const model of Object.values(models)) {
+      expect(budgetFor(model, "high")).toBe(transportAllowance("high"));
+    }
+    // The narrowing is exactly one thinking-budget step (32 768 - 16 384).
+    expect(
+      budgetFor(models.anthropicDirect, "max") - budgetFor(models.anthropicManagedTransport, "max"),
+    ).toBe(16_384);
+    // Forwarding transports must not silently collapse "max" onto "high".
+    expect(budgetFor(models.anthropicDirect, "max")).toBeGreaterThan(
+      budgetFor(models.anthropicDirect, "high"),
     );
-    // Bedrock "max" is genuinely larger than Bedrock "high", not silently equal.
-    expect(bedrockMax.completionAllowanceTokens).toBeGreaterThan(
-      bedrockHigh.completionAllowanceTokens,
-    );
-    // Anthropic "max" is coerced to high, so it equals its high budget.
-    const anthropicHigh = resolveRequestBudget(messages, {
-      model: anthropicModel,
-      reserveTokens,
-      thinkingLevel: "high",
-    });
-    expect(anthropicMax.completionAllowanceTokens).toBe(anthropicHigh.completionAllowanceTokens);
+    expect(budgetFor(models.bedrock, "max")).toBeGreaterThan(budgetFor(models.bedrock, "high"));
   });
 
   it("falls back to bounded chunks when a verified single-pass request overflows", async () => {

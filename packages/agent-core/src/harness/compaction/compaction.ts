@@ -704,6 +704,19 @@ function buildSummarizationPromptText(params: {
   return promptText;
 }
 
+/** Managed-transport alias applied when the host requires OpenClaw's HTTP transport. */
+const MANAGED_ANTHROPIC_TRANSPORT_API = "openclaw-anthropic-messages-transport";
+
+/** Returns whether the api is the managed Anthropic Messages transport alias. */
+function isManagedAnthropicTransportApi(api: string): boolean {
+  return api === MANAGED_ANTHROPIC_TRANSPORT_API;
+}
+
+/** Returns whether the api routes through Anthropic Messages, alias included. */
+function isAnthropicMessagesApi(api: string): boolean {
+  return api === "anthropic-messages" || isManagedAnthropicTransportApi(api);
+}
+
 function isClaudeBedrockModel(model: Model): boolean {
   if (model.api !== "bedrock-converse-stream") {
     return false;
@@ -720,6 +733,34 @@ function isClaudeBedrockModel(model: Model): boolean {
     name.includes("anthropic/claude") ||
     name.includes("claude")
   );
+}
+
+/**
+ * Returns the thinking level the model's executing transport will actually pass
+ * to `adjustMaxTokensForThinking`.
+ *
+ * `adjustMaxTokensForThinking` natively supports "max" (32 768) and only clamps
+ * "xhigh" internally, so any max->high narrowing is a per-transport decision:
+ *
+ * - `streamSimpleAnthropic` (packages/ai/src/providers/anthropic.ts) forwards
+ *   `reasoning` unchanged. This is the default simple-runtime route for
+ *   `anthropic-messages`, registered as `streamSimple` in register-builtins.ts.
+ * - `resolveSimpleBedrockOptions` (extensions/amazon-bedrock/stream.runtime.ts)
+ *   likewise forwards the requested level unchanged.
+ * - The managed transport stream (packages/ai/src/transports/anthropic-transport-stream.ts)
+ *   coerces "max" to "high". It only runs when the host reports a managed
+ *   transport requirement (request.proxy / request.tls / localService), which
+ *   `prepareTransportAwareSimpleModel` signals by rewriting `model.api` to the
+ *   `openclaw-anthropic-messages-transport` alias.
+ *
+ * Budgeting therefore follows the alias: an un-aliased model keeps the
+ * requested level, and only the managed-transport alias narrows "max".
+ */
+function resolveTransportThinkingLevel<TLevel extends Exclude<ThinkingLevel, "off">>(
+  model: Model,
+  reasoning: TLevel,
+): TLevel | "high" {
+  return isManagedAnthropicTransportApi(model.api) && reasoning === "max" ? "high" : reasoning;
 }
 
 function resolveSummarizationCompletionAllowance(params: {
@@ -739,26 +780,15 @@ function resolveSummarizationCompletionAllowance(params: {
   if (
     !reasoning ||
     reasoning === "off" ||
-    (params.model.api !== "anthropic-messages" && !isClaudeBedrockModel(params.model)) ||
+    (!isAnthropicMessagesApi(params.model.api) && !isClaudeBedrockModel(params.model)) ||
     supportsClaudeAdaptiveThinking(params.model)
   ) {
     return params.maxTokens;
   }
-  // Anthropic's direct transport coerces non-adaptive "max" to "high" before
-  // adjustMaxTokensForThinking, so the budget must match that coercion. Bedrock's
-  // resolveSimpleBedrockOptions passes the requested level through unchanged,
-  // which means a Bedrock "max" request reserves the full 32 768-token budget.
-  // Coercing Bedrock "max" to "high" here would undercount by 16 384 tokens and
-  // let a near-window request bypass chunking only to overflow at the provider.
-  const budgetReasoning = isClaudeBedrockModel(params.model)
-    ? reasoning
-    : reasoning === "max"
-      ? "high"
-      : reasoning;
   const adjusted = adjustMaxTokensForThinking(
     params.maxTokens,
     params.model.maxTokens,
-    budgetReasoning,
+    resolveTransportThinkingLevel(params.model, reasoning),
     options.thinkingBudgets,
   );
   return adjusted.thinkingBudget >= 1024 ? adjusted.maxTokens : params.maxTokens;

@@ -13,6 +13,7 @@ import {
   buildStageSplitPlan,
   buildSummaryChunks,
   computeAdaptiveChunkRatio,
+  projectCompactionInlineMediaForTransfer,
   projectCompactionMessagesForPlanning,
   sanitizeCompactionMessages,
   type OversizedFallbackPlan,
@@ -79,7 +80,11 @@ async function runCompactionPlan<TInput extends CompactionPlanningWorkerInput, T
   try {
     const workerMessages =
       params.projectWorkerMessages === false
-        ? messages
+        ? // Exact budgeting needs real text, so the full planning projection is
+          // skipped here. Inline media payloads are still dropped: they never
+          // reach the serialized summary prompt, so transferring them would only
+          // pay structured-clone cost.
+          projectCompactionInlineMediaForTransfer(messages)
         : projectCompactionMessagesForPlanning(messages);
     const value = await runCompactionPlanningWorker({
       input: replacePlanningMessages(params.input, workerMessages),
