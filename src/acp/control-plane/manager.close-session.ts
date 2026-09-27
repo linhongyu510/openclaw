@@ -20,7 +20,11 @@ import type {
   ResolveManagerSession,
   WriteManagerSessionMeta,
 } from "./manager.types.js";
-import { requireReadySessionMeta, resolveAcpSessionResolutionError } from "./manager.utils.js";
+import {
+  requireReadySessionMeta,
+  resolveAcpSessionResolutionError,
+  resolveAcpSessionTarget,
+} from "./manager.utils.js";
 
 /** Closes an ACP session runtime handle and optionally discards persistent state/meta. */
 export async function runManagerCloseSession(params: {
@@ -60,6 +64,46 @@ export async function runManagerCloseSession(params: {
     input.discardPersistentState &&
     currentIdentity != null &&
     !identityHasStableSessionId(currentIdentity);
+
+  // Maintenance cleanup of a terminal oneshot runs after turn finalization has
+  // already closed and evicted its runtime handle (`oneshot-complete` in the turn
+  // runner). There is nothing live to close: re-ensuring here would launch a new
+  // prompt-less runtime session only to close it (and leave an orphan if that
+  // close fails). Gate strictly on the maintenance discard+clear contract and an
+  // empty cache, so manual closes, persistent sessions, and any live handle keep
+  // the real runtime close below. Never call ensureRuntimeHandle to detect this.
+  const liveRuntimeHandle = params.runtimeHandles.get(
+    resolveAcpSessionTarget({ cfg: input.cfg, sessionKey, agentId }),
+  );
+  const shouldMetadataOnlyCloseTerminalOneshot =
+    !shouldSkipRuntimeClose &&
+    input.clearMeta === true &&
+    input.discardPersistentState === true &&
+    meta.mode === "oneshot" &&
+    liveRuntimeHandle === null;
+  if (shouldMetadataOnlyCloseTerminalOneshot) {
+    if (!params.isCurrentActor()) {
+      throw createSupersededActorError(sessionKey);
+    }
+    input.assertActive?.();
+    await params.writeSessionMeta({
+      cfg: input.cfg,
+      sessionKey,
+      agentId,
+      isCurrentActor: params.isCurrentActor,
+      mutate: () => null,
+      failOnError: true,
+    });
+    if (!params.isCurrentActor()) {
+      throw createSupersededActorError(sessionKey);
+    }
+    return {
+      runtimeClosed: false,
+      runtimeNotice:
+        "Skipped runtime close for terminal oneshot without a live handle; cleared session metadata.",
+      metaCleared: true,
+    };
+  }
 
   let runtimeClosed = false;
   let runtimeNotice: string | undefined;
