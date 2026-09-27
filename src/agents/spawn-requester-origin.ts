@@ -163,6 +163,13 @@ export type SpawnRequesterConversationSource = {
   currentThreadTs?: string | number;
   /** Explicit thread id resolved by regular channel turns; wins when present. */
   agentThreadId?: string | number;
+  /**
+   * Host-minted provenance of the ambient current* conversation fields. Generic
+   * token loopback callers (`caller-token`) can write those headers, so their
+   * ambient current conversation is not authority for thread binding. Explicit
+   * `agentTo`/`agentThreadId` stay authoritative regardless of provenance.
+   */
+  currentConversationOrigin?: McpCurrentConversationOrigin;
 };
 
 function normalizeNonEmptySpawnConversationValue(
