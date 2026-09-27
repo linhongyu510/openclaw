@@ -94,4 +94,51 @@ describe("resolveSpawnRequesterConversationTarget", () => {
       }),
     ).toEqual({});
   });
+
+  it("binds a CLI run-bound grant turn from caller-supplied-looking but immutable current fields", () => {
+    // The run-bound grant copies the gateway's immutable context; its current
+    // channel is trusted for binding even though it travels in current*.
+    expect(
+      resolveSpawnRequesterConversationTarget({
+        currentConversationOrigin: "run-bound-grant",
+        currentMessagingTarget: undefined,
+        currentChannelId: "guild:123",
+        currentThreadTs: "456",
+        agentTo: undefined,
+        agentThreadId: undefined,
+      }),
+    ).toEqual({ to: "guild:123", threadId: "456" });
+  });
+
+  it("does not use caller-writable generic-token current fields as a binding target", () => {
+    // A generic loopback bearer can rewrite x-openclaw-current-channel-id. Its
+    // ambient current conversation may still drive delivery, but must not select
+    // the child-thread binding target: fail closed to an empty binding target.
+    expect(
+      resolveSpawnRequesterConversationTarget({
+        currentConversationOrigin: "caller-token",
+        currentMessagingTarget: "room:ambient",
+        currentChannelId: "room:scope-shopped",
+        currentThreadTs: "456",
+        agentTo: undefined,
+        agentThreadId: undefined,
+      }),
+    ).toEqual({});
+  });
+
+  it("keeps an explicit agentTo binding on a caller-token turn despite untrusted ambient fields", () => {
+    // Explicit host-minted recipients remain authoritative; only the ambient
+    // current* fallback is gated. (On loopback agentTo cannot come from headers,
+    // but the resolver must honor it whenever the host supplies one.)
+    expect(
+      resolveSpawnRequesterConversationTarget({
+        currentConversationOrigin: "caller-token",
+        currentMessagingTarget: "room:ambient",
+        currentChannelId: "room:scope-shopped",
+        currentThreadTs: "456",
+        agentTo: "channel:host-directed",
+        agentThreadId: "789",
+      }),
+    ).toEqual({ to: "channel:host-directed", threadId: "789" });
+  });
 });

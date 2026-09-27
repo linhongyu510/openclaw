@@ -588,4 +588,111 @@ describe("spawnSubagentDirect thread binding delivery", () => {
     expect(bindCalls).toHaveLength(0);
     expect(hoisted.registerSubagentRunMock.mock.calls).toHaveLength(0);
   });
+  it("does not bind a caller-token loopback thread spawn to a caller-selected room", async () => {
+    // Security (issue #158945 review P1): on the generic token loopback surface
+    // currentChannelId/currentThreadTs are caller-writable headers. They may drive
+    // delivery, but must not be authority for the child-thread binding target.
+    // With no explicit host-minted agentTo, binding must fail closed before the
+    // binding service (and therefore before any channel bind message), even when
+    // the channel would otherwise accept the room and thread spawning is enabled.
+    const bindCalls: Array<Record<string, unknown>> = [];
+    currentSessionBindingService = {
+      getCapabilities: () => ({
+        adapterAvailable: true,
+        bindSupported: true,
+        placements: ["child"],
+      }),
+      bind: async (request) => {
+        bindCalls.push(request as unknown as Record<string, unknown>);
+        throw new Error("bind must not be reached for a caller-token-selected room");
+      },
+      listBySession: () => [],
+    };
+
+    const result = await spawnSubagentDirect(
+      {
+        task: "reply with a marker",
+        thread: true,
+        mode: "session",
+        context: "isolated",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+        agentChannel: "matrix",
+        agentAccountId: "default",
+        agentTo: undefined,
+        agentThreadId: undefined,
+        currentMessagingTarget: "room:ambient",
+        currentChannelId: "room:scope-shopped",
+        currentThreadTs: "456",
+        currentConversationOrigin: "caller-token",
+      },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toMatch(
+        /not running on a channel|Could not resolve a matrix conversation/,
+      );
+    }
+    expect(bindCalls).toHaveLength(0);
+    expect(hoisted.registerSubagentRunMock.mock.calls).toHaveLength(0);
+  });
+
+  it("binds a run-bound-grant CLI thread spawn from the immutable current channel", async () => {
+    // The reported issue path: a Gateway-launched CLI carries currentChannelId in
+    // an immutable run-bound grant (provenance run-bound-grant), never agentTo.
+    // That current channel is trusted and thread binding must still succeed.
+    const bindCalls: Array<Record<string, unknown>> = [];
+    currentSessionBindingService = {
+      getCapabilities: () => ({
+        adapterAvailable: true,
+        bindSupported: true,
+        placements: ["child"],
+      }),
+      bind: async (request) => {
+        bindCalls.push(request as unknown as Record<string, unknown>);
+        return {
+          targetSessionKey: request.targetSessionKey,
+          targetKind: request.targetKind,
+          status: "active",
+          conversation: {
+            channel: request.conversation.channel,
+            accountId: request.conversation.accountId,
+            conversationId: "$thread-root",
+            parentConversationId: request.conversation.conversationId,
+          },
+        };
+      },
+      listBySession: () => [],
+    };
+
+    const result = await spawnSubagentDirect(
+      {
+        task: "reply with a marker",
+        thread: true,
+        mode: "session",
+        context: "isolated",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+        agentChannel: "matrix",
+        agentAccountId: "default",
+        agentTo: undefined,
+        agentThreadId: undefined,
+        currentMessagingTarget: undefined,
+        currentChannelId: "room:parent",
+        currentThreadTs: undefined,
+        currentConversationOrigin: "run-bound-grant",
+      },
+    );
+
+    expect(result.status).toBe("accepted");
+    expect(bindCalls).toHaveLength(1);
+    const bindingConversation = bindCalls[0]?.conversation as
+      | { channel?: string; conversationId?: string }
+      | undefined;
+    expect(bindingConversation?.channel).toBe("matrix");
+    expect(bindingConversation?.conversationId).toBe("parent");
+  });
 });

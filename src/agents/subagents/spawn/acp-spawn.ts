@@ -139,6 +139,7 @@ type SpawnAcpContext = {
   currentMessagingTarget?: string;
   currentChannelId?: string;
   currentThreadTs?: string | number;
+  currentConversationOrigin?: import("../../../gateway/mcp-grant-store.js").McpCurrentConversationOrigin;
   currentMessageId?: string | number;
   /** Group chat ID for channels that distinguish group vs. topic (e.g. Telegram). */
   agentGroupId?: string;

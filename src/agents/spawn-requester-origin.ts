@@ -5,6 +5,7 @@
  */
 import type { ChatType } from "../channels/chat-type.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { McpCurrentConversationOrigin } from "../gateway/mcp-grant-store.js";
 import { resolveFirstBoundAccountId } from "../routing/bound-account-read.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 
@@ -202,13 +203,22 @@ export function resolveSpawnRequesterConversationTarget(source: SpawnRequesterCo
   to?: string;
   threadId?: string | number;
 } {
-  const to =
-    normalizeNonEmptySpawnConversationValue(source.agentTo) ??
-    normalizeNonEmptySpawnConversationValue(source.currentMessagingTarget) ??
-    normalizeNonEmptySpawnConversationValue(source.currentChannelId);
-  const threadId =
-    normalizeNonEmptySpawnThreadValue(source.agentThreadId) ??
-    normalizeNonEmptySpawnThreadValue(source.currentThreadTs);
+  const explicitTo = normalizeNonEmptySpawnConversationValue(source.agentTo);
+  const explicitThreadId = normalizeNonEmptySpawnThreadValue(source.agentThreadId);
+  // An explicit recipient/thread is host-minted authority on every surface and
+  // always wins. The ambient current conversation is caller-writable only on the
+  // generic-token loopback surface; such a target may drive delivery but must not
+  // select where a child thread binds, so it is dropped for binding (fail-closed).
+  const ambientTrusted = source.currentConversationOrigin !== "caller-token";
+  const currentTo = ambientTrusted
+    ? (normalizeNonEmptySpawnConversationValue(source.currentMessagingTarget) ??
+      normalizeNonEmptySpawnConversationValue(source.currentChannelId))
+    : undefined;
+  const currentThreadId = ambientTrusted
+    ? normalizeNonEmptySpawnThreadValue(source.currentThreadTs)
+    : undefined;
+  const to = explicitTo ?? currentTo;
+  const threadId = explicitThreadId ?? currentThreadId;
   return {
     ...(to ? { to } : {}),
     ...(threadId !== undefined ? { threadId } : {}),

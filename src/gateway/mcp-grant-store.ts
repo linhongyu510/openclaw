@@ -25,6 +25,20 @@ import type { SkillLibraryAuthoringCapability } from "../skills/library/authorin
 import type { SkillWorkshopRunOptions } from "../skills/workshop/types.js";
 import type { CronCreatorAuthorityGrant } from "./cron-creator-authority-grant.types.js";
 
+/**
+ * Host-minted provenance of the current conversation fields
+ * (`currentChannelId`/`currentThreadTs`) on an MCP loopback request. It records
+ * which authenticated branch produced them, never their wire contents:
+ * - `run-bound-grant`: copied verbatim from an immutable Gateway-launched CLI
+ *   client grant, so the child process cannot scope-shop by rewriting headers.
+ * - `server-session`: server-bound attach grant; conversation headers are
+ *   reserved and the current conversation fields stay undefined.
+ * - `caller-token`: generic loopback bearer whose current-channel/thread
+ *   headers are caller-writable and therefore not authority for binding.
+ * Set only by the request authenticator; never sourced from request headers.
+ */
+export type McpCurrentConversationOrigin = "run-bound-grant" | "server-session" | "caller-token";
+
 export type McpLoopbackRequestContext = {
   sessionKey: string;
   runtimePolicySessionKey?: string;
@@ -49,6 +63,11 @@ export type McpLoopbackRequestContext = {
   currentChannelId?: string;
   currentThreadTs?: string;
   currentMessageId?: string;
+  /**
+   * Host-minted provenance of `currentChannelId`/`currentThreadTs`. See
+   * {@link McpCurrentConversationOrigin}; never sourced from request headers.
+   */
+  currentConversationOrigin?: McpCurrentConversationOrigin;
   replyToMode?: "off" | "first" | "all" | "batched";
   currentInboundAudio?: boolean;
   accountId?: string;

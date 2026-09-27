@@ -39,6 +39,7 @@ type AcpSpawnRequesterContext = {
   currentMessagingTarget?: string;
   currentChannelId?: string;
   currentThreadTs?: string | number;
+  currentConversationOrigin?: import("../../../gateway/mcp-grant-store.js").McpCurrentConversationOrigin;
   agentGroupSpace?: string | null;
   agentMemberRoleIds?: string[];
 };
