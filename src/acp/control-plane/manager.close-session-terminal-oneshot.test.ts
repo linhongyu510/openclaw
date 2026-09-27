@@ -150,6 +150,23 @@ describe("runManagerCloseSession terminal oneshot metadata-only cleanup", () => 
     expect(result.runtimeNotice).toBeUndefined();
   });
 
+  it("does not metadata-only close a discard-only reset (clearMeta unset) even for an uncached oneshot", async () => {
+    // Mirrors session-reset: discardPersistentState without clearMeta must keep
+    // the real runtime close path (the pair is what authorizes metadata-only).
+    const h = harness(readySessionMeta({ mode: "oneshot", state: "idle" }));
+    const result = await h.close({
+      cfg: baseCfg,
+      sessionKey: "x",
+      reason: "reset",
+      discardPersistentState: true,
+      allowBackendUnavailable: true,
+    });
+    expect(h.runtimeState.ensureSession).toHaveBeenCalledTimes(1);
+    expect(h.runtimeState.close).toHaveBeenCalledTimes(1);
+    expect(result.runtimeClosed).toBe(true);
+    expect(result.metaCleared).toBe(false);
+  });
+
   it("does not metadata-only close a manual oneshot close without clear/discard", async () => {
     const h = harness(readySessionMeta({ mode: "oneshot", state: "idle" }));
     const result = await h.close({

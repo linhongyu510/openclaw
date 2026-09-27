@@ -69,9 +69,17 @@ export async function runManagerCloseSession(params: {
   // already closed and evicted its runtime handle (`oneshot-complete` in the turn
   // runner). There is nothing live to close: re-ensuring here would launch a new
   // prompt-less runtime session only to close it (and leave an orphan if that
-  // close fails). Gate strictly on the maintenance discard+clear contract and an
-  // empty cache, so manual closes, persistent sessions, and any live handle keep
-  // the real runtime close below. Never call ensureRuntimeHandle to detect this.
+  // close fails).
+  //
+  // The `discardPersistentState + clearMeta` pair is the irrevocable deletion
+  // contract: it destroys the persisted state and the resume identity, so the
+  // backend session is intentionally non-resumable regardless of cache state.
+  // The task-registry ACP maintenance closer is the only production caller that
+  // passes both (and only after its terminal-task predicate); manual close passes
+  // clearMeta without discard, reset passes discard without clearMeta, and config
+  // reconfigure passes neither — all keep the real runtime close below. Combined
+  // with an empty cache (checked non-mutatingly; never via ensureRuntimeHandle),
+  // the narrow oneshot case here has no live backend session left to close.
   const liveRuntimeHandle = params.runtimeHandles.get(
     resolveAcpSessionTarget({ cfg: input.cfg, sessionKey, agentId }),
   );
