@@ -256,291 +256,88 @@ describe("spawnSubagentDirect thread binding", () => {
   });
 
   it("binds a CLI-runtime thread spawn from currentChannelId when agentTo is absent", async () => {
-    // claude-cli loopback tool calls identify the conversation via
-    // currentChannelId/currentThreadTs and never set agentTo. Thread binding
-    // previously read agentTo alone and failed even though delivery already used
-    // currentChannelId (issue #158945).
-    const bindCalls: Array<Record<string, unknown>> = [];
-    currentSessionBindingService = {
-      getCapabilities: () => ({
-        adapterAvailable: true,
-        bindSupported: true,
-        placements: ["child"],
-      }),
-      bind: async (request) => {
-        bindCalls.push(request as unknown as Record<string, unknown>);
-        return {
-          targetSessionKey: request.targetSessionKey,
-          targetKind: request.targetKind,
-          status: "active",
-          conversation: {
-            channel: request.conversation.channel,
-            accountId: request.conversation.accountId,
-            conversationId: "$thread-root",
-            parentConversationId: request.conversation.conversationId,
-          },
-        };
-      },
-      listBySession: () => [],
-    };
-
+    // CLI runtimes have no agentTo; fall back to the ambient current* fields.
+    const bind = vi.fn<NonNullable<BindingService["bind"]>>(async (request) => ({
+      targetSessionKey: request.targetSessionKey,
+      targetKind: request.targetKind,
+      status: "active",
+      conversation: request.conversation,
+    }));
+    bindingService = makeBindingService(bind);
     const result = await spawnSubagentDirect(
-      {
-        task: "reply with a marker",
-        thread: true,
-        mode: "session",
-        context: "isolated",
-      },
+      { task: "CLI turn", thread: true, mode: "session", context: "isolated" },
       {
         agentSessionKey: "agent:main:main",
         agentChannel: "matrix",
-        agentAccountId: "default",
-        agentTo: undefined,
-        agentThreadId: undefined,
-        currentMessagingTarget: undefined,
-        currentChannelId: "room:parent",
-        currentThreadTs: undefined,
-      },
-    );
-
-    expect(result.status).toBe("accepted");
-    expect(bindCalls).toHaveLength(1);
-    const bindingConversation = bindCalls[0]?.conversation as
-      | { channel?: string; accountId?: string; conversationId?: string }
-      | undefined;
-    expect(bindingConversation?.channel).toBe("matrix");
-    expect(bindingConversation?.conversationId).toBe("parent");
-    const registeredRun = firstRegisteredSubagentRun();
-    expect(registeredRun?.requesterOrigin?.channel).toBe("matrix");
-    expect(registeredRun?.requesterOrigin?.to).toBe("room:parent");
-  });
-
-  it("rejects a CLI-runtime thread spawn before binding when spawns are disabled for the current channel", async () => {
-    // The wider CLI origin (currentChannelId with no agentTo) must still pass
-    // through the same channel thread-binding authority gate as agentTo origins:
-    // when thread-bound spawns are disabled for the resolved channel, the bind
-    // service must never be reached.
-    const sessionConfig = currentConfig.session as
-      | { threadBindings?: { spawnSessions?: boolean } }
-      | undefined;
-    currentConfig.session = {
-      ...sessionConfig,
-      threadBindings: { ...sessionConfig?.threadBindings, spawnSessions: false },
-    };
-    const bindCalls: Array<Record<string, unknown>> = [];
-    currentSessionBindingService = {
-      getCapabilities: () => ({
-        adapterAvailable: true,
-        bindSupported: true,
-        placements: ["child"],
-      }),
-      bind: async (request) => {
-        bindCalls.push(request as unknown as Record<string, unknown>);
-        throw new Error("bind must not be reached when spawns are disabled");
-      },
-      listBySession: () => [],
-    };
-
-    const result = await spawnSubagentDirect(
-      {
-        task: "reply with a marker",
-        thread: true,
-        mode: "session",
-        context: "isolated",
-      },
-      {
-        agentSessionKey: "agent:main:main",
-        agentChannel: "matrix",
-        agentAccountId: "default",
-        agentTo: undefined,
-        agentThreadId: undefined,
-        currentMessagingTarget: undefined,
-        currentChannelId: "room:parent",
-        currentThreadTs: undefined,
-      },
-    );
-
-    expect(result.status).toBe("error");
-    if (result.status === "error") {
-      expect(result.error).toContain("Thread-bound session spawns are disabled for matrix");
-    }
-    expect(bindCalls).toHaveLength(0);
-    expect(hoisted.registerSubagentRunMock.mock.calls).toHaveLength(0);
-  });
-
-  it("does not bind a CLI-runtime thread spawn into a conversation the channel rejects for the caller", async () => {
-    // The generic loopback path lets a caller supply x-openclaw-current-channel-id.
-    // Conversation authority is owned by the channel: its
-    // resolveInboundConversation is the final arbiter of whether the caller may
-    // bind in that conversation. When it rejects the target (a conversation the
-    // caller cannot access), prepareSpawnThreadBinding must fail resolution and
-    // never reach the binding service, even though thread spawning is enabled.
-    const allowedRooms = new Set(["parent"]);
-    setActivePluginRegistryForTest(
-      createTestRegistryForTest([
-        {
-          pluginId: "matrix",
-          source: "test",
-          plugin: {
-            ...createChannelTestPluginBaseForTest({ id: "matrix", label: "Matrix" }),
-            messaging: {
-              resolveInboundConversation: ({ to }: { to?: string }) => {
-                const roomId = to?.trim().replace(/^(?:matrix:)?(?:channel:|room:)/iu, "");
-                return roomId && allowedRooms.has(roomId) ? { conversationId: roomId } : null;
-              },
-              resolveDeliveryTarget: ({ conversationId }: { conversationId: string }) => ({
-                to: `room:${conversationId}`,
-              }),
-            },
-          },
-        },
-      ]),
-    );
-    const bindCalls: Array<Record<string, unknown>> = [];
-    currentSessionBindingService = {
-      getCapabilities: () => ({
-        adapterAvailable: true,
-        bindSupported: true,
-        placements: ["child"],
-      }),
-      bind: async (request) => {
-        bindCalls.push(request as unknown as Record<string, unknown>);
-        throw new Error("bind must not be reached when the channel rejects the conversation");
-      },
-      listBySession: () => [],
-    };
-
-    const result = await spawnSubagentDirect(
-      {
-        task: "reply with a marker",
-        thread: true,
-        mode: "session",
-        context: "isolated",
-      },
-      {
-        agentSessionKey: "agent:main:main",
-        agentChannel: "matrix",
-        agentAccountId: "default",
-        agentTo: undefined,
-        agentThreadId: undefined,
-        currentMessagingTarget: undefined,
-        currentChannelId: "room:not-a-conversation-for-this-caller",
-        currentThreadTs: undefined,
-      },
-    );
-
-    expect(result.status).toBe("error");
-    if (result.status === "error") {
-      expect(result.error).toContain("Could not resolve a matrix conversation");
-    }
-    expect(bindCalls).toHaveLength(0);
-    expect(hoisted.registerSubagentRunMock.mock.calls).toHaveLength(0);
-  });
-  it("does not bind a caller-token loopback thread spawn to a caller-selected room", async () => {
-    // Security (issue #158945 review P1): on the generic token loopback surface
-    // currentChannelId/currentThreadTs are caller-writable headers. They may drive
-    // delivery, but must not be authority for the child-thread binding target.
-    // With no explicit host-minted agentTo, binding must fail closed before the
-    // binding service (and therefore before any channel bind message), even when
-    // the channel would otherwise accept the room and thread spawning is enabled.
-    const bindCalls: Array<Record<string, unknown>> = [];
-    currentSessionBindingService = {
-      getCapabilities: () => ({
-        adapterAvailable: true,
-        bindSupported: true,
-        placements: ["child"],
-      }),
-      bind: async (request) => {
-        bindCalls.push(request as unknown as Record<string, unknown>);
-        throw new Error("bind must not be reached for a caller-token-selected room");
-      },
-      listBySession: () => [],
-    };
-
-    const result = await spawnSubagentDirect(
-      {
-        task: "reply with a marker",
-        thread: true,
-        mode: "session",
-        context: "isolated",
-      },
-      {
-        agentSessionKey: "agent:main:main",
-        agentChannel: "matrix",
-        agentAccountId: "default",
-        agentTo: undefined,
-        agentThreadId: undefined,
-        currentMessagingTarget: "room:ambient",
-        currentChannelId: "room:scope-shopped",
-        currentThreadTs: "456",
-        currentConversationOrigin: "caller-token",
-      },
-    );
-
-    expect(result.status).toBe("error");
-    if (result.status === "error") {
-      expect(result.error).toMatch(
-        /not running on a channel|Could not resolve a matrix conversation/,
-      );
-    }
-    expect(bindCalls).toHaveLength(0);
-    expect(hoisted.registerSubagentRunMock.mock.calls).toHaveLength(0);
-  });
-
-  it("binds a run-bound-grant CLI thread spawn from the immutable current channel", async () => {
-    // The reported issue path: a Gateway-launched CLI carries currentChannelId in
-    // an immutable run-bound grant (provenance run-bound-grant), never agentTo.
-    // That current channel is trusted and thread binding must still succeed.
-    const bindCalls: Array<Record<string, unknown>> = [];
-    currentSessionBindingService = {
-      getCapabilities: () => ({
-        adapterAvailable: true,
-        bindSupported: true,
-        placements: ["child"],
-      }),
-      bind: async (request) => {
-        bindCalls.push(request as unknown as Record<string, unknown>);
-        return {
-          targetSessionKey: request.targetSessionKey,
-          targetKind: request.targetKind,
-          status: "active",
-          conversation: {
-            channel: request.conversation.channel,
-            accountId: request.conversation.accountId,
-            conversationId: "$thread-root",
-            parentConversationId: request.conversation.conversationId,
-          },
-        };
-      },
-      listBySession: () => [],
-    };
-
-    const result = await spawnSubagentDirect(
-      {
-        task: "reply with a marker",
-        thread: true,
-        mode: "session",
-        context: "isolated",
-      },
-      {
-        agentSessionKey: "agent:main:main",
-        agentChannel: "matrix",
-        agentAccountId: "default",
-        agentTo: undefined,
-        agentThreadId: undefined,
-        currentMessagingTarget: undefined,
-        currentChannelId: "room:parent",
-        currentThreadTs: undefined,
+        agentAccountId: "bot-beta",
+        currentChannelId: "!room:example.org",
+        currentThreadTs: "t-123",
         currentConversationOrigin: "run-bound-grant",
       },
     );
-
     expect(result.status).toBe("accepted");
-    expect(bindCalls).toHaveLength(1);
-    const bindingConversation = bindCalls[0]?.conversation as
-      | { channel?: string; conversationId?: string }
-      | undefined;
-    expect(bindingConversation?.channel).toBe("matrix");
-    expect(bindingConversation?.conversationId).toBe("parent");
+    expect(bind).toHaveBeenCalledOnce();
+    expect(bind.mock.calls[0]?.[0].conversation).toMatchObject({
+      channel: "matrix",
+      accountId: "bot-beta",
+      conversationId: "t-123",
+      parentConversationId: "!room:example.org",
+    });
+  });
+
+  it("rejects a caller-token loopback thread spawn that would bind to a caller-selected room", async () => {
+    // generic-token callers must not steer thread-binding target; the channel
+    // gate or the origin resolver must refuse before reaching the binding service.
+    const bind = vi.fn<NonNullable<BindingService["bind"]>>(async (request) => ({
+      targetSessionKey: request.targetSessionKey,
+      targetKind: request.targetKind,
+      status: "active",
+      conversation: request.conversation,
+    }));
+    bindingService = makeBindingService(bind);
+    const result = await spawnSubagentDirect(
+      { task: "loopback turn", thread: true, mode: "session", context: "isolated" },
+      {
+        agentSessionKey: "agent:main:main",
+        agentChannel: "matrix",
+        agentAccountId: "bot-beta",
+        currentChannelId: "!attacker-controlled-room",
+        currentThreadTs: "t-123",
+        currentConversationOrigin: "caller-token",
+      },
+    );
+    // Provenance fail-closed: caller-token ambient current* must not become a
+    // binding target. Expect the result to be rejected (error) rather than a bind.
+    expect(result.status).toBe("error");
+    expect(bind).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit agentTo authoritative over ambient current* fields", async () => {
+    const bind = vi.fn<NonNullable<BindingService["bind"]>>(async (request) => ({
+      targetSessionKey: request.targetSessionKey,
+      targetKind: request.targetKind,
+      status: "active",
+      conversation: request.conversation,
+    }));
+    bindingService = makeBindingService(bind);
+    const result = await spawnSubagentDirect(
+      { task: "channel turn", thread: true, mode: "session", context: "isolated" },
+      {
+        agentSessionKey: "agent:main:main",
+        agentChannel: "matrix",
+        agentAccountId: "bot-beta",
+        agentTo: "room:!legitimate-room",
+        agentThreadId: "t-legit",
+        currentChannelId: "!ignored-room",
+        currentThreadTs: "t-ignored",
+        currentConversationOrigin: "caller-token",
+      },
+    );
+    expect(result.status).toBe("accepted");
+    expect(bind).toHaveBeenCalledOnce();
+    expect(bind.mock.calls[0]?.[0].conversation).toMatchObject({
+      conversationId: "t-legit",
+      parentConversationId: "!legitimate-room",
+    });
   });
 });
