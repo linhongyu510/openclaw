@@ -4,6 +4,8 @@ import { resolveAgentEffectiveModelPrimary } from "../agents/agent-scope.js";
 import { loadAuthProfileStoreWithoutExternalProfiles } from "../agents/auth-profiles/store-runtime.js";
 import * as catalogRefresh from "../agents/prepared-model-runtime.refresh-scope.js";
 import { getRuntimeConfig } from "../config/config.js";
+import { onInternalDiagnosticEvent } from "../infra/diagnostic-events.js";
+import { getCurrentDiagnosticPhase } from "../logging/diagnostic-phase.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { resetGatewayTestState } from "./gateway.test-support.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
@@ -19,6 +21,72 @@ it(
   async ({ signal, onTestFinished }) => {
     const requests: string[] = [];
     const startedAt = performance.now();
+    const observedPhases = new Set([
+      "config.load",
+      "config.normalize",
+      "state.ownership",
+      "state.schema-preflight",
+      "worker-environments.store-import",
+      "plugins.bootstrap-imports",
+      "plugins.load",
+      "startup.maintenance",
+      "gateway.ready",
+      "sidecars.model-runtime",
+      "sidecars.reply-runtime",
+      "sidecars.chat-metadata",
+      "sidecars.total",
+    ]);
+    const ownerTimings: Array<{
+      name: string;
+      phase: string;
+      elapsedMs: number;
+      durationMs?: number;
+      cpuTotalMs?: number;
+      admissionMs?: number;
+      queueWaitMs?: number;
+    }> = [];
+    // Keep only named timing facts: diagnostic details can contain private state.
+    const stopObserving = onInternalDiagnosticEvent(
+      (event) => {
+        if (ownerTimings.length >= 64) {
+          return;
+        }
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        if (event.type === "diagnostic.phase.completed" && observedPhases.has(event.name)) {
+          ownerTimings.push({
+            name: event.name,
+            phase: "completed",
+            elapsedMs,
+            durationMs: event.durationMs,
+            cpuTotalMs: event.cpuTotalMs,
+          });
+        } else if (
+          event.type === "gateway.rpc" &&
+          (event.method === "openclaw.setup.auth.start" || event.method === "wizard.next")
+        ) {
+          ownerTimings.push({
+            name: event.method,
+            phase: event.phase,
+            elapsedMs,
+            durationMs: event.phase === "received" ? undefined : event.durationMs,
+            admissionMs: event.phase === "handler" ? event.admissionMs : undefined,
+            queueWaitMs: event.phase === "dispatch" ? event.queueWaitMs : undefined,
+          });
+        }
+      },
+      { include: ["diagnostic.phase.completed", "gateway.rpc"] },
+    );
+    onTestFinished(stopObserving);
+    const requestPhases = new Map([
+      ["https://github.com/login/device/code", "device-code"],
+      ["https://github.com/login/oauth/access_token", "access-token"],
+      ["https://api.github.com/copilot_internal/user", "account"],
+      ["https://api.individual.githubcopilot.com/models", "models"],
+      ["https://api.individual.githubcopilot.com/v1/messages", "probe"],
+      ["https://catalog.openclaw.ai/models/v2/catalog.json", "catalog-refresh"],
+    ]);
+    let lastRequestPhase: string | undefined;
+    let lastRequestElapsedMs: number | undefined;
     let phase = "fixture-setup";
     const phaseTransitions = [{ phase, elapsedMs: 0 }];
     const markPhase = (nextPhase: string) => {
@@ -27,12 +95,25 @@ it(
     };
     let wizardSteps = 0;
     let wizardStepType: string | undefined;
+    let wizardProgressPhase: "device-code" | "browser" | "testing" | "other" | undefined;
+    let wizardProgressElapsedMs: number | undefined;
     const reportAbort = () => {
+      const activePhase = getCurrentDiagnosticPhase();
       console.error("[setup-first-signin] test aborted", {
+        pid: process.pid,
+        activePhase: activePhase
+          ? observedPhases.has(activePhase)
+            ? activePhase
+            : "other"
+          : "none",
+        ownerTimingLimitReached: ownerTimings.length === 64,
+        ownerTimings,
         phase,
         elapsedMs: Math.round(performance.now() - startedAt),
         phaseTransitions,
         mockedRequests: requests.length,
+        lastRequestPhase,
+        lastRequestElapsedMs,
         deviceCodeRequests: requests.filter((url) => url === "https://github.com/login/device/code")
           .length,
         tokenRequests: requests.filter(
@@ -47,8 +128,13 @@ it(
         probeRequests: requests.filter(
           (url) => url === "https://api.individual.githubcopilot.com/v1/messages",
         ).length,
+        catalogRequests: requests.filter(
+          (url) => url === "https://catalog.openclaw.ai/models/v2/catalog.json",
+        ).length,
         wizardSteps,
         wizardStepType,
+        wizardProgressPhase,
+        wizardProgressElapsedMs,
       });
     };
     // Capture the deadline phase before teardown can advance the pending test.
@@ -59,6 +145,8 @@ it(
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = new URL(input instanceof Request ? input.url : input);
       requests.push(`${url.origin}${url.pathname}`);
+      lastRequestPhase = requestPhases.get(`${url.origin}${url.pathname}`) ?? "other";
+      lastRequestElapsedMs = Math.round(performance.now() - startedAt);
       switch (`${url.origin}${url.pathname}`) {
         case "https://github.com/login/device/code":
           return Response.json({
@@ -159,6 +247,7 @@ it(
             },
             agents: { defaults: { workspace: state.workspaceDir, skipBootstrap: true } },
             plugins: {
+              allow: ["github-copilot"],
               slots: { memory: "none" },
               entries: { "github-copilot": { enabled: true } },
             },
@@ -186,6 +275,19 @@ it(
             }
             wizardSteps += 1;
             wizardStepType = step.type;
+            wizardProgressPhase = undefined;
+            wizardProgressElapsedMs = undefined;
+            if (step.type === "progress") {
+              // Later progress retains the device-code presentation as a prefix.
+              wizardProgressPhase = step.message?.endsWith("Testing your AI connection…")
+                ? "testing"
+                : step.message?.endsWith("Complete sign-in in your browser.")
+                  ? "browser"
+                  : step.deviceCode
+                    ? "device-code"
+                    : "other";
+              wizardProgressElapsedMs = Math.round(performance.now() - startedAt);
+            }
             result = await client.request<WizardNextResult>("wizard.next", {
               sessionId,
               answer: { stepId: step.id, value: step.type === "confirm" ? true : null },

@@ -178,9 +178,6 @@ describe("gateway startup import boundaries", () => {
       'from "./config-reload.js"',
     );
     expect(serverImpl).not.toContain('from "../plugins/hook-runner-global.js"');
-    expect(serverImpl).not.toContain('from "../tasks/task-registry.js"');
-    expect(serverImpl).not.toContain('from "../tasks/task-registry.maintenance.js"');
-    expect(serverImpl).toContain('import("../tasks/task-registry.maintenance.js")');
     expect(serverImpl).not.toContain('from "../secrets/runtime.js"');
     expect(readSource("src/gateway/server-reload-managed.ts")).not.toContain(
       'from "../secrets/runtime.js"',
@@ -286,6 +283,6 @@ describe("gateway startup import boundaries", () => {
     expect(workerStartup).toContain(
       "const loadWorkerSessionToolExecutorModule = createLazyRuntimeModule(",
     );
-    expect(workerStartup).toContain("loadWorkerSessionToolExecutorModule().then(");
+    expect(workerStartup).toContain("await loadWorkerSessionToolExecutorModule()");
   });
 });

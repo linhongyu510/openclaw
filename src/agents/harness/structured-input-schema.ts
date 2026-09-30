@@ -387,10 +387,7 @@ function buildField(
     question: {
       id: context.questionId,
       header: boundText(title, 12),
-      question: boundText(
-        details.length > 0 ? `${title}\n${details.join(" ")}` : title,
-        MAX_FIELD_TEXT,
-      ),
+      question: boundText(`${title}\n${details.join(" ")}`, MAX_FIELD_TEXT),
       ...(params.multiSelect ? { multiSelect: true } : {}),
       isOther: params.isOther,
       isSecret: context.secret,
@@ -406,7 +403,7 @@ function buildField(
         return decoded;
       }
       const selectedDeclaredChoice = params.options?.some(
-        (choice) => choice.label.toLowerCase() === values[0]?.trim().toLowerCase(),
+        (choice) => choice.label.trim().toLowerCase() === values[0]?.trim().toLowerCase(),
       );
       const selectedOther =
         context.otherFieldId &&
@@ -586,7 +583,7 @@ function matchesStringFormat(value: string, format: string): boolean {
 function findChoice(choices: readonly Choice[], raw: string | undefined): Choice | undefined {
   const value = raw?.trim().toLowerCase();
   return choices.find(
-    (choice) => choice.label.toLowerCase() === value || choice.value.toLowerCase() === value,
+    (choice) => choice.label.trim().toLowerCase() === value || choice.value.toLowerCase() === value,
   );
 }
 

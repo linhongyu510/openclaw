@@ -60,7 +60,7 @@ export type Bootstrap = {
   runner: RunnerSnapshot;
   runnerCatalog: {
     status: "loading" | "ready" | "failed";
-    real: RunnerModelOption[];
+    real: QaRunnerModelOption[];
     channels: string[];
     profiles: Array<{
       id: string;
@@ -77,8 +77,6 @@ type ScenarioRun = QaLabScenarioRun;
 export type RunnerSelection = QaLabRunSelection;
 export type RunnerResolvedPlan = QaLabResolvedRunPlan;
 type RunnerSnapshot = QaLabRunnerSnapshot;
-
-export type RunnerModelOption = QaRunnerModelOption;
 
 export type OutcomesEnvelope = {
   run: ScenarioRun | null;
@@ -108,7 +106,7 @@ export type CaptureEventView = {
   captureOrigin?: string;
 };
 
-export type CaptureQueryPreset = "none" | StoredCaptureQueryPreset;
+type CaptureQueryPreset = "none" | StoredCaptureQueryPreset;
 
 export type CaptureSessionsEnvelope = {
   sessions: CaptureSessionSummary[];

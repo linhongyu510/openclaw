@@ -1,4 +1,3 @@
-// Implements model listing and provider catalog commands.
 import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -150,14 +149,7 @@ export function formatModelsAvailableHeader(params: {
   sessionEntry?: ModelsCommandSessionEntry;
   availability?: ModelsProviderMenu;
 }): string {
-  const providerLabel = resolveProviderLabel({
-    provider: params.provider,
-    cfg: params.cfg,
-    agentId: params.agentId,
-    agentDir: params.agentDir,
-    workspaceDir: params.workspaceDir,
-    sessionEntry: params.sessionEntry,
-  });
+  const providerLabel = resolveProviderLabel(params);
   const count =
     params.availability && params.availability.available !== params.total
       ? `${params.availability.available} of ${params.total}`
@@ -321,14 +313,7 @@ function buildModelsCommandReply(
     if (checking) {
       return { text: checking };
     }
-    const emptyProviderLabel = resolveProviderLabel({
-      provider,
-      cfg: params.cfg,
-      agentId: params.agentId,
-      agentDir: params.agentDir,
-      workspaceDir: params.workspaceDir,
-      sessionEntry: params.sessionEntry,
-    });
+    const emptyProviderLabel = resolveProviderLabel({ ...params, provider });
     return {
       text: [
         `Models (${emptyProviderLabel}) — none`,
@@ -355,13 +340,9 @@ function buildModelsCommandReply(
   if (interactiveChannelData) {
     return {
       text: formatModelsAvailableHeader({
+        ...params,
         provider,
         total,
-        cfg: params.cfg,
-        agentId: params.agentId,
-        agentDir: params.agentDir,
-        workspaceDir: params.workspaceDir,
-        sessionEntry: params.sessionEntry,
         availability,
       }),
       channelData: interactiveChannelData,
@@ -390,14 +371,7 @@ function buildModelsCommandReply(
   const startIndex = (safePage - 1) * effectivePageSize;
   const endIndexExclusive = Math.min(total, startIndex + effectivePageSize);
   const pageModels = models.slice(startIndex, endIndexExclusive);
-  const providerLabel = resolveProviderLabel({
-    provider,
-    cfg: params.cfg,
-    agentId: params.agentId,
-    agentDir: params.agentDir,
-    workspaceDir: params.workspaceDir,
-    sessionEntry: params.sessionEntry,
-  });
+  const providerLabel = resolveProviderLabel({ ...params, provider });
   const lines = [
     `Models (${providerLabel}) — showing ${startIndex + 1}-${endIndexExclusive} of ${total} (page ${safePage}/${pageCount})`,
   ];

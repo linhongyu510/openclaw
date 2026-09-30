@@ -1,17 +1,14 @@
 /** Tests session-scoped MCP runtime catalog, transport, validation, and lifecycle behavior. */
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult, ReadResourceResult } from "@modelcontextprotocol/sdk/types.js";
 import { expectDefined } from "@openclaw/normalization-core";
 import { materializeRequesterScopedMcpToolsForHarnessRun } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred, withinTest } from "../../test/helpers/promise.js";
 import {
   cleanupTempDirs,
   makeTempDir,
@@ -19,16 +16,23 @@ import {
 } from "../../test/helpers/temp-dir.js";
 import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
+import {
+  createGatewaySchedulerClock,
+  createTestGatewayScheduler,
+} from "../test-utils/gateway-scheduler-clock.js";
 import { startCatalogRecoveryMcpServer } from "./agent-bundle-mcp-catalog-recovery.test-support.js";
 import { createCombinedSessionMcpRuntime } from "./agent-bundle-mcp-combined.js";
 import { completeDeferredSessionMcpRuntimeRetirement } from "./agent-bundle-mcp-manager-api.js";
 import {
+  bindSessionMcpRuntimeTestScheduler,
   createSessionMcpRuntimeManager,
   getOrCreateSessionMcpRuntime,
+  makeRequesterParams,
   unopenedMcpConfig,
 } from "./agent-bundle-mcp-manager.test-support.js";
 import { createMcpProbeFixture } from "./agent-bundle-mcp-probe.test-support.js";
 import { runWithSessionMcpRequestSignal } from "./agent-bundle-mcp-request-context.js";
+import { startRequesterScopedMcpProofServer } from "./agent-bundle-mcp-requester.test-support.js";
 import { SESSION_MCP_RUNTIME_MANAGER_KEY } from "./agent-bundle-mcp-runtime-shared.js";
 import {
   createBundleMcpJsonSchemaValidator,
@@ -81,7 +85,20 @@ vi.mock("./mcp-auth-profile.js", () => ({
 }));
 
 const tempDirs: string[] = [];
-const tempDirTracker = useAutoCleanupTempDirTracker(afterEach);
+beforeEach(async () => {
+  await testing.resetSessionMcpRuntimeManager();
+  // A drained manager must not retain another test file's mocked config loader.
+  Reflect.deleteProperty(globalThis, SESSION_MCP_RUNTIME_MANAGER_KEY);
+  await bindSessionMcpRuntimeTestScheduler();
+});
+const tempDirTracker = useAutoCleanupTempDirTracker((cleanup) => {
+  afterEach(async () => {
+    await testing.resetSessionMcpRuntimeManager();
+    Reflect.deleteProperty(globalThis, SESSION_MCP_RUNTIME_MANAGER_KEY);
+    cleanupTempDirs(tempDirs);
+    cleanup();
+  });
+});
 
 type RuntimeFactoryOptions = NonNullable<Parameters<typeof createSessionMcpRuntimeManager>[0]>;
 type RuntimeFactory = NonNullable<RuntimeFactoryOptions["createRuntime"]>;
@@ -93,60 +110,6 @@ type ConfiguredMcpServer = NonNullable<
 const LIST_TOOLS_SERVER_LOG_TIMEOUT_MS = 2_000;
 const LIST_TOOLS_TEST_DEADLINE_MS = 4_000;
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
-
-async function startRequesterScopedMcpProofServer(): Promise<{
-  url: string;
-  session: { current?: string; closed?: string };
-  close: () => Promise<void>;
-}> {
-  const server = new McpServer({ name: "openclaw-requester-proof", version: "1.0.0" });
-  const session: { current?: string; closed?: string } = {};
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: randomUUID,
-    onsessioninitialized(nextSessionId) {
-      session.current = nextSessionId;
-    },
-    onsessionclosed(nextSessionId) {
-      session.closed = nextSessionId;
-    },
-  });
-  server.registerTool(
-    "requester_probe",
-    { description: "Return the live requester-scoped MCP transport identity" },
-    async () => ({ content: [{ type: "text", text: session.current ?? "missing-session" }] }),
-  );
-  await server.connect(transport);
-  const httpServer = http.createServer((request, response) => {
-    if (request.url !== "/mcp" || request.headers.authorization !== "Bearer proof-token") {
-      response.writeHead(404).end();
-      return;
-    }
-    void transport.handleRequest(request, response).catch(() => {
-      if (!response.headersSent) {
-        response.writeHead(500).end();
-      }
-    });
-  });
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(0, "127.0.0.1", resolve);
-  });
-  const address = httpServer.address();
-  if (!address || typeof address === "string") {
-    throw new Error("requester-scoped MCP proof server did not bind a loopback port");
-  }
-  return {
-    url: `http://127.0.0.1:${address.port}/mcp`,
-    session,
-    close: async () => {
-      await server.close();
-      httpServer.closeAllConnections();
-      await new Promise<void>((resolve, reject) => {
-        httpServer.close((error) => (error ? reject(error) : resolve()));
-      });
-    },
-  };
-}
 
 function readMcpText(
   result: { content: ReadonlyArray<{ type: string; text?: string }> },
@@ -704,27 +667,6 @@ async function makeStdioRuntime(
     ...(options.toolOverrides ? { toolOverrides: options.toolOverrides } : {}),
   });
 }
-
-function makeRequesterParams(
-  sessionId: string,
-  cfg: RuntimeParams["cfg"],
-  requesterSenderId: string,
-  overrides: Partial<RuntimeParams> = {},
-): RuntimeParams {
-  return {
-    sessionId,
-    workspaceDir: "/workspace",
-    cfg,
-    requesterSenderId,
-    messageChannel: "telegram",
-    ...overrides,
-  };
-}
-
-afterEach(async () => {
-  cleanupTempDirs(tempDirs);
-  await testing.resetSessionMcpRuntimeManager();
-});
 
 describe("session MCP runtime", () => {
   it("advertises the stable MCP Apps client extension only when enabled", () => {
@@ -1454,7 +1396,9 @@ describe("session MCP runtime", () => {
     }
   });
 
-  it("times out default-config hung bundle MCP tools/list using the internal catalog timeout", async () => {
+  it("times out default-config hung bundle MCP tools/list using the internal catalog timeout", async ({
+    signal,
+  }) => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "bundle-mcp-listtools-timeout-"));
     const serverPath = path.join(tempDir, "hanging-list-tools.mjs");
     const logPath = path.join(tempDir, "server.log");
@@ -1473,11 +1417,7 @@ describe("session MCP runtime", () => {
 
     try {
       await waitForFileText(logPath, "recv tools/list", LIST_TOOLS_SERVER_LOG_TIMEOUT_MS);
-      const result = await withTestTimeout(
-        catalogResult,
-        LIST_TOOLS_TEST_DEADLINE_MS,
-        "timed out waiting for bundle MCP catalog timeout",
-      );
+      const result = await withinTest(catalogResult, signal);
 
       expect(result.status).toBe("resolved");
       if (result.status === "resolved") {
@@ -1486,11 +1426,7 @@ describe("session MCP runtime", () => {
       }
     } finally {
       await runtime.dispose();
-      await withTestTimeout(
-        catalogResult,
-        1_000,
-        "timed out waiting for bundle MCP catalog cleanup",
-      );
+      await catalogResult;
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
@@ -1525,7 +1461,7 @@ describe("session MCP runtime", () => {
     }
   });
 
-  it("retries a failed MCP catalog without stalling healthy siblings", async () => {
+  it("retries a failed MCP catalog without stalling healthy siblings", async ({ signal }) => {
     const tempDir = tempDirTracker.make("bundle-mcp-catalog-retry-");
     const retryServerPath = path.join(tempDir, "retry-list-tools.mjs");
     const retryLogPath = path.join(tempDir, "retry-server.log");
@@ -1604,11 +1540,7 @@ describe("session MCP runtime", () => {
 
       nowMs += 5_001;
       expect(runtime.peekCatalog()).toBe(failedCatalog);
-      const staleCatalog = await withTestTimeout(
-        runtime.getCatalog(),
-        300,
-        "catalog retry blocked the triggering turn",
-      );
+      const staleCatalog = await withinTest(runtime.getCatalog(), signal);
       expect(staleCatalog).toBe(failedCatalog);
       expect(staleCatalog.diagnostics?.[0]?.serverName).toBe("retryServer");
       await waitForFileTextCount(
@@ -1895,7 +1827,7 @@ describe("session MCP runtime", () => {
     }
   });
 
-  it("reconnects after an MCP child process exits", async () => {
+  it("reconnects after an MCP child process exits", async ({ signal }) => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "bundle-mcp-child-exit-"));
     const serverPath = path.join(tempDir, "server.mjs");
     const logPath = path.join(tempDir, "server.log");
@@ -1955,11 +1887,7 @@ describe("session MCP runtime", () => {
       );
       await waitForFileTextCount(logPath, "recv tools/list", 2, LIST_TOOLS_TEST_DEADLINE_MS);
       await expect(
-        withTestTimeout(
-          runtime.callTool("healthy", "slow_tool", {}),
-          400,
-          "healthy sibling stalled during reconnect",
-        ),
+        withinTest(runtime.callTool("healthy", "slow_tool", {}), signal),
       ).resolves.toMatchObject({ isError: false });
       await fs.writeFile(listToolsReleasePath, "release", "utf8");
       await waitForPredicate(
@@ -2119,7 +2047,9 @@ process.on("SIGINT", shutdown);`,
     }
   });
 
-  it("bounds catalog replay when a server invalidates every tools/list response", async () => {
+  it("bounds catalog replay when a server invalidates every tools/list response", async ({
+    signal,
+  }) => {
     const tempDir = tempDirTracker.make("bundle-mcp-continuous-invalidation-");
     const noisyServerPath = path.join(tempDir, "noisy-server.mjs");
     const noisyLogPath = path.join(tempDir, "noisy-server.log");
@@ -2153,11 +2083,7 @@ process.on("SIGINT", shutdown);`,
     });
 
     try {
-      const catalog = await withTestTimeout(
-        runtime.getCatalog(),
-        LIST_TOOLS_SERVER_LOG_TIMEOUT_MS,
-        "continuous tools/list invalidation blocked the catalog",
-      );
+      const catalog = await withinTest(runtime.getCatalog(), signal);
 
       expect(catalog.tools.map((tool) => tool.toolName).toSorted()).toEqual([
         "healthy_tool",
@@ -2274,9 +2200,9 @@ process.on("SIGINT", shutdown);`,
     }
   });
 
-  it.each(["before-start", "initialize", "tools/list", "ready"] as const)(
+  it.for(["before-start", "initialize", "tools/list", "ready"] as const)(
     "settles private MCP acquisition cancellation at %s",
-    async (phase) => {
+    async (phase, { signal }) => {
       const tempDir = tempDirTracker.make("bundle-mcp-private-cancel-");
       const serverPath = path.join(tempDir, "server.mjs");
       const logPath = path.join(tempDir, "server.log");
@@ -2342,13 +2268,7 @@ process.on("SIGINT", shutdown);`,
           await view.dispose();
         } else {
           work.beginClose(reason);
-          await expect(
-            withTestTimeout(
-              pending,
-              LIST_TOOLS_TEST_DEADLINE_MS,
-              "Private MCP startup did not settle",
-            ),
-          ).rejects.toBe(reason);
+          await expect(withinTest(pending, signal)).rejects.toBe(reason);
         }
         expect(runtime?.activeLeases).toBe(0);
         expect(() => process.kill(pid, 0)).toThrow();
@@ -3397,7 +3317,7 @@ process.on("SIGINT", shutdown);`,
   });
 
   it("cancels deferred retirement when a later run reuses the runtime", async () => {
-    const manager = createSessionMcpRuntimeManager({ enableIdleSweepTimer: false });
+    const manager = createSessionMcpRuntimeManager();
     const params = {
       sessionId: "session-reused-after-view",
       sessionKey: "agent:test:session-reused-after-view",
@@ -3419,7 +3339,7 @@ process.on("SIGINT", shutdown);`,
   });
 
   it("keeps required retirement armed across late runtime creation and reuse", async () => {
-    const manager = createSessionMcpRuntimeManager({ enableIdleSweepTimer: false });
+    const manager = createSessionMcpRuntimeManager();
     const params = {
       sessionId: "session-required-retirement",
       sessionKey: "agent:test:session-required-retirement",
@@ -3494,9 +3414,9 @@ process.on("SIGINT", shutdown);`,
         logPath: path.join(tempDir, "server.log"),
         pidPath,
       });
+      const clock = createGatewaySchedulerClock(Date.now());
       const manager = createSessionMcpRuntimeManager({
-        enableIdleSweepTimer: false,
-        now: () => Date.now(),
+        scheduler: createTestGatewayScheduler(clock.clock),
       });
       const params: RuntimeParams = {
         sessionId: "session-child-keep-alive",
@@ -3509,14 +3429,10 @@ process.on("SIGINT", shutdown);`,
         await runtime.callTool("child", "slow_tool", {});
         await waitForFileText(pidPath, "", LIST_TOOLS_SERVER_LOG_TIMEOUT_MS);
         const pid = Number.parseInt(await fs.readFile(pidPath, "utf8"), 10);
-        const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 86_400_000);
-        try {
-          expect(await manager.sweepIdleRuntimes()).toBe(0);
-          expect(manager.peekSession({ sessionId: params.sessionId })).toBe(runtime);
-          expect(() => process.kill(pid, 0)).not.toThrow();
-        } finally {
-          clock.mockRestore();
-        }
+        clock.setTime(Date.now() + 86_400_000);
+        expect(await manager.sweepIdleRuntimes()).toBe(0);
+        expect(manager.peekSession({ sessionId: params.sessionId })).toBe(runtime);
+        expect(() => process.kill(pid, 0)).not.toThrow();
         if (cleanup === "reset") {
           await manager.disposeSession(params.sessionId);
         } else {
@@ -3548,8 +3464,8 @@ process.on("SIGINT", shutdown);`,
 
       let firstTools: Awaited<ReturnType<typeof materializeRequesterScopedMcpToolsForHarnessRun>>;
       let secondTools: Awaited<ReturnType<typeof materializeRequesterScopedMcpToolsForHarnessRun>>;
-      let nowMs = 100_000;
-      const clock = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+      const time = createGatewaySchedulerClock(100_000);
+      const clock = vi.spyOn(Date, "now").mockImplementation(time.clock.now);
       let resolveCount = 0;
       const releaseResolution = createDeferred();
       const resolutionStarted = createDeferred();
@@ -3587,8 +3503,7 @@ process.on("SIGINT", shutdown);`,
       const hadRuntimeManager = Object.hasOwn(singletonStore, SESSION_MCP_RUNTIME_MANAGER_KEY);
       const previousRuntimeManager = singletonStore[SESSION_MCP_RUNTIME_MANAGER_KEY];
       const manager = createSessionMcpRuntimeManager({
-        now: () => nowMs,
-        enableIdleSweepTimer: false,
+        scheduler: createTestGatewayScheduler(time.clock),
       });
       singletonStore[SESSION_MCP_RUNTIME_MANAGER_KEY] = manager;
 
@@ -3613,12 +3528,12 @@ process.on("SIGINT", shutdown);`,
         await firstTools.dispose();
         firstTools = undefined;
 
-        nowMs += 300_000;
+        time.setTime(time.clock.now() + 300_000);
         const secondRequest = materializeRequesterScopedMcpToolsForHarnessRun(params);
         await resolutionStarted.promise;
 
         const idleTtlMs = 10 * 60 * 1000;
-        nowMs += idleTtlMs;
+        time.setTime(time.clock.now() + idleTtlMs);
         expect(await manager.sweepIdleRuntimes()).toBe(0);
         expect(manager.listRuntimeKeys()).toHaveLength(1);
 
@@ -3633,7 +3548,7 @@ process.on("SIGINT", shutdown);`,
         await secondTools.dispose();
         secondTools = undefined;
 
-        nowMs += idleTtlMs;
+        time.setTime(time.clock.now() + idleTtlMs);
         expect(await manager.sweepIdleRuntimes()).toBe(1);
         expect(manager.listRuntimeKeys()).toEqual([]);
         expect(proof.session.closed).toBe(firstSessionId);
@@ -3689,15 +3604,16 @@ describe("requester-scoped MCP connection resolution", () => {
     async (entrypoint, expectedExpired) => {
       const resolverRegistry = createMcpProofPluginRegistry();
       await withPluginRuntimeRegistryScope(resolverRegistry.registry, async () => {
-        let nowMs = 100_000;
-        const clock = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+        const time = createGatewaySchedulerClock(100_000);
+        const clock = vi.spyOn(Date, "now").mockImplementation(time.clock.now);
 
         const resolverApi = resolverRegistry.apiFor("test-plugin");
         resolverApi.registerMcpServerConnectionResolver({
           serverName: "user-mail",
           resolve: async () => ({ url: "https://mcp.example.test/user" }),
         });
-        const manager = createSessionMcpRuntimeManager({ enableIdleSweepTimer: false });
+        const scheduler = createTestGatewayScheduler(time.clock);
+        const manager = createSessionMcpRuntimeManager({ scheduler });
         const sessionKey = "agent:test:session-fixed-idle";
         const params: RuntimeParams = {
           sessionId: "session-fixed-idle",
@@ -3722,15 +3638,15 @@ describe("requester-scoped MCP connection resolution", () => {
             : manager.getOrCreate(params);
         try {
           await getRuntime();
-          nowMs += 1_200_000 - 1;
+          await time.advanceBy(1_200_000 - 1);
           expect(await manager.sweepIdleRuntimes()).toBe(0);
 
           const reused = expectDefined(await getRuntime(), "admitted MCP runtime");
-          expect(reused.lastUsedAt).toBe(nowMs);
-          nowMs += 1_200_000 - 1;
+          expect(reused.lastUsedAt).toBe(time.clock.now());
+          await time.advanceBy(1_200_000 - 1);
           expect(await manager.sweepIdleRuntimes()).toBe(0);
           const release = expectDefined(reused.acquireLease, "MCP runtime lease")();
-          nowMs += 1;
+          await time.advanceBy(1);
           expect(await manager.sweepIdleRuntimes()).toBe(0);
           expect(manager.listSessionIds()).toContain(params.sessionId);
 
@@ -3740,6 +3656,7 @@ describe("requester-scoped MCP connection resolution", () => {
           expect(manager.resolveSessionId(sessionKey)).toBeUndefined();
         } finally {
           await manager.disposeAll();
+          await scheduler.stop();
           clock.mockRestore();
         }
       });
@@ -3747,7 +3664,7 @@ describe("requester-scoped MCP connection resolution", () => {
   );
 
   it("keeps replacement capacity reserved when an old child's cleanup is uncertain", async () => {
-    const manager = createSessionMcpRuntimeManager({ enableIdleSweepTimer: false });
+    const manager = createSessionMcpRuntimeManager();
     const params: RuntimeParams = {
       sessionId: "uncertain-child",
       workspaceDir: "/workspace",
@@ -4373,7 +4290,7 @@ describe("requester-scoped MCP connection resolution", () => {
             : null,
       });
 
-      let nowMs = 50_000;
+      const clock = createGatewaySchedulerClock(50_000);
       const disposed: string[] = [];
       const createRuntime: RuntimeFactory = (params) => {
         const label = params.requesterScope ? "scoped" : "static";
@@ -4386,8 +4303,7 @@ describe("requester-scoped MCP connection resolution", () => {
       };
       const manager = createSessionMcpRuntimeManager({
         createRuntime,
-        now: () => nowMs,
-        enableIdleSweepTimer: false,
+        scheduler: createTestGatewayScheduler(clock.clock),
       });
       const cfg = {
         mcp: {
@@ -4403,11 +4319,11 @@ describe("requester-scoped MCP connection resolution", () => {
       expect(manager.listRuntimeKeys().some((key) => key.startsWith("{"))).toBe(true);
 
       allow = false;
-      nowMs += 299_999;
+      clock.setTime(clock.clock.now() + 299_999);
       await manager.getOrCreate(params);
       expect(disposed).toEqual([]);
       expect(manager.listRuntimeKeys().some((key) => key.startsWith("{"))).toBe(true);
-      nowMs += 1;
+      clock.setTime(clock.clock.now() + 1);
       const after = await manager.getOrCreate(params);
 
       expect(disposed).toContain("scoped");
@@ -4474,14 +4390,9 @@ describe("requester-scoped MCP connection resolution", () => {
     const resolverRegistry = createMcpProofPluginRegistry();
     await withPluginRuntimeRegistryScope(resolverRegistry.registry, async () => {
       let call = 0;
-      let clock = 0;
-      let releaseFirst: (() => void) | undefined;
-      const firstGate = new Promise<void>((resolve) => {
-        releaseFirst = resolve;
-      });
+      const firstStarted = createDeferred();
+      const firstGate = createDeferred();
       const { hashMcpResolvedConnections } = await import("./mcp-connection-resolver.js");
-      // Advance the injected clock past the documented five-minute window for
-      // each queued installation without advancing transport timers.
 
       const resolverApi = resolverRegistry.apiFor("test-plugin");
       resolverApi.registerMcpServerConnectionResolver({
@@ -4490,7 +4401,8 @@ describe("requester-scoped MCP connection resolution", () => {
           call += 1;
           const token = call === 1 ? "test-auth-token" : "secret-token";
           if (call === 1) {
-            await firstGate;
+            firstStarted.resolve();
+            await firstGate.promise;
           }
           return {
             url: "https://mcp.example.test/user",
@@ -4506,14 +4418,7 @@ describe("requester-scoped MCP connection resolution", () => {
         }
         return makeManagedRuntime(params);
       };
-      const manager = createSessionMcpRuntimeManager({
-        createRuntime,
-        now: () => {
-          clock += 300_001;
-          return clock;
-        },
-        enableIdleSweepTimer: false,
-      });
+      const manager = createSessionMcpRuntimeManager({ createRuntime });
       const cfg = {
         mcp: {
           servers: {
@@ -4524,28 +4429,25 @@ describe("requester-scoped MCP connection resolution", () => {
 
       const params = makeRequesterParams("session-serialize", cfg as never, "sender-a");
       const first = manager.getOrCreate(params);
-      await new Promise((resolve) => {
-        setTimeout(resolve, 20);
-      });
-
-      const second = manager.getOrCreate(params);
-
-      // Second is queued behind the first exclusive section. First installs the first credential, then
-      // second re-resolves the rotated credential and replaces — last serialized resolution wins.
-      await new Promise((resolve) => {
-        setTimeout(resolve, 20);
-      });
-      expect(call).toBe(1);
-      releaseFirst?.();
-      await Promise.all([first, second]);
-
-      expect(call).toBe(2);
-      expect(builtHashes).toHaveLength(2);
-      expect(builtHashes[0]).not.toBe(builtHashes[1]);
-      expect(manager.listRuntimeKeys().filter((key) => key.startsWith("{"))).toHaveLength(1);
-
-      expect(testing.getBookkeepingSizes(manager).runtimes).toBeGreaterThan(0);
-      await manager.disposeAll();
+      await firstStarted.promise;
+      // A changed workspace requires fresh credentials after the queued admission.
+      const successorParams = { ...params, workspaceDir: "/replacement" };
+      const second = manager.getOrCreate(successorParams);
+      try {
+        expect(call).toBe(1);
+        firstGate.resolve();
+        const [, successor] = await Promise.all([first, second]);
+        await expect(manager.getOrCreate(successorParams)).resolves.toBe(successor);
+        expect(call).toBe(2);
+        expect(builtHashes).toHaveLength(2);
+        expect(builtHashes[0]).not.toBe(builtHashes[1]);
+        expect(manager.listRuntimeKeys().filter((key) => key.startsWith("{"))).toHaveLength(1);
+        expect(testing.getBookkeepingSizes(manager).runtimes).toBeGreaterThan(0);
+      } finally {
+        firstGate.resolve();
+        await Promise.allSettled([first, second]);
+        await manager.disposeAll();
+      }
       expect(testing.getBookkeepingSizes(manager)).toEqual({
         runtimes: 0,
         connectionMeta: 0,
@@ -4575,7 +4477,7 @@ describe("requester-scoped MCP connection resolution", () => {
         },
       });
 
-      let nowMs = 10_000;
+      const clock = createGatewaySchedulerClock(10_000);
       let createCount = 0;
       const createRuntime: RuntimeFactory = (params) => {
         createCount += 1;
@@ -4583,8 +4485,7 @@ describe("requester-scoped MCP connection resolution", () => {
       };
       const manager = createSessionMcpRuntimeManager({
         createRuntime,
-        now: () => nowMs,
-        enableIdleSweepTimer: false,
+        scheduler: createTestGatewayScheduler(clock.clock),
       });
       const cfg = {
         mcp: {
@@ -4600,20 +4501,20 @@ describe("requester-scoped MCP connection resolution", () => {
       expect(createCount).toBe(2); // empty static + requester
 
       // Within revalidation window: no resolver call.
-      nowMs += 299_999;
+      clock.setTime(clock.clock.now() + 299_999);
       await manager.getOrCreate(params);
       expect(resolveCalls).toBe(1);
       expect(createCount).toBe(2);
 
       // Past window, unchanged credentials: resolve once, no rebuild.
-      nowMs += 1;
+      clock.setTime(clock.clock.now() + 1);
       await manager.getOrCreate(params);
       expect(resolveCalls).toBe(2);
       expect(createCount).toBe(2);
 
       // Past window with rotated header: rebuild requester runtime.
       token = "secret-token";
-      nowMs += 300_000;
+      clock.setTime(clock.clock.now() + 300_000);
       await manager.getOrCreate(params);
       expect(resolveCalls).toBe(3);
       expect(createCount).toBe(3);
@@ -4960,9 +4861,9 @@ describe("requester-scoped MCP connection resolution", () => {
         exclude?: string[];
       }> = [];
       const dispose = vi.fn(async () => {});
-      let nowMs = 100_000;
+      const clock = createGatewaySchedulerClock(100_000);
       const createRuntime: RuntimeFactory = (params) => {
-        const createdAt = nowMs;
+        const createdAt = clock.clock.now();
         created.push({
           requesterScope: params.requesterScope,
           include: params.includeServerNames ? [...params.includeServerNames] : undefined,
@@ -4977,8 +4878,10 @@ describe("requester-scoped MCP connection resolution", () => {
           dispose,
         };
       };
-      const now = vi.fn(() => nowMs);
-      const manager = createSessionMcpRuntimeManager({ createRuntime, now });
+      const manager = createSessionMcpRuntimeManager({
+        createRuntime,
+        scheduler: createTestGatewayScheduler(clock.clock),
+      });
       const cfg = {
         mcp: {
           servers: {
@@ -5010,8 +4913,7 @@ describe("requester-scoped MCP connection resolution", () => {
         sessionKeys: 1,
       });
 
-      now.mockClear();
-      nowMs += 10 * 60 * 1000 + 1;
+      clock.setTime(clock.clock.now() + 10 * 60 * 1000 + 1);
       for (const [requesterSenderId, attemptedSessionId] of [
         [undefined, "session-missing"],
         ["  ", "session-blank"],
@@ -5029,7 +4931,6 @@ describe("requester-scoped MCP connection resolution", () => {
         expect(manager.resolveSessionId(sessionKey)).toBe(sessionId);
       }
 
-      expect(now).not.toHaveBeenCalled();
       expect(dispose).not.toHaveBeenCalled();
       expect(manager.listRuntimeKeys()).toEqual(runtimeKeys);
       expect(testing.getBookkeepingSizes(manager)).toEqual(bookkeeping);

@@ -114,22 +114,14 @@ export async function loadPreparedGatewayModelCatalogSnapshot(
 ): Promise<PreparedGatewayModelCatalogSnapshot> {
   for (;;) {
     let loaded: Awaited<ReturnType<typeof loadGatewayModelCatalogOwnerSnapshot>>;
-    try {
-      loaded = await loadGatewayModelCatalogOwnerSnapshot(params);
-    } catch (error) {
-      if (error instanceof PreparedModelRuntimePublicationSupersededError) {
-        continue;
-      }
-      throw error;
-    }
-    const { candidate, owner } = loaded;
     let refreshedAuth: Awaited<ReturnType<typeof loadPreparedModelRuntimeAuth>>;
     try {
+      loaded = await loadGatewayModelCatalogOwnerSnapshot(params);
       refreshedAuth = params?.refreshAuth
         ? await loadPreparedModelRuntimeAuth(
-            candidate,
+            loaded.candidate,
             params.authScope ?? {
-              providerIds: owner.modelCatalog.entries.map((entry) => entry.provider),
+              providerIds: loaded.owner.modelCatalog.entries.map((entry) => entry.provider),
             },
           )
         : undefined;
@@ -141,6 +133,7 @@ export async function loadPreparedGatewayModelCatalogSnapshot(
       }
       throw error;
     }
+    const { owner } = loaded;
     return {
       ...projectGatewayModelCatalogSnapshot(owner),
       authModes: refreshedAuth?.authModes ?? owner.authModes,
@@ -150,6 +143,7 @@ export async function loadPreparedGatewayModelCatalogSnapshot(
       pluginRegistry: owner.pluginRegistry,
       isCurrent: owner.isCurrent,
       observationConfig: owner.observationConfig,
+      accountCatalog: owner.accountCatalog,
     };
   }
 }
@@ -165,6 +159,7 @@ export async function loadGatewayModelCatalogSnapshot(
     pluginRegistry: _pluginRegistry,
     isCurrent: _isCurrent,
     observationConfig: _observationConfig,
+    accountCatalog: _accountCatalog,
     ...snapshot
   } = await loadPreparedGatewayModelCatalogSnapshot(params);
   return snapshot;
@@ -250,9 +245,17 @@ export async function readPreparedGatewayModelCatalogBatch(
 export async function readPreparedGatewayModelCatalogOwnerSnapshot(
   params?: LoadGatewayModelCatalogParams,
 ): Promise<PreparedGatewayModelCatalogSnapshot | undefined> {
-  const { getPublishedPreparedModelCatalogOwnerSnapshot, materializePreparedModelCatalogOwner } =
-    await import("../agents/prepared-model-catalog.js");
+  const {
+    getPublishedPreparedModelCatalogOwnerSnapshot,
+    getPendingPreparedModelRuntimeReplacement,
+    materializePreparedModelCatalogOwner,
+  } = await import("../agents/prepared-model-catalog.js");
   const config = (params?.getConfig ?? getRuntimeConfig)();
+  const replacement = getPendingPreparedModelRuntimeReplacement();
+  if (replacement) {
+    await replacement;
+    return readPreparedGatewayModelCatalogOwnerSnapshot(params);
+  }
   const candidate = getPublishedPreparedModelCatalogOwnerSnapshot({
     ...(params?.agentId ? { agentId: params.agentId } : {}),
     ...(params?.agentDir ? { agentDir: params.agentDir } : {}),
@@ -273,5 +276,6 @@ export async function readPreparedGatewayModelCatalogOwnerSnapshot(
     pluginRegistry: owner.pluginRegistry,
     isCurrent: owner.isCurrent,
     observationConfig: owner.observationConfig,
+    accountCatalog: owner.accountCatalog,
   };
 }

@@ -26,13 +26,16 @@ import {
   disconnectGatewayClient,
 } from "../../../../src/gateway/test-helpers.e2e.js";
 import { stopQaGatewayFixture } from "../../../helpers/qa-gateway-cleanup.js";
+import { readQaSubagentRuns } from "../../../helpers/qa-subagent-runs.js";
 import { stopChildProcess } from "../../../helpers/stop-child-process.js";
 
 const MODEL = "mock-openai/progress-fixture";
 const FINAL_MARKER = "TOOL-PROGRESS-FINAL";
 const HEADLINE = "Checking the requested work";
-// Draft progress uses compact tool rows; native Slack uses task_update chunks.
+// Draft progress uses compact tool rows; the Slack Block Kit card uses plain
+// "Exec — detail" rows; native Slack uses task_update chunks.
 const toolRow = /🛠️ (?:Exec|Bash)\b/u;
+const slackCardToolRow = /\b(?:Exec|Bash) — /u;
 const nativeToolTitle = /^(?:Exec|Bash)\b/u;
 const failedToolRow = /🛠️ (?:Exec|Bash): failed\b/u;
 type WireWrite = {
@@ -366,7 +369,7 @@ async function startPresentationApi(
 function isCompletionUserText(text: string): boolean {
   return (
     text.includes("Internal task completion event") ||
-    text.includes("[Subagent Context] Every subagent spawned from this session has now settled")
+    text.includes("[Subagent Context] Every subagent in this batch has now settled")
   );
 }
 
@@ -581,12 +584,7 @@ describe("channel progress presentation through an isolated Gateway", () => {
     cleanups.push(() => stopQaGatewayFixture(owner));
     const gateway = await owner.start({
       repoRoot: process.cwd(),
-      command: {
-        executablePath: process.execPath,
-        argsPrefix: [path.join(process.cwd(), "openclaw.mjs")],
-        cwd: process.cwd(),
-        usePackagedPlugins: true,
-      },
+      // The source QA fixture uses prebuilt dist without installed-package repair.
       providerBaseUrl: `http://127.0.0.1:${providerPort}/v1`,
       providerMode: "mock-openai",
       primaryModel: MODEL,
@@ -877,12 +875,6 @@ describe("channel progress presentation through an isolated Gateway", () => {
     cleanups.push(() => stopQaGatewayFixture(owner));
     const gateway = await owner.start({
       repoRoot: process.cwd(),
-      command: {
-        executablePath: process.execPath,
-        argsPrefix: [path.join(process.cwd(), "openclaw.mjs")],
-        cwd: process.cwd(),
-        usePackagedPlugins: true,
-      },
       providerBaseUrl: `http://127.0.0.1:${address.port}/v1`,
       mockSessionObserverUrl: provider.sessionObserverUrl,
       providerMode: "mock-openai",
@@ -1052,12 +1044,21 @@ describe("channel progress presentation through an isolated Gateway", () => {
       try {
         await waitForFact(async () => {
           await provider.terminalRequesters.settle(gateway);
-          const listing = asRecord(await gateway.call("tasks.list", { agentId: "qa", limit: 100 }));
-          terminalTask = Array.isArray(listing.tasks)
-            ? listing.tasks.map(asRecord).find((task) => task.title === `qa-terminal-${caseName}`)
+          const run = readQaSubagentRuns(gateway.runtimeEnv).find(
+            (entry) => entry.label === `qa-terminal-${caseName}`,
+          );
+          terminalTask = run
+            ? {
+                runId: run.runId,
+                title: run.label,
+                sessionKey: run.requesterSessionKey,
+                status: run.execution.status,
+                deliveryStatus: run.delivery?.status,
+                error: run.delivery?.lastError,
+              }
             : undefined;
           return (
-            terminalTask?.status === "completed" &&
+            terminalTask?.status === "terminal" &&
             ["failed", "delivered"].includes(String(terminalTask.deliveryStatus))
           );
         }, `settled ${caseName} task`);
@@ -1248,8 +1249,7 @@ describe("channel progress presentation through an isolated Gateway", () => {
             acceptedRunId &&
             acceptedChildSessionKey
           ) {
-            // A normal final acknowledgement leaves completion with the child;
-            // the shared fixture's NO_REPLY intentionally yields requester custody.
+            // A normal final acknowledgement leaves completion with the child.
             parentAcknowledged = true;
             taskRunId = acceptedRunId;
             childSessionKey = acceptedChildSessionKey;
@@ -1284,12 +1284,6 @@ describe("channel progress presentation through an isolated Gateway", () => {
     cleanups.push(() => stopQaGatewayFixture(owner));
     const gateway = await owner.start({
       repoRoot: process.cwd(),
-      command: {
-        executablePath: process.execPath,
-        argsPrefix: [path.join(process.cwd(), "openclaw.mjs")],
-        cwd: process.cwd(),
-        usePackagedPlugins: true,
-      },
       providerBaseUrl: `http://127.0.0.1:${address.port}/v1`,
       mockSessionObserverUrl: provider.sessionObserverUrl,
       providerMode: "mock-openai",
@@ -1317,6 +1311,7 @@ describe("channel progress presentation through an isolated Gateway", () => {
             commands: { native: false, nativeSkills: false },
           },
         },
+        tools: { ...config.tools, codeMode: false, toolSearch: false },
       }),
     });
     let task: Record<string, unknown> | undefined;
@@ -1398,40 +1393,19 @@ describe("channel progress presentation through an isolated Gateway", () => {
     if (!stateDir) {
       throw new Error("isolated Gateway state directory missing");
     }
-    const { openOpenClawStateDatabase } =
-      await import("../../../../src/state/openclaw-state-db.js");
-    const { closeOpenClawStateDatabaseByPath } =
-      await import("../../../../src/state/openclaw-state-db-cache.js");
-    const { readSubagentRun } =
-      await import("../../../../src/agents/subagents/registry/subagent-registry.store.sqlite.js");
-    const database = openOpenClawStateDatabase({ env: gateway.runtimeEnv });
-    cleanups.push(async () => {
-      closeOpenClawStateDatabaseByPath(database.path);
-    });
     await waitForFact(async () => {
       await provider.terminalRequesters.settle(gateway);
-      const listing = asRecord(await gateway.call("tasks.list", { agentId: "qa", limit: 100 }));
-      allTaskSummaries = Array.isArray(listing.tasks)
-        ? listing.tasks.map((entry) => {
-            const record = asRecord(entry);
-            return {
-              runId: record.runId,
-              title: record.title,
-              status: record.status,
-              deliveryStatus: record.deliveryStatus,
-            };
-          })
-        : [];
-      const tasks = Array.isArray(listing.tasks)
-        ? listing.tasks.map(asRecord).filter((entry) => entry.runId === taskRunId)
-        : [];
-      taskRuns = tasks.map(({ runId, status, deliveryStatus }) => ({
-        runId,
-        status,
-        deliveryStatus,
+      const runs = readQaSubagentRuns(gateway.runtimeEnv);
+      const summaries = runs.map((run) => ({
+        runId: run.runId,
+        title: run.label,
+        status: run.execution.status,
+        deliveryStatus: run.delivery?.status,
       }));
-      task = tasks.find((entry) => entry.runId === taskRunId);
-      const run = taskRunId ? readSubagentRun(database, taskRunId) : undefined;
+      allTaskSummaries = summaries;
+      taskRuns = summaries.filter((entry) => entry.runId === taskRunId);
+      task = summaries.find((entry) => entry.runId === taskRunId);
+      const run = runs.find((entry) => entry.runId === taskRunId);
       delivery =
         run?.childSessionKey === childSessionKey && run?.delivery
           ? {
@@ -1458,7 +1432,7 @@ describe("channel progress presentation through an isolated Gateway", () => {
         ? { recoveryState: pending.recoveryState, lastError: pending.lastError }
         : undefined;
       return (
-        task?.status === "completed" &&
+        task?.status === "terminal" &&
         delivery?.disposition === "ambiguous" &&
         Boolean(queued) &&
         gateway.logs().includes("automatic completion delivery could not be confirmed")
@@ -1582,14 +1556,6 @@ describe("channel progress presentation through an isolated Gateway", () => {
       }
       const gateway = await owner.start({
         repoRoot: process.cwd(),
-        // The E2E runner owns the build; child startups must not rebuild dist
-        // beneath already-running test workers when the source tree is dirty.
-        command: {
-          executablePath: process.execPath,
-          argsPrefix: [path.join(process.cwd(), "openclaw.mjs")],
-          cwd: process.cwd(),
-          usePackagedPlugins: true,
-        },
         providerBaseUrl: `${provider.baseUrl}/v1`,
         providerMode: "mock-openai",
         primaryModel: MODEL,
@@ -1760,10 +1726,16 @@ describe("channel progress presentation through an isolated Gateway", () => {
         )
         .join("\n");
       expect(progressText).toContain(HEADLINE);
+      const slackCard = channel === "slack" && !native && !compact;
+      const expectedToolRow = slackCard ? slackCardToolRow : toolRow;
       if (!tools) {
-        expect(progressText).not.toMatch(toolRow);
+        expect(progressText).not.toMatch(expectedToolRow);
       } else if (channel !== "slack" || !native) {
-        expect(progressText).toMatch(toolRow);
+        expect(progressText).toMatch(expectedToolRow);
+      }
+      if (slackCard) {
+        // The fallback card adds no emoji status or tool chrome.
+        expect(progressText).not.toMatch(/🛠️|🔄/u);
       }
       if (failTool) {
         if (tools) {

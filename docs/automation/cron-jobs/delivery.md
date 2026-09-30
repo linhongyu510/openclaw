@@ -21,6 +21,12 @@ Where a finished run sends its output, what happens when a run or a delivery fai
 
 A successful primary webhook run with no nonblank summary intentionally skips the POST and records `deliverySuppressionReason: "empty"`, matching announce delivery's optional-output contract. Execution errors still send the error event even without a summary.
 
+Primary webhooks record delivery after an HTTP 2xx acknowledgment. An HTTP rejection
+records **Not delivered**. If the request may have reached the receiver but its
+response is lost or times out, delivery stays **Unknown**; the transport does not
+retry that ambiguous send. Required delivery also leaves completion unknown,
+while best-effort delivery can complete successfully without claiming delivery.
+
 When `gateway.publicOrigin` is configured and the Control UI is enabled, chat
 notifications include an `Inspect` link into the Control UI. Command and script
 completion announcements open the automation run; isolated agent announcements
@@ -95,6 +101,11 @@ When an agent creates an isolated reminder from an active chat, OpenClaw stores 
 Implicit announce delivery uses configured channel allowlists to validate and reroute stale targets. DM pairing-store approvals are not fallback automation recipients; set `delivery.to` or configure the channel `allowFrom` entry when a scheduled job should proactively send to a DM.
 
 ### Failure notifications
+
+Failure-alert webhooks stay **Unknown** when the request may have reached the
+receiver but its response is lost. An explicit HTTP rejection or a failure proven
+to precede sending records **Not delivered** and allows the in-app fallback
+notification. An unknown outcome does not trigger that fallback.
 
 Execution failures use one scheduler-owned threshold and cooldown policy. A job with an existing failure route is covered by default after 2 consecutive failures with a 1-hour cooldown. The route can be a resolved failure destination or the job's primary announce target. Jobs with no such route stay quiet unless a per-job or global `failureAlert` object explicitly activates the policy.
 

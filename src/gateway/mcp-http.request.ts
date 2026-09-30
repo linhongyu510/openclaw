@@ -144,14 +144,17 @@ export function validateMcpLoopbackRequest(params: {
   nonOwnerToken: string;
   onSseResponse?: (res: ServerResponse) => void;
 }): McpLoopbackRequestAuth | null {
+  const reply = (status: number, body: unknown): null => {
+    params.res.writeHead(status, { "Content-Type": "application/json" });
+    params.res.end(JSON.stringify(body));
+    return null;
+  };
   let url: URL;
   try {
     url = new URL(params.req.url ?? "/", `http://${params.req.headers.host ?? "localhost"}`);
   } catch {
     logMcpLoopbackTraffic("reject", { reason: "bad_request_url", method: params.req.method ?? "" });
-    params.res.writeHead(400, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "bad_request" }));
-    return null;
+    return reply(400, { error: "bad_request" });
   }
 
   if (params.req.method === "GET" && url.pathname.startsWith("/.well-known/")) {
@@ -166,9 +169,7 @@ export function validateMcpLoopbackRequest(params: {
       method: params.req.method ?? "",
       path: url.pathname,
     });
-    params.res.writeHead(404, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "not_found" }));
-    return null;
+    return reply(404, { error: "not_found" });
   }
 
   if (
@@ -195,9 +196,7 @@ export function validateMcpLoopbackRequest(params: {
         origin: getHeader(params.req, "origin") ?? "",
       });
     }
-    params.res.writeHead(403, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "forbidden" }));
-    return null;
+    return reply(403, { error: "forbidden" });
   }
 
   const sender = resolveMcpSender(params);
@@ -209,9 +208,7 @@ export function validateMcpLoopbackRequest(params: {
         hasAuthorization: (getHeader(params.req, "authorization") ?? "").length > 0,
       });
     }
-    params.res.writeHead(401, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "unauthorized" }));
-    return null;
+    return reply(401, { error: "unauthorized" });
   }
 
   if (params.req.method === "GET") {
@@ -234,9 +231,7 @@ export function validateMcpLoopbackRequest(params: {
   if (params.req.method === "DELETE") {
     // This stateless listener owns no session lifecycle; authenticated teardown is a no-op.
     logMcpLoopbackTraffic("session-delete", { method: "DELETE", path: url.pathname });
-    params.res.writeHead(200, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ ok: true }));
-    return null;
+    return reply(200, { ok: true });
   }
 
   const contentType = getHeader(params.req, "content-type") ?? "";
@@ -246,9 +241,7 @@ export function validateMcpLoopbackRequest(params: {
       method: params.req.method ?? "",
       contentType,
     });
-    params.res.writeHead(415, { "Content-Type": "application/json" });
-    params.res.end(JSON.stringify({ error: "unsupported_media_type" }));
-    return null;
+    return reply(415, { error: "unsupported_media_type" });
   }
 
   return sender;
