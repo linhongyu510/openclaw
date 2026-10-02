@@ -1,5 +1,6 @@
 import type { SessionTranscriptRuntimeTarget } from "../../../config/sessions/session-accessor.js";
 import type { InternalSessionEntry } from "../../../config/sessions/types.js";
+import type { Model } from "../../../llm/types.js";
 import type { AgentExecutionAuthBinding } from "../../execution-auth-binding.js";
 import type { ModelFallbackRouteResolution } from "../../model-fallback.types.js";
 import type { PreparedModelRuntimePluginGeneration } from "../../prepared-model-runtime.types.js";
@@ -7,6 +8,7 @@ import type { CompactionRequestBudget } from "../../sessions/compaction/request-
 import type { SystemAgentToolOptions } from "../../tools/system-agent-tool.js";
 import type { DeferredEmbeddedRunLifecycleOwner } from "./deferred-lifecycle-owner.js";
 import type { RunEmbeddedAgentParams } from "./params.js";
+import type { EmbeddedRunCompletionCheck } from "./terminal-retry-state.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
 export type CompactionAccountingTarget = Readonly<
@@ -18,12 +20,21 @@ export type CompactionAccountingTarget = Readonly<
 export type EmbeddedContextAccountingEvent = Readonly<
   | { kind: "compaction"; tokensAfter: number | undefined }
   /**
-   * `admitted` reports whether the provider actually accepted this prompt and
-   * produced a usable turn. The producer emits a model event for rejected,
-   * aborted and overflow-length responses as well, so consumers that renew a
-   * per-episode recovery budget must key off this flag, not off the event.
+   * `successful` is the broad telemetry signal: the provider returned a
+   * stop/toolUse response without a refusal. It does NOT exclude silent
+   * overflow responses.
+   *
+   * `admitted` is the narrow admission signal: the provider actually accepted
+   * the prompt and produced a usable turn, excluding rejected, aborted,
+   * zero-usage, and context-overflow responses. Consumers renewing a per-episode
+   * recovery budget must key off `admitted`, not `successful`.
    */
-  | { kind: "model"; contextTokens: number | undefined; admitted?: boolean }
+  | {
+      kind: "model";
+      contextTokens: number | undefined;
+      successful: boolean;
+      admitted?: boolean;
+    }
 >;
 
 /** Writer custody is independent of telemetry; an absent snapshot is not observed unknown context. */
@@ -40,6 +51,8 @@ export type CompactionAccountingFact = Readonly<
 >;
 
 export type RunEmbeddedAgentInternalParams = RunEmbeddedAgentParams & {
+  /** Fail-closed caller input admission against the actual prepared model, before dispatch. */
+  assertModelInput?: (model: Pick<Model, "input">) => void;
   /** Reset deferred terminal facts when the host admits a new attempt, before preparation. */
   onAttemptStart?: () => void;
   /** Keep a bounded auxiliary tool set directly visible after runtime admission. */
@@ -81,6 +94,8 @@ export type RunEmbeddedAgentInternalParams = RunEmbeddedAgentParams & {
 export type EmbeddedRunAttemptInternalParams = EmbeddedRunAttemptParams &
   Pick<RunEmbeddedAgentInternalParams, "onContextAccountingEvent" | "onCompactionRequestBudget"> & {
     compactionCountOwner?: "subscription" | "caller";
+    /** Current-run committed plan facts; retained across attempts, never loaded from history. */
+    completionCheck?: EmbeddedRunCompletionCheck;
   };
 
 export type RunEmbeddedAgentParamsWithSessionFile = RunEmbeddedAgentInternalParams & {

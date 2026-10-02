@@ -4,8 +4,13 @@ import { expect, it } from "vitest";
 import { SIDEBAR_SESSION_ROSTER_LIMIT } from "../../../src/shared/session-list-limits.ts";
 import type { SessionDataController } from "../components/session-data-controller.ts";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
+import { pauseVirtualClock } from "../test-helpers/control-ui-e2e.ts";
 import { createControlUiSessionRow as sessionRow } from "../test-helpers/control-ui-session-fixtures.ts";
 import { createControlUiE2eContextOptions } from "./control-ui-e2e-suite.test-support.ts";
+import {
+  installMutationScopeDiagnostics,
+  logMutationScopeRequests,
+} from "./session-management.mutation-scope.test-support.ts";
 import {
   controlUiSessionUrl,
   createSessionManagementE2eSuite,
@@ -13,6 +18,7 @@ import {
   sessionsListResponse,
   waitForPatch,
 } from "./session-management.test-support.ts";
+import { chooseSidebarMenuOption, closeSidebarMenu } from "./sidebar-session-menu.test-support.ts";
 
 const suite = createSessionManagementE2eSuite();
 
@@ -28,6 +34,8 @@ suite.define(() => {
       const artifactDir = createControlUiE2eArtifactDir("session-mutation-scope");
       const context = await suite.browser.newContext(createControlUiE2eContextOptions());
       const page = await context.newPage();
+      await page.clock.install();
+      await installMutationScopeDiagnostics(page, { operation, filter });
       const original = sessionRow("agent:main:rename-cross-agent", "Original name", 3);
       const batch = [original, sessionRow("agent:main:batch-sibling", "Batch sibling", 2)];
       const mainRows = [sessionRow("agent:main:main", "Main", 1), ...batch];
@@ -109,11 +117,8 @@ suite.define(() => {
         await page.goto(controlUiSessionUrl(suite.server.baseUrl, original.key));
         await rowFor(original.key).waitFor({ state: "visible" });
         if (filter === "All") {
-          await sidebar.getByRole("button", { name: "Filter & sort" }).click();
-          await page
-            .locator(".sidebar-session-sort-menu")
-            .getByRole("menuitemradio", { name: filter, exact: true })
-            .click();
+          await chooseSidebarMenuOption(page, "Status", filter);
+          await closeSidebarMenu(page);
           await gateway.waitForRequest("sessions.list", {
             match: { agentId: "main", archived: "all" },
           });
@@ -216,11 +221,14 @@ suite.define(() => {
           ...(filter === "All" ? { archived: "all" } : {}),
         };
         const readsBeforeEvent = (await gateway.getRequests("sessions.list", researchMatch)).length;
+        await pauseVirtualClock(page);
         await gateway.emitGatewayEvent("sessions.changed", {
           sessionKey: newRow.key,
           agentId: "research",
           reason: "create",
         });
+        await page.clock.fastForward(5_001);
+        await page.clock.resume();
         await gateway.waitForRequest("sessions.list", {
           match: researchMatch,
           after: readsBeforeEvent,
@@ -277,11 +285,14 @@ suite.define(() => {
           await capture("retained-before-invalidation");
           const readsBeforeInvalidation = (await gateway.getRequests("sessions.list", refreshMatch))
             .length;
+          await pauseVirtualClock(page);
           await gateway.emitGatewayEvent("sessions.changed", {
             sessionKey: newRow.key,
             agentId: "research",
             reason: "update",
           });
+          await page.clock.fastForward(5_001);
+          await page.clock.resume();
           const refresh = await gateway.waitForRequest("sessions.list", {
             match: refreshMatch,
             after: readsBeforeInvalidation,
@@ -309,11 +320,14 @@ suite.define(() => {
             "sessions.list",
             responseFor(returnedResearchRows.filter((row) => row.key !== researchRows[1]!.key)),
           );
+          await pauseVirtualClock(page);
           await gateway.emitGatewayEvent("sessions.changed", {
             sessionKey: newRow.key,
             agentId: "research",
             reason: "update",
           });
+          await page.clock.fastForward(5_001);
+          await page.clock.resume();
           const refresh = await gateway.waitForRequest("sessions.list", {
             match: refreshMatch,
             after: readsBeforeRemoval,
@@ -326,15 +340,15 @@ suite.define(() => {
         }
       } finally {
         await capture("final-state");
+        const listRequests = await gateway.getRequests("sessions.list");
+        logMutationScopeRequests(listRequests, { operation, filter });
         await writeFile(
           path.join(artifactDir, "observations.json"),
           JSON.stringify(
             {
               url: page.url(),
               rows: await sidebar.locator(".sidebar-recent-session").allTextContents(),
-              listRequests: (await gateway.getRequests("sessions.list")).map(
-                ({ params }) => params,
-              ),
+              listRequests: listRequests.map(({ params }) => params),
               patchRequests: (await gateway.getRequests("sessions.patch")).map(
                 ({ params }) => params,
               ),

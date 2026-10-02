@@ -305,6 +305,7 @@ describe("embedded model resolution consistency", () => {
     const preparedModelRuntime = createPreparedModelRuntime(config);
 
     const chat = await resolveEmbeddedRunModelSetup({
+      assertCurrent: () => {},
       runParams: {
         config,
         prompt: "hello",
@@ -320,7 +321,11 @@ describe("embedded model resolution consistency", () => {
       onHooksResolved: vi.fn(),
       preparedModelRuntime: preparedModelRuntime as never,
     });
-    expect(chat.model).toMatchObject({ provider: PROVIDER, id: STATIC_MODEL_ID });
+    expect(chat.model).toMatchObject({
+      provider: PROVIDER,
+      id: STATIC_MODEL_ID,
+      compactionThinkingDefault: "off",
+    });
 
     const compaction = await prepareDirectCompactionAttempt({
       config,

@@ -1,5 +1,6 @@
 import { isContextOverflow } from "@openclaw/ai/internal/runtime";
 import { isProviderRefusalAssistantError } from "@openclaw/llm-core/diagnostics";
+import { asPositiveFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { formatErrorMessage } from "../../../infra/errors.js";
 import type { AssistantMessage } from "../../../llm/types.js";
@@ -34,7 +35,6 @@ import {
 import { createRunRecoveryDiagId } from "./helpers.js";
 import {
   isNoRealConversationCompactionNoop,
-  isNonReducingCompaction,
   resetNoRealConversationTokenSnapshot,
 } from "./session-bootstrap.js";
 
@@ -162,10 +162,10 @@ export async function recoverEmbeddedRunOverflow(
         reason: "detached recovery has no caller-owned transcript",
       };
     }
-    return await withSessionManagerWrite(sessionManager, () => {
+    return await withSessionManagerWrite(sessionManager, async () => {
       const target = sessionManager.getSessionTarget();
       assertActive();
-      const result = truncateOversizedToolResultsInSessionManager({
+      const result = await truncateOversizedToolResultsInSessionManager({
         sessionManager,
         contextWindowTokens: contextTokenBudget,
         maxCharsOverride: resolveLiveToolResultMaxChars({
@@ -179,20 +179,15 @@ export async function recoverEmbeddedRunOverflow(
       return result;
     });
   };
-  const preflightPromptBudget =
-    isPreflightRecovery &&
-    typeof preflightRecovery?.promptBudgetBeforeReserve === "number" &&
-    Number.isFinite(preflightRecovery.promptBudgetBeforeReserve) &&
-    preflightRecovery.promptBudgetBeforeReserve > 0
-      ? Math.floor(preflightRecovery.promptBudgetBeforeReserve)
-      : undefined;
+  const promptBudget = isPreflightRecovery
+    ? asPositiveFiniteNumber(preflightRecovery?.promptBudgetBeforeReserve)
+    : undefined;
+  const estimatedPromptTokens = isPreflightRecovery
+    ? asPositiveFiniteNumber(preflightRecovery?.estimatedPromptTokens)
+    : undefined;
+  const preflightPromptBudget = promptBudget === undefined ? undefined : Math.floor(promptBudget);
   const preflightEstimatedPromptTokens =
-    isPreflightRecovery &&
-    typeof preflightRecovery?.estimatedPromptTokens === "number" &&
-    Number.isFinite(preflightRecovery.estimatedPromptTokens) &&
-    preflightRecovery.estimatedPromptTokens > 0
-      ? Math.ceil(preflightRecovery.estimatedPromptTokens)
-      : undefined;
+    estimatedPromptTokens === undefined ? undefined : Math.ceil(estimatedPromptTokens);
   const overflowTokenCountForCompaction =
     observedOverflowTokens ??
     preflightEstimatedPromptTokens ??
@@ -337,23 +332,22 @@ export async function recoverEmbeddedRunOverflow(
     }
 
     if (compactResult.compacted) {
-      // A compaction that freed no context stays charged: refunding it would
-      // cancel every increment, so a provider that keeps rejecting the retried
-      // prompt could never reach MAX_OVERFLOW_COMPACTION_ATTEMPTS and the run
-      // would spin until the far coarser outer run guard fired. Renewal is the
-      // job of real model progress instead (see observeContextAccounting).
-      //
-      // It is still a committed compaction, and the context engine reassembles
-      // model messages independently, so the next prompt is not necessarily the
-      // one the provider rejected: keep the bounded retry/reassembly path so a
-      // recoverable run continues. Only the log wording changes here, because
-      // this is not the success it used to claim to be.
-      const nonReducingCompaction = isNonReducingCompaction(compactResult);
-      if (nonReducingCompaction) {
+      const tokensBefore = compactResult.result?.tokensBefore;
+      const tokensAfter = compactResult.result?.tokensAfter;
+      const noReduction =
+        typeof tokensBefore === "number" &&
+        Number.isFinite(tokensBefore) &&
+        typeof tokensAfter === "number" &&
+        Number.isFinite(tokensAfter) &&
+        tokensAfter >= tokensBefore;
+      const compactionOutcome = noReduction
+        ? "auto-compaction removed nothing"
+        : "auto-compaction succeeded";
+      if (noReduction) {
         log.warn(
           `auto-compaction removed no context for ${input.modelSelection.provider}/${input.modelSelection.model} ` +
-            `(tokensBefore=${compactResult.result?.tokensBefore ?? "unknown"} ` +
-            `tokensAfter=${compactResult.result?.tokensAfter ?? "unknown"}); ` +
+            `(tokensBefore=${tokensBefore ?? "unknown"} ` +
+            `tokensAfter=${tokensAfter ?? "unknown"}); ` +
             `attempt ${input.state.overflowCompactionAttempts}/${MAX_OVERFLOW_COMPACTION_ATTEMPTS} stays charged)`,
         );
       }
@@ -375,13 +369,11 @@ export async function recoverEmbeddedRunOverflow(
       input.armPostCompactionGuard();
       if (parkedWorkBlocksContinuation) {
         log.warn(
-          `auto-compaction succeeded for ${input.modelSelection.provider}/${input.modelSelection.model}, but parked nested tool work cannot follow the rotated session; surfacing overflow guidance`,
+          `${compactionOutcome} for ${input.modelSelection.provider}/${input.modelSelection.model}, but parked nested tool work cannot follow the rotated session; surfacing overflow guidance`,
         );
       } else {
         log.info(
-          nonReducingCompaction
-            ? `auto-compaction removed no context for ${input.modelSelection.provider}/${input.modelSelection.model}; retrying prompt`
-            : `auto-compaction succeeded for ${input.modelSelection.provider}/${input.modelSelection.model}; retrying prompt`,
+          `${compactionOutcome} for ${input.modelSelection.provider}/${input.modelSelection.model}; retrying prompt`,
         );
         input.markOwnedTranscriptRetry();
         if (requiresTranscriptContinuation) {

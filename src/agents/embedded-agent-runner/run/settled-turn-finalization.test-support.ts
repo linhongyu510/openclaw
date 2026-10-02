@@ -186,6 +186,8 @@ export function projectSettledProviderFailureAttempt(
     getMessagingToolSentTexts: () => [],
     getMessagingToolSourceReplyPayloads: () => [],
     getSourceReplyDelivered: () => undefined,
+    getSourceReplyDeliveryState: () => undefined,
+    endsWithSourceProgress: () => false,
     getPendingToolMediaReply: () => undefined,
     getToolAutoDeliveryMediaUrls: () => [],
     getReplayState: () => ({ replayInvalid: false, hadPotentialSideEffects: true }),

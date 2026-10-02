@@ -71,9 +71,9 @@ function resolveDreamingTriggerSessionKeys(sessionKey?: string): string[] {
   return uniqueStrings(keys);
 }
 
-function hasPendingManagedDreamingCronEvent(sessionKey?: string): boolean {
+function hasPendingManagedDreamingCronEvent(sessionKey?: string, agentId?: string): boolean {
   return resolveDreamingTriggerSessionKeys(sessionKey).some((candidateSessionKey) =>
-    peekSystemEventEntries(candidateSessionKey).some(
+    peekSystemEventEntries(candidateSessionKey, agentId).some(
       (event) =>
         event.contextKey?.startsWith("cron:") === true &&
         normalizeOptionalString(event.text) === DREAMING_SYSTEM_EVENT_TEXT,
@@ -81,9 +81,8 @@ function hasPendingManagedDreamingCronEvent(sessionKey?: string): boolean {
   );
 }
 
-async function runShortTermDreamingPromotionIfTriggered(params: {
-  cleanedBody: string;
-  trigger?: string;
+async function runShortTermDreamingPromotion(params: {
+  trigger: "heartbeat" | "cron";
   /** Agent whose heartbeat/cron turn triggered the sweep. */
   agentId?: string;
   workspaceDir?: string;
@@ -92,12 +91,6 @@ async function runShortTermDreamingPromotionIfTriggered(params: {
   logger: Logger;
   subagent?: OpenClawPluginApi["runtime"]["subagent"];
 }): Promise<{ handled: true; reason: string } | undefined> {
-  if (params.trigger !== "heartbeat" && params.trigger !== "cron") {
-    return undefined;
-  }
-  if (!includesSystemEventToken(params.cleanedBody, DREAMING_SYSTEM_EVENT_TEXT)) {
-    return undefined;
-  }
   if (!params.config.enabled) {
     return { handled: true, reason: "memory-core: short-term dreaming disabled" };
   }
@@ -198,8 +191,8 @@ async function runShortTermDreamingPromotionIfTriggered(params: {
         detachNarratives,
         nowMs: sweepNowMs,
       });
-      degradedNarratives += phaseResult?.degradedPhases ?? 0;
-      pendingNarratives += phaseResult?.pendingNarratives ?? 0;
+      degradedNarratives += phaseResult.degradedPhases;
+      pendingNarratives += phaseResult.pendingNarratives;
     } catch (err) {
       failedWorkspaces += 1;
       params.logger.error(
@@ -308,12 +301,14 @@ async function runShortTermDreamingPromotionIfTriggered(params: {
         timezone: params.config.timezone,
         storage: params.config.storage ?? { mode: "separate", separateReports: false },
       });
-      // Generate dream diary narrative from promoted memories.
       if (applied.applied > 0) {
+        const promotions = applied.appliedCandidates
+          .map((candidate) => candidate.snippet)
+          .filter(Boolean);
         const data: NarrativePhaseData = {
           phase: "deep",
-          snippets: applied.appliedCandidates.map((c) => c.snippet).filter(Boolean),
-          promotions: applied.appliedCandidates.map((c) => c.snippet).filter(Boolean),
+          snippets: promotions,
+          promotions,
           sourceEntryKeys: [...new Set(applied.appliedCandidates.map((c) => c.key))],
         };
         if (!params.subagent) {
@@ -609,20 +604,16 @@ export function registerShortTermPromotionDreaming(api: OpenClawPluginApi): void
           event.cleanedBody,
           DREAMING_SYSTEM_EVENT_TEXT,
         );
-        const isManagedHeartbeatTrigger =
-          ctx.trigger === "heartbeat" && hasPendingManagedDreamingCronEvent(ctx.sessionKey);
-        const isManagedCronTrigger = ctx.trigger === "cron";
-        const shouldHandleManagedDreaming =
-          hasManagedDreamingToken && (isManagedHeartbeatTrigger || isManagedCronTrigger);
-        if (!shouldHandleManagedDreaming) {
+        const isManagedTrigger =
+          ctx.trigger === "cron" || hasPendingManagedDreamingCronEvent(ctx.sessionKey, ctx.agentId);
+        if (!hasManagedDreamingToken || !isManagedTrigger) {
           return undefined;
         }
         const config = resolveMemoryDeepDreamingConfig({
           pluginConfig: resolveMemoryDreamingPluginConfig(currentConfig),
           cfg: currentConfig,
         });
-        return await runShortTermDreamingPromotionIfTriggered({
-          cleanedBody: event.cleanedBody,
+        return await runShortTermDreamingPromotion({
           trigger: ctx.trigger,
           agentId: ctx.agentId,
           workspaceDir: ctx.workspaceDir,

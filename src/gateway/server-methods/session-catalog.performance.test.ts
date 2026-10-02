@@ -4,9 +4,11 @@ import { createCatalogIoCounters } from "./session-catalog.performance-counters.
 import type { HeapProfiler, Profiler } from "node:inspector";
 import { Session as InspectorSession } from "node:inspector/promises";
 import { expect, it } from "vitest";
-import type { SessionsCatalogListParams } from "../../../packages/gateway-protocol/src/index.js";
+import type {
+  SessionCatalogHost,
+  SessionsCatalogListParams,
+} from "../../../packages/gateway-protocol/src/index.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { retainSessionListForegroundWork } from "../session-projection-work.js";
 import { createComposedCatalogFixture } from "./session-catalog.performance.test-support.js";
 
 function measureHostCpuReference(): number {
@@ -62,12 +64,13 @@ it("measures 100 composed catalog lists against real session and plugin stores",
     { layout: "state-only", prefix: "composed-catalog-" },
     async (state) => {
       const counters = createCatalogIoCounters();
-      // Match request ownership so optional transcript backfill stays outside the measurement.
-      const releaseForegroundWork = retainSessionListForegroundWork();
       let fixture: Awaited<ReturnType<typeof createComposedCatalogFixture>> | undefined;
       try {
         counters.begin();
         fixture = await createComposedCatalogFixture(state, counters);
+        // The cold request starts hydration and may return pending before persistence finishes.
+        await fixture.requestList();
+        const catalogNamespace = await counters.catalogPersisted;
         const first = await fixture.list();
         expect(first.sessions.length).toBeGreaterThan(0);
         const sourceHomeId = first.sessions[0]?.sourceHomeId;
@@ -85,7 +88,7 @@ it("measures 100 composed catalog lists against real session and plugin stores",
           version: number;
           kind: string;
         }>({
-          namespace: await counters.catalogPersisted,
+          namespace: catalogNamespace,
           maxEntries: 20_001,
           overflowPolicy: "reject-new",
         });
@@ -125,18 +128,24 @@ it("measures 100 composed catalog lists against real session and plugin stores",
             limitPerHost: 32,
           },
         ];
+        const warmResponses: SessionCatalogHost[] = [];
         for (const query of variants) {
           for (let warm = 0; warm < 3; warm++) {
-            await fixture.list(query);
+            const result = await fixture.list(query);
+            if (warm === 2) {
+              warmResponses.push(result);
+            }
           }
         }
         do {
           await fixture.projection.ensureMaterialized();
         } while (fixture.projection.needsMaterialization);
         const cpuReferenceP50Ms = measureHostCpuReference();
+        expect(fixture.setupMaintenance).toEqual({ started: 3, completed: 3 });
         counters.begin();
         const durations: number[] = [];
         const workPerList = [];
+        const measuredResponses: SessionCatalogHost[] = [];
         let previousIo = counters.snapshot();
         let minimumRows = Infinity;
         const cpuStart = process.threadCpuUsage();
@@ -144,11 +153,19 @@ it("measures 100 composed catalog lists against real session and plugin stores",
           const started = performance.now();
           const result = await fixture.list(variants[index % variants.length]);
           durations.push(performance.now() - started);
+          measuredResponses.push(result);
           const currentIo = counters.snapshot();
           workPerList.push({
             sqliteReadCalls: currentIo.sqliteReadCalls - previousIo.sqliteReadCalls,
+            sqliteFreshnessReads: currentIo.sqliteFreshnessReads - previousIo.sqliteFreshnessReads,
             bindingAuthorityReads:
               currentIo.bindingAuthorityReads - previousIo.bindingAuthorityReads,
+            fileReadCalls: currentIo.fileReadCalls - previousIo.fileReadCalls,
+            ownershipFileReadCalls:
+              currentIo.ownershipFileReadCalls - previousIo.ownershipFileReadCalls,
+            fileOpenCalls: currentIo.fileOpenCalls - previousIo.fileOpenCalls,
+            ownershipFileOpenCalls:
+              currentIo.ownershipFileOpenCalls - previousIo.ownershipFileOpenCalls,
             pluginStateWorkerOperations:
               currentIo.pluginStateWorkerOperations - previousIo.pluginStateWorkerOperations,
           });
@@ -157,10 +174,14 @@ it("measures 100 composed catalog lists against real session and plugin stores",
         }
         const cpu = process.threadCpuUsage(cpuStart);
         const io = counters.end();
+        for (const [index, result] of measuredResponses.entries()) {
+          expect(result).toEqual(warmResponses[index % variants.length]);
+        }
         expect(minimumRows).toBeGreaterThan(0);
         durations.sort((a, b) => a - b);
 
         const inspector = new InspectorSession();
+        expect(fixture.setupMaintenance).toEqual({ started: 3, completed: 3 });
         inspector.connect();
         let sampledAllocationBytes: number;
         let cpuSamples: ReturnType<typeof observedCpuSamples>;
@@ -200,28 +221,34 @@ it("measures 100 composed catalog lists against real session and plugin stores",
               "Separate 100-list pass with CPU and heap sampling. Counts are observed self samples; zero samples cannot exclude calls shorter than the sampling interval.",
             setupIo,
             ioTotals: io,
+            workPerList,
             ioPerList: Object.fromEntries(
               Object.entries(io).map(([key, value]) => [key, value / 100]),
             ),
             scope:
-              "Explicit local Codex host through the real Gateway handler, registered provider, session accessor and plugin stores. Main-thread SQL counts include freshness and binding authority reads; worker read operations are reported separately. File counts cover sync, callback and promise fs read/open APIs.",
+              "Explicit local Codex host through Gateway request admission, registered provider, session accessor and plugin stores. Binding authority is acquired through the plugin-state worker; calling-thread SQL and worker operations are counted separately. File counts cover sync, callback and promise fs read/open APIs, including separately attributed live ownership checks. Descriptor classification adds fstat instrumentation cost.",
           }),
         );
         expect(cpuSamples.totalCpuSamples).toBeGreaterThan(0);
         expect(cpuSamples.catalogPreviewSamples).toBe(0);
         expect(cpuSamples.sanitizeTerminalTextSamples).toBe(0);
         expect(io.nativeRpcCalls).toBe(0);
-        expect(io.fileReadCalls).toBe(0);
-        expect(io.fileOpenCalls).toBe(0);
-        expect(io.pluginStateWorkerReadOperations).toBe(0);
+        expect(io.fileReadCalls).toBe(io.ownershipFileReadCalls);
+        expect(io.fileOpenCalls).toBe(io.ownershipFileOpenCalls);
+        expect(io.pluginStateWorkerReadOperations).toBe(100);
         expect(io.sessionEntryReads).toBe(0);
         expect(io.sessionPayloadReads).toBe(0);
-        // Revalidate all three adopted bindings without adding work to the resident list path.
+        // Fresh binding authority belongs to the worker, including its freshness probe.
         for (const work of workPerList) {
           expect(work).toEqual({
-            sqliteReadCalls: 18,
-            bindingAuthorityReads: 3,
-            pluginStateWorkerOperations: 0,
+            sqliteReadCalls: 0,
+            sqliteFreshnessReads: 0,
+            bindingAuthorityReads: 0,
+            fileReadCalls: 1,
+            ownershipFileReadCalls: 1,
+            fileOpenCalls: 1,
+            ownershipFileOpenCalls: 1,
+            pluginStateWorkerOperations: 1,
           });
         }
         // Two-CPU reference 1.568–1.615 ms gives 31.36–32.30 ms: >3x the prior 9.43 ms
@@ -233,7 +260,6 @@ it("measures 100 composed catalog lists against real session and plugin stores",
         try {
           await fixture?.close();
         } finally {
-          releaseForegroundWork();
           counters.close();
         }
       }

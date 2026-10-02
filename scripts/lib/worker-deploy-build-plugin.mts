@@ -29,23 +29,18 @@ const UNDICI_REQUIRE_BOOTSTRAP = [
   'return (undiciModule ??= requireUndici("undici/index.js") as typeof import("undici"));',
 ] as const;
 const WORKER_UNDICI_IMPORT = 'import * as bundledUndici from "undici/index.js";';
+const FACADE_ACTIVATION_LOADER =
+  "function loadFacadeActivationCheckRuntime(): FacadeActivationCheckRuntimeModule {";
 const WS_DIRECT_RUNTIME_FRAGMENTS = [
   'require.resolve("ws/package.json")',
   '"lib/websocket.js"',
   '"lib/websocket-server.js"',
   '"lib/stream.js"',
 ] as const;
-const WS_DYNAMIC_IMPORT =
-  'pathToFileURL(path.join(path.dirname(require.resolve("ws/package.json")), "wrapper.mjs")).href';
 const TREE_SITTER_INIT = "TreeSitter.Parser.init()";
 const TREE_SITTER_BASH_WASM = 'require.resolve("tree-sitter-bash/tree-sitter-bash.wasm")';
 const PHOTON_WASM_INIT = `const path = require('path').join(__dirname, 'photon_rs_bg.wasm');
 const bytes = require('fs').readFileSync(path);`;
-
-function resolveOptionalBuildSource(source: string): string {
-  const resolved = path.resolve(source);
-  return fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
-}
 
 export function resolveWorkerDeployGeneratorInputs(rootDir = process.cwd()) {
   const playwrightRoot = fs.realpathSync(path.resolve(rootDir, "node_modules/playwright-core"));
@@ -83,6 +78,7 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
   const browserRuntimeBridgePath = fs.realpathSync(
     path.resolve("src/worker/worker-deploy-browser-runtime.ts"),
   );
+  const facadeRuntimePath = fs.realpathSync(path.resolve("src/plugin-sdk/facade-runtime.ts"));
   const playwrightRuntimePath = fs.realpathSync(
     path.resolve("extensions/browser/src/browser/playwright-core.runtime.ts"),
   );
@@ -94,12 +90,6 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
   );
   const websocketRuntimePath = fs.realpathSync(
     path.resolve("packages/gateway-client/src/websocket.ts"),
-  );
-  const dynamicWebsocketRuntimePaths = new Set(
-    [
-      "src/node-host/node-stream-transport.ts",
-      "src/realtime-transcription/websocket-session.ts",
-    ].map(resolveOptionalBuildSource),
   );
   const [packageJsonPath, browsersJsonPath, treeSitterWasmPath, bashWasmPath, photonWasmPath] =
     resolveWorkerDeployGeneratorInputs(rootDir);
@@ -145,6 +135,22 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
       if (resolvedId === browserRuntimeBridgePath) {
         return WORKER_BROWSER_RUNTIME_COMPOSITION;
       }
+      if (resolvedId === facadeRuntimePath) {
+        if (code.split(FACADE_ACTIVATION_LOADER).length !== 2) {
+          this.error("facade activation loader changed; update the worker deploy transform");
+        }
+        // Workers ship no activation sidecar. A literal require keeps activation
+        // lazy inside the sealed graph instead of resolving a host module.
+        return code.replace(
+          FACADE_ACTIVATION_LOADER,
+          `${FACADE_ACTIVATION_LOADER}
+  try {
+    return require("./facade-activation-check.runtime.js");
+  } catch (error) {
+    return throwFacadeActivationCheckRuntimeUnavailable(error);
+  }`,
+        );
+      }
       if (resolvedId === playwrightRuntimePath) {
         return WORKER_PLAYWRIGHT_RUNTIME;
       }
@@ -181,12 +187,6 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
         const wsWrapperUrl = resolveWsWrapperUrl();
         return `import * as bundledWebSocket from ${JSON.stringify(wsWrapperUrl)};
 export const { WebSocket, WebSocketServer, createWebSocketStream } = bundledWebSocket;`;
-      }
-      if (dynamicWebsocketRuntimePaths.has(resolvedId)) {
-        if (!code.includes(WS_DYNAMIC_IMPORT)) {
-          this.error("ws dynamic bootstrap changed; update the worker deploy transform");
-        }
-        return code.replace(WS_DYNAMIC_IMPORT, JSON.stringify(resolveWsWrapperUrl()));
       }
       if (resolvedId === undiciDispatcherOptionsPath) {
         if (UNDICI_REQUIRE_BOOTSTRAP.some((fragment) => !code.includes(fragment))) {

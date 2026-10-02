@@ -28,13 +28,13 @@ export function createEmbeddedRunContextRecoveryState() {
         state.lastCompactionTokensAfter = tokens;
         return;
       }
-      // Only a turn the provider actually admitted ends the overflow episode the
-      // budget was spent on. The producer also emits model events for rejected,
-      // aborted and overflow responses; renewing on those would let the very
-      // rejection that should be charged clear the counter instead, so the
-      // three-attempt bound could never be reached.
+      // Model event: split gates. Budget reset uses narrow admission signal;
+      // truncation reset uses broad telemetry signal. Both can fire independently.
       if (event.admitted === true) {
         state.overflowCompactionAttempts = 0;
+      }
+      if (event.successful) {
+        state.toolResultTruncationAttempted = false;
       }
     },
     retainTimeoutRecoveryMarker(marker: EmbeddedRunTimeoutRecoveryMarker) {

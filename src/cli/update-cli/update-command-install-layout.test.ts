@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as nodeRuntime from "../../commands/node-runtime-diagnostics.js";
 import * as container from "../../infra/container-environment.js";
+import * as packageMetadata from "../../infra/update-check-package-target.js";
 import * as updateCheck from "../../infra/update-check.js";
 import { prepareUpdateFailureReport } from "../../infra/update-failure-report-prepare.js";
 import { listUpdateRuns } from "../../infra/update-run-ledger.js";
@@ -11,7 +12,7 @@ import {
   renderUpdateRunReport,
   updateRunReportInputFromResult,
 } from "../../infra/update-run-report.js";
-import { runGatewayUpdate } from "../../infra/update-runner.js";
+import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import * as processRunner from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
 import { isReportableUpdateRun } from "../../shared/update-outcome.js";
@@ -23,6 +24,7 @@ import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.pa
 import * as shared from "./shared.js";
 import { updateStatusCommand } from "./status.js";
 import * as finalization from "./update-command-finalize.js";
+import * as servicePlan from "./update-command-service-plan.js";
 import { updateCommand } from "./update-command.js";
 import { updateRepairCommand } from "./update-repair-command.js";
 
@@ -83,6 +85,23 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+function expectUnclassifiedInstall(reason: string) {
+  expect(output).toHaveLength(1);
+  expect(output[0]).toMatchObject({
+    status: "skipped",
+    reason,
+    before: { version: "2026.9.4" },
+    steps: [
+      expect.objectContaining({
+        exitCode: 0,
+        failureFacts: [expect.objectContaining({ code: "installation-unclassified" })],
+      }),
+    ],
+  });
+  expect(output[0]).not.toHaveProperty("recovery");
+  expect(triage).not.toHaveBeenCalled();
+}
+
 it.each([
   { containerized: true, reason: "container-image-install", action: "Pull or build" },
   { containerized: false, reason: "unmanaged-package-install", action: "Reinstall" },
@@ -94,14 +113,7 @@ it.each([
     await expect(updateCommand({ json: true, yes: true, channel: "stable" })).rejects.toMatchObject(
       { code: 0 },
     );
-    expect(output).toHaveLength(1);
-    expect(output[0]).toMatchObject({
-      status: "skipped",
-      reason,
-      before: { version: "2026.9.4" },
-      steps: [],
-    });
-    expect(output[0]).not.toHaveProperty("recovery");
+    expectUnclassifiedInstall(reason);
     const run = listUpdateRuns({ limit: 1 }, { env: process.env })[0]!;
     expect(run).toMatchObject({
       status: "skipped",
@@ -111,7 +123,6 @@ it.each([
     expect(renderUpdateRunReport(run).markdown).toContain(action);
     expect(isReportableUpdateRun(run)).toBe(false);
     expect(output[0]).toMatchObject({ runId: run.runId, run: { origin: run.origin } });
-    expect(triage).not.toHaveBeenCalled();
     await expect(fs.readFile(path.join(root, "package.json"), "utf8")).resolves.toContain(
       '"2026.9.4"',
     );
@@ -133,26 +144,22 @@ it.each([
   },
 );
 
-it.each([true, false])(
-  "reports an untouched fresh profile (container: %s)",
-  async (containerized) => {
-    vi.spyOn(container, "isContainerEnvironment").mockReturnValue(containerized);
-    await expect(updateCommand({ json: true, yes: true })).rejects.toMatchObject({ code: 0 });
-    expect(output).toHaveLength(1);
-    expect(output[0]).toMatchObject({
-      status: "skipped",
-      reason: containerized ? "container-image-install" : "unmanaged-package-install",
-      before: { version: "2026.9.4" },
-      steps: [],
-    });
-    expect(output[0]).not.toHaveProperty("recovery");
-    expect(output[0]).not.toHaveProperty("runId");
-    expect(triage).not.toHaveBeenCalled();
-    await expect(fs.stat(resolveOpenClawStateSqlitePath(process.env))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-  },
-);
+it("reports an untouched fresh container profile", async () => {
+  vi.spyOn(container, "isContainerEnvironment").mockReturnValue(true);
+  await expect(updateCommand({ json: true, yes: true })).rejects.toMatchObject({ code: 0 });
+  expectUnclassifiedInstall("container-image-install");
+  expect(output[0]).not.toHaveProperty("runId");
+  const result = output[0] as UpdateRunResult;
+  expect(renderUpdateRunReport(updateRunReportInputFromResult(result)).markdown).toContain(
+    "Pull or build",
+  );
+  await expect(
+    prepareUpdateFailureReport({ attemptId: "untouched-install", result }),
+  ).rejects.toThrow("Only a final failed update");
+  await expect(fs.stat(resolveOpenClawStateSqlitePath(process.env))).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+});
 
 it("renders the container non-outcome in terminal output", async () => {
   vi.spyOn(container, "isContainerEnvironment").mockReturnValue(true);
@@ -163,31 +170,74 @@ it("renders the container non-outcome in terminal output", async () => {
   expect(triage).not.toHaveBeenCalled();
 });
 
-it("keeps the Git runner's untouched container result out of failure reports", async () => {
-  vi.spyOn(container, "isContainerEnvironment").mockReturnValue(true);
-  const result = await runGatewayUpdate({
-    cwd: root,
-    argv1: path.join(root, "openclaw.mjs"),
-    runCommand: processRunner.runCommandWithTimeout,
-  });
-  expect(result).toMatchObject({
-    status: "skipped",
-    mode: "unknown",
-    reason: "container-image-install",
-    steps: [],
-  });
-  expect(result.recovery).toBeUndefined();
-  expect(renderUpdateRunReport(updateRunReportInputFromResult(result)).markdown).toContain(
-    "Pull or build",
-  );
-  await expect(
-    prepareUpdateFailureReport({ attemptId: "untouched-container", result }),
-  ).rejects.toThrow("Only a final failed update");
-});
+it.each(["missing", "invalid"])(
+  "explains an unclassified root with a %s manifest before fetching target metadata",
+  async (manifest) => {
+    const manifestPath = path.join(root, "package.json");
+    if (manifest === "missing") {
+      await fs.unlink(manifestPath);
+      await fs.rmdir(path.join(root, "dist"));
+    } else {
+      await fs.writeFile(manifestPath, "{invalid json");
+    }
+    vi.spyOn(container, "isContainerEnvironment").mockReturnValue(false);
+    vi.spyOn(servicePlan, "isGatewayServiceManagementAllowedForUpdate").mockReturnValue(false);
+    const metadata = vi
+      .spyOn(packageMetadata, "fetchNpmPackageTargetStatus")
+      .mockRejectedValue(new Error("Unclassified roots must not query target metadata"));
+    const channel = vi
+      .spyOn(updateCheck, "resolveNpmChannelTag")
+      .mockRejectedValue(new Error("Unclassified roots must not resolve a channel"));
+
+    await expect(updateCommand({ dryRun: true, json: true, yes: true })).rejects.toMatchObject({
+      code: 0,
+    });
+
+    expect(output).toHaveLength(1);
+    expect(output[0]).toMatchObject({
+      status: "skipped",
+      mode: "unknown",
+      reason: "unmanaged-package-install",
+      steps: [
+        expect.objectContaining({
+          exitCode: 0,
+          failureFacts: [
+            expect.objectContaining({
+              check: "installation-inspection",
+              code: "installation-unclassified",
+              message: expect.stringContaining("openclaw gateway status --deep and npm root -g"),
+            }),
+          ],
+        }),
+      ],
+    });
+    const diagnostics = JSON.stringify(output[0]);
+    expect(diagnostics).toContain(`Root: ${root}`);
+    expect(diagnostics).toContain("Git metadata: absent or unreadable");
+    expect(diagnostics).toContain("node_modules layout: outside node_modules");
+    expect(diagnostics).toContain("package.json name: missing or unreadable");
+    expect(diagnostics).toContain(
+      "Service unit target: not inspected (service management unavailable)",
+    );
+    expect(diagnostics).toContain("retry openclaw update from the owning installation");
+    expect(metadata).not.toHaveBeenCalled();
+    expect(channel).not.toHaveBeenCalled();
+    expect(triage).not.toHaveBeenCalled();
+    await expect(fs.stat(resolveOpenClawStateSqlitePath(process.env))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    if (manifest === "missing") {
+      expect(await fs.readdir(root)).toEqual([]);
+    } else {
+      expect(await fs.readFile(manifestPath, "utf8")).toBe("{invalid json");
+    }
+  },
+);
 
 it.skipIf(process.platform === "win32").each([false, true])(
   "reports Homebrew guidance across output and existing history (database: %s)",
   async (existingDatabase) => {
+    vi.spyOn(container, "isContainerEnvironment").mockReturnValue(false);
     if (existingDatabase) {
       openOpenClawStateDatabase();
     }

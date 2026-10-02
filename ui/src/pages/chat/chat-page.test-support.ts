@@ -1,10 +1,17 @@
+import { createRouter } from "@openclaw/uirouter";
 import { onTestFinished, vi } from "vitest";
 import type { GatewayBrowserClient, GatewayHelloOk } from "../../api/gateway.ts";
 import { createChatSubmissions } from "../../app/chat-submissions.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import type { ApplicationGatewaySnapshot } from "../../app/gateway.ts";
-import { createTestSessionCapability } from "../../lib/sessions/session-capability.test-support.ts";
+import {
+  createGatewayHarness,
+  createTestSessionCapability,
+} from "../../lib/sessions/session-capability.test-support.ts";
+import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import type { ChatPage } from "./chat-page.ts";
+import type { ChatSplitLayout } from "./split-layout-types.ts";
+import { insertPane } from "./split-layout.ts";
 
 export function createChatPageSessions(
   gateway: Parameters<typeof createTestSessionCapability>[0] = {
@@ -19,6 +26,8 @@ export function createChatPageSessions(
 }
 
 export function createChatPageNavigationContext() {
+  const router = createRouter({ routes: [] });
+  onTestFinished(() => router.stop());
   const navigate = vi.fn();
   const replace = vi.fn();
   const patch = vi.fn(async () => null);
@@ -34,8 +43,10 @@ export function createChatPageNavigationContext() {
   };
   const context = {
     basePath: "",
+    router,
     sessions: { ...createChatPageSessions(), patch },
     chatSubmissions: createChatSubmissions(),
+    placementStartup: { get: vi.fn(() => null), subscribe: () => () => undefined },
     agents: { state: { agentsList: { defaultId: "main", mainKey: "main" } } },
     gateway: {
       snapshot: { hello: null },
@@ -84,6 +95,7 @@ export function setViewerPresenceContext(page: ChatPage) {
     connectionRevision: 0,
     eventLog: [],
     eventLogRevision: 0,
+    loadSelfProfile: async () => null,
     connect: vi.fn(),
     setSessionKey: vi.fn(),
     start: vi.fn(),
@@ -124,4 +136,56 @@ export function createSessionTitleSource() {
       }
     },
   };
+}
+
+export function createSplitLayout(sessionKey: string): ChatSplitLayout {
+  const singlePane: ChatSplitLayout = {
+    columns: [{ id: "c1", panes: [{ id: "p1", sessionKey }], paneWeights: [1] }],
+    columnWeights: [1],
+    activePaneId: "p1",
+  };
+  return insertPane(singlePane, "p1", sessionKey, "right");
+}
+
+export function setLayout(page: ChatPage, layout: ChatSplitLayout | undefined) {
+  (page as unknown as { layout: ChatSplitLayout | undefined }).layout = layout;
+}
+
+export function stubMatchMedia(matches: boolean) {
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn((query: string) => ({
+      matches,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  );
+}
+
+export function createChatPageStateContext() {
+  const { gateway, publish } = createGatewayHarness(createTestGatewayClient(vi.fn()));
+  publish(false, null);
+  return {
+    agents: {
+      state: { agentsList: null },
+      ensureList: vi.fn(async () => null),
+    },
+    agentSelection: { state: { selectedId: "main" } },
+    basePath: "",
+    config: {
+      current: {
+        allowExternalEmbedUrls: false,
+        assistantIdentity: { name: "Assistant" },
+        embedSandboxMode: "scripts",
+      },
+    },
+    gateway,
+    chatSubmissions: createChatSubmissions(),
+    sessions: {},
+  } as unknown as ApplicationContext;
 }
