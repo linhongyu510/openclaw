@@ -851,7 +851,12 @@ describe("recoverEmbeddedRunOverflow", () => {
 
     // Real progress, not a refund, is what returns the budget: the provider
     // admitted the retried prompt and produced a usable turn.
-    state.observeContextAccounting({ kind: "model", contextTokens: 20_000, admitted: true });
+    state.observeContextAccounting({
+      kind: "model",
+      contextTokens: 20_000,
+      successful: true,
+      admitted: true,
+    });
     expect(state.overflowCompactionAttempts).toBe(0);
   });
 
@@ -896,9 +901,9 @@ describe("recoverEmbeddedRunOverflow", () => {
     // renew the budget - otherwise the overflow that should be charged would
     // clear its own cost and the three-attempt bound could never be reached.
     for (const rejected of [
-      { kind: "model", contextTokens: undefined, admitted: false },
-      { kind: "model", contextTokens: 45_211, admitted: false },
-      { kind: "model", contextTokens: undefined },
+      { kind: "model", contextTokens: undefined, successful: false, admitted: false },
+      { kind: "model", contextTokens: 45_211, successful: false, admitted: false },
+      { kind: "model", contextTokens: undefined, successful: false },
     ] as const) {
       state.observeContextAccounting(rejected);
       expect(state.overflowCompactionAttempts).toBe(1);
@@ -930,7 +935,12 @@ describe("recoverEmbeddedRunOverflow", () => {
 
     // The retried prompt was admitted by the provider: that overflow episode is
     // over, so a later unrelated overflow must start from a full budget.
-    state.observeContextAccounting({ kind: "model", contextTokens: 45_211, admitted: true });
+    state.observeContextAccounting({
+      kind: "model",
+      contextTokens: 45_211,
+      successful: true,
+      admitted: true,
+    });
 
     expect(state.overflowCompactionAttempts).toBe(0);
   });
