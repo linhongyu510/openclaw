@@ -144,36 +144,33 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
   const resolved = resolveSqliteTranscriptScope(params);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
   const db = database.db;
-  // Fail-closed: reconcile probe, active-anchor join, and identity revalidation all run in one
-  // read transaction so they observe a consistent snapshot, not three autocommits racing a writer.
-  db.exec("BEGIN");
-  try {
-    const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
-    if (!indexDirty) {
-      return {
-        anchor: readActiveTranscriptEntryAnchorInTransaction({
-          database,
-          resolved,
-          entryId: params.entryId,
-        }),
-        indexDirty: false,
-        cachedIdentityExists: true,
-      };
-    }
-    // Dirty projection: the active join cannot certify anything. Revalidate against the
-    // authoritative identity log. Suffix removal physically deletes those rows, so a missing
-    // identity row means the cached turn is gone -> the caller must reject, not degrade.
-    const identity = executeSqliteQueryTakeFirstSync(
-      db,
-      getSessionKysely(db)
-        .selectFrom("transcript_event_identities")
-        .select("event_id")
-        .where("session_id", "=", resolved.sessionId)
-        .where("event_id", "=", params.entryId)
-        .limit(1),
-    );
-    return { anchor: undefined, indexDirty: true, cachedIdentityExists: Boolean(identity) };
-  } finally {
-    db.exec("COMMIT");
+  // The handle may already be inside a caller write transaction (dedup can run re-entrantly
+  // during an append). Do NOT open an unconditional BEGIN: it cannot join that transaction and
+  // would throw "cannot start a transaction within a transaction". Reads run on whatever
+  // snapshot the cached handle already holds (an existing tx) or as sequential statements.
+  const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
+  if (!indexDirty) {
+    return {
+      anchor: readActiveTranscriptEntryAnchorInTransaction({
+        database,
+        resolved,
+        entryId: params.entryId,
+      }),
+      indexDirty: false,
+      cachedIdentityExists: true,
+    };
   }
+  // Dirty projection: the active join cannot certify anything. Revalidate against the
+  // authoritative identity log. Suffix removal physically deletes those rows, so a missing
+  // identity row means the cached turn is gone -> the caller must reject, not degrade.
+  const identity = executeSqliteQueryTakeFirstSync(
+    db,
+    getSessionKysely(db)
+      .selectFrom("transcript_event_identities")
+      .select("event_id")
+      .where("session_id", "=", resolved.sessionId)
+      .where("event_id", "=", params.entryId)
+      .limit(1),
+  );
+  return { anchor: undefined, indexDirty: true, cachedIdentityExists: Boolean(identity) };
 }
