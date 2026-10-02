@@ -246,18 +246,19 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     const m1 = SessionManager.open(scope, dir);
     const appendedId = m1.appendMessage(user);
 
-    // Production stale-row mechanism: a leaf control / alternative-parent append marks the
-    // index dirty WITHOUT removing the cached user's old active-event rows (reconciliation
-    // rebuilds later). Only the canonical leaf moves elsewhere. Degrading on active-row
-    // membership would false-ack; the leaf must not equal the cached turn -> reject.
+    // Production stale-row mechanism: a branch switch / alternative-parent append moves the
+    // durable tail off the cached user's parent chain (and marks the index dirty). The cached
+    // identity row may still exist, but a recursive walk from the current tail no longer reaches
+    // it. Degrading would false-ack a displaced user; the durable chain walk must reject.
     const database = openOpenClawAgentDatabase({
       agentId: scope.agentId,
       path: resolveSessionTranscriptDatabasePath({ ...scope, storePath: scope.storePath }),
     });
     database.db
-      .prepare(
-        "UPDATE session_transcript_index_state SET needs_rebuild = 1, leaf_event_id = 'some-other-turn' WHERE session_id = ?",
-      )
+      .prepare("DELETE FROM transcript_event_identities WHERE session_id = ? AND event_id = ?")
+      .run(scope.sessionId, appendedId);
+    database.db
+      .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
       .run(scope.sessionId);
 
     expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
@@ -280,15 +281,20 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     const m1 = SessionManager.open(scope, dir);
     m1.appendMessage(user);
 
-    // Pass the fixture's agent + store path (database options) so the callback actually opens
-    // the agent db and reaches the replay (without options it threw TypeError before replay).
-    // Reject ANY thrown error, and assert the dedup actually replayed.
+    // Pass the fixture's agent + store path so the OUTER transaction opens the SAME database file
+    // m1 reads (without it, runOpenClawAgentWriteTransaction opens the default agent db and the
+    // replay never hits a nested transaction on the fixture handle). Assert the dedup actually
+    // replayed; reject any thrown error.
+    const fixtureDbOptions = {
+      agentId: scope.agentId,
+      path: resolveSessionTranscriptDatabasePath(scope),
+    };
     let replay: ReturnType<SessionManager["appendMessageWithTranscriptAnchor"]> | undefined;
     expect(() =>
       runOpenClawAgentWriteTransaction((database) => {
-        expect(database).toBeDefined();
+        expect(database.path).toBe(fixtureDbOptions.path);
         replay = m1.appendMessageWithTranscriptAnchor(user);
-      }, scope),
+      }, fixtureDbOptions),
     ).not.toThrow();
     expect(replay?.appended).toBe(false);
   });

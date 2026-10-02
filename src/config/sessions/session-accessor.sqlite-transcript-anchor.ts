@@ -151,19 +151,26 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
   // join, so a between-read writer cannot change the verdict.
   return runSqliteDeferredTransactionSync(db, () => {
     const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
-    // Authoritative canonical leaf: the projection state's leaf_event_id, NOT dirty active-row
-    // membership. Leaf controls / alternative-parent appends mark the index dirty while leaving
-    // the old active-event rows in place until reconciliation; active-row presence therefore
-    // cannot prove the cached turn is still the canonical current turn.
-    const leafRow = executeSqliteQueryTakeFirstSync(
-      db,
-      getSessionKysely(db)
-        .selectFrom("session_transcript_index_state as state")
-        .select("state.leaf_event_id as leafEventId")
-        .where("state.session_id", "=", resolved.sessionId)
-        .limit(1),
-    );
-    const canonicalLeafEventId = (leafRow?.leafEventId as string | null | undefined) ?? null;
+    // Authoritative canonical-turn check, independent of the dirty projection. The index
+    // watermark's leaf_event_id is NOT trustworthy while dirty: markSessionTranscriptIndexDirty
+    // preserves the previous leaf, and branch switches / alternative-parent appends move the real
+    // tail in the durable event log without advancing it. Walk the durable
+    // transcript_event_identities parent chain from the current tail (max seq) up to the root; the
+    // cached entry is still the canonical current turn iff it is an ancestor-or-self of that tail.
+    const chainRow = db
+      .prepare(
+        `WITH RECURSIVE chain AS (
+           SELECT event_id, parent_id FROM (
+             SELECT event_id, parent_id, seq FROM transcript_event_identities
+               WHERE session_id = ? ORDER BY seq DESC LIMIT 1
+           )
+           UNION ALL
+           SELECT i.event_id, i.parent_id FROM transcript_event_identities i
+             JOIN chain c ON i.event_id = c.parent_id WHERE i.session_id = ?
+         )
+         SELECT COUNT(*) AS hit FROM chain WHERE event_id = ?`,
+      )
+      .get(resolved.sessionId, resolved.sessionId, params.entryId) as { hit: number };
     // Canonical active-path join (identities ⨝ active ⨝ rewrite). This is the authoritative
     // "is the cached entry still the current active turn" check -- NOT the raw identity log,
     // which only proves the event historically existed.
@@ -205,16 +212,15 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
         cachedIdentityExists: Boolean(activeAnchor),
       };
     }
-    // Dirty index: degrade ONLY when this cached entry is the canonical current leaf turn in
-    // this snapshot. A branched-away / alternative-parent rewritten / completed-ancestor turn
-    // keeps old active rows while the leaf moves elsewhere, so active-row membership is not
-    // enough. If the cached entry is not the leaf -> reject (fail-closed), never false-ack.
-    const isCanonicalLeaf =
-      canonicalLeafEventId !== null && canonicalLeafEventId === params.entryId;
+    // Dirty index: degrade ONLY when this cached entry is still on the durable canonical
+    // parent chain (ancestor-or-self of the current tail) in this snapshot. A branched-away /
+    // alternative-parent rewritten / deleted turn is off that chain -> reject (fail-closed), never
+    // false-ack.
+    const isCanonicalOnChain = (chainRow?.hit ?? 0) > 0;
     return {
       anchor: undefined,
       indexDirty: true,
-      cachedIdentityExists: isCanonicalLeaf,
+      cachedIdentityExists: isCanonicalOnChain,
     };
   });
 }
