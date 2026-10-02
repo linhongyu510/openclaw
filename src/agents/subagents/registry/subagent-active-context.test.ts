@@ -392,9 +392,9 @@ describe("buildActiveSubagentRuntimeContext", () => {
   // completeCleanupBookkeeping). resumeSubagentRun hard-stops that row, so it is
   // never delivered again, yet it used to re-render into "## Child results
   // awaiting delivery" on every later requester turn and survive restarts.
-  it("drops a give-up terminal failed delivery from awaiting-delivery context", () => {
+  it("drops a give-up terminal failed delivery from awaiting-delivery context", async () => {
     const endedAt = Date.now() - 20_000;
-    addSubagentRunForTests({
+    seedSubagentRunForReadTest({
       runId: "run-giveup-failed",
       childSessionKey: "agent:main:subagent:giveup-failed",
       controllerSessionKey: "agent:main:main",
@@ -410,7 +410,7 @@ describe("buildActiveSubagentRuntimeContext", () => {
       delivery: { status: "failed", lastError: "delivery retries exhausted" },
     } satisfies SubagentRunRecordOverrides);
 
-    const prompt = buildActiveSubagentRuntimeContext({
+    const prompt = await buildActiveSubagentRuntimeContext({
       cfg: {} as OpenClawConfig,
       controllerSessionKey: "agent:main:main",
     });
@@ -423,9 +423,9 @@ describe("buildActiveSubagentRuntimeContext", () => {
     expect(prompt).not.toContain("dead give-up result");
   });
 
-  it("keeps a still-retrying failed delivery (no cleanupCompletedAt) awaiting delivery", () => {
+  it("keeps a still-retrying failed delivery (no cleanupCompletedAt) awaiting delivery", async () => {
     const endedAt = Date.now() - 20_000;
-    addSubagentRunForTests({
+    seedSubagentRunForReadTest({
       runId: "run-retrying-failed",
       childSessionKey: "agent:main:subagent:retrying-failed",
       controllerSessionKey: "agent:main:main",
@@ -440,7 +440,7 @@ describe("buildActiveSubagentRuntimeContext", () => {
       delivery: { status: "failed", lastError: "transient send error" },
     } satisfies SubagentRunRecordOverrides);
 
-    const prompt = buildActiveSubagentRuntimeContext({
+    const prompt = await buildActiveSubagentRuntimeContext({
       cfg: {} as OpenClawConfig,
       controllerSessionKey: "agent:main:main",
     });
@@ -464,9 +464,9 @@ describe("buildActiveSubagentRuntimeContext", () => {
     },
   ])(
     "keeps a genuinely undelivered $label child awaiting delivery even after cleanup",
-    ({ delivery, result }) => {
+    async ({ delivery, result }) => {
       const endedAt = Date.now() - 20_000;
-      addSubagentRunForTests({
+      seedSubagentRunForReadTest({
         runId: `run-undelivered-${delivery.status}`,
         childSessionKey: `agent:main:subagent:undelivered-${delivery.status}`,
         controllerSessionKey: "agent:main:main",
@@ -482,7 +482,7 @@ describe("buildActiveSubagentRuntimeContext", () => {
         delivery,
       } satisfies SubagentRunRecordOverrides);
 
-      const prompt = buildActiveSubagentRuntimeContext({
+      const prompt = await buildActiveSubagentRuntimeContext({
         cfg: {} as OpenClawConfig,
         controllerSessionKey: "agent:main:main",
       });
@@ -492,9 +492,9 @@ describe("buildActiveSubagentRuntimeContext", () => {
     },
   );
 
-  it("keeps a settle-wake-owned failed delivery awaiting delivery despite cleanup", () => {
+  it("keeps a settle-wake-owned failed delivery awaiting delivery despite cleanup", async () => {
     const endedAt = Date.now() - 20_000;
-    addSubagentRunForTests({
+    seedSubagentRunForReadTest({
       runId: "run-settlewake-failed",
       childSessionKey: "agent:main:subagent:settlewake-failed",
       controllerSessionKey: "agent:main:main",
@@ -511,7 +511,7 @@ describe("buildActiveSubagentRuntimeContext", () => {
       delivery: { status: "failed", lastError: "awaiting requester turn" },
     } satisfies SubagentRunRecordOverrides);
 
-    const prompt = buildActiveSubagentRuntimeContext({
+    const prompt = await buildActiveSubagentRuntimeContext({
       cfg: {} as OpenClawConfig,
       controllerSessionKey: "agent:main:main",
     });
