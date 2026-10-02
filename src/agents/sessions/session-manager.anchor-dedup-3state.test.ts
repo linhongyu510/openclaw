@@ -290,6 +290,40 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     );
   });
 
+  it("G2: dirty index but cached user turn completed by a same-branch assistant answer still rejects", async () => {
+    const dir = tempDirs.make("openclaw-anchor-3state-g2-");
+    const scope = {
+      agentId: "main",
+      sessionId: "anchor-3state-g2",
+      sessionKey: "agent:main:dashboard:anchor-3state-g2",
+      storePath: path.join(dir, "sessions.json"),
+    };
+    const user = userMessage("anchor-3state-g2:user");
+    await seedSession(scope);
+
+    const m1 = SessionManager.open(scope, dir);
+    const appendedId = m1.appendMessage(user);
+
+    // A second manager on the SAME branch completes K's turn with an assistant answer. K's
+    // identity history is retained and K remains an ancestor on the visible path -- but K is no
+    // longer the canonical current turn (the current-turn walk stops at the assistant answer).
+    // Then dirty the projection the way a concurrent side-append does.
+    const m2 = SessionManager.open(scope, dir);
+    m2.appendMessage(assistantMessage("completed answer"));
+    markIndexDirty(scope, dir);
+
+    // Non-vacuity: K is still on the visible path (it is an ancestor of the assistant answer),
+    // so a visible-path-membership check would have wrongly degraded (false-acked). The canonical
+    // current-turn walk resolves to the assistant answer, not K.
+    expect(appendedId).toBeTruthy();
+
+    // m1 never reloaded; its cache still names K as the current turn. K's turn has completed,
+    // so replaying the duplicate must reject, not degrade.
+    expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
+      /Session transcript anchor was not returned/,
+    );
+  });
+
   it("H: duplicate delivery inside an enclosing write transaction reaches the replay", async () => {
     const dir = tempDirs.make("openclaw-anchor-3state-h-");
     const scope = {

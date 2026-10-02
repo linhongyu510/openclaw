@@ -10,7 +10,7 @@ import {
   toDatabaseOptions,
   type ResolvedTranscriptScope,
 } from "./session-accessor.sqlite-scope.js";
-import { isTranscriptEntryOnActivePathInTransaction } from "./session-accessor.sqlite-transcript-parent.js";
+import { resolveTranscriptCanonicalCurrentTurnEntryIdInTransaction } from "./session-accessor.sqlite-transcript-parent.js";
 import { sessionTranscriptIndexNeedsReconcile } from "./session-transcript-index.js";
 import type { TranscriptEntryAnchor } from "./transcript-entry-anchor.js";
 import { readMessageIdempotencyKey } from "./transcript-message-identity.js";
@@ -121,12 +121,12 @@ export interface ActiveTranscriptAnchorRead {
    */
   indexDirty: boolean;
   /**
-   * True only when indexDirty is set AND the cached entry is still on the canonical visible
-   * active branch resolved from the durable event tree (the same owner the projection rebuild
-   * uses). A branch switch, alternative-parent rewrite, or suffix remove moves/deletes the turn
-   * off that path, so during a dirty projection we revalidate against the durable tree instead
-   * of walking the raw parent chain or trusting the stale watermark -- a displaced turn must not
-   * be false-acked.
+   * True only when indexDirty is set AND the cached entry IS the canonical current turn
+   * resolved from the durable event tree (the manager's current-turn walk, not merely
+   * visible-path membership). A branch switch, alternative-parent rewrite, completed turn, or
+   * suffix remove makes the current turn a different id, so during a dirty projection we
+   * revalidate against the durable current-turn walk instead of trusting the stale watermark
+   * -- a displaced/completed/deleted turn must not be false-acked.
    */
   cachedIdentityExists: boolean;
 }
@@ -168,21 +168,20 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
     }
     // Dirty index: the materialized active projection may be stale (a leaf-control /
     // branch-switch / alternative-parent write preserves the old watermark and skips forward
-    // indexing). Do NOT trust the dirty projection and do NOT walk the raw parent chain from
-    // the tail -- that chain can keep reaching a displaced turn after a branch switch.
-    // Revalidate the cached turn through the SAME canonical visible-path owner the projection
-    // rebuild and parent-fork resolver use (scan the durable event tree and select the leaf's
-    // visible branch), inside this snapshot. Degrade only when the cached entry is still on
-    // that canonical active path; a branched-away / rewritten / deleted turn is off it -> reject
-    // (fail-closed), never false-ack.
+    // indexing). Do NOT trust the dirty projection, do NOT accept visible-path membership, and
+    // do NOT walk the raw parent chain from the tail. Resolve the canonical current turn from the
+    // durable tree with the SAME walk the manager uses (walk up from the append cursor, skipping
+    // traversable metadata; the first non-traversable row is the current turn). Degrade only
+    // when the cached entry IS that current turn. A completed / branched-away / rewritten /
+    // deleted turn is a different id -> reject (fail-closed), never false-ack.
+    const canonicalCurrentTurnId = resolveTranscriptCanonicalCurrentTurnEntryIdInTransaction(
+      database,
+      resolved.sessionId,
+    );
     return {
       anchor: undefined,
       indexDirty: true,
-      cachedIdentityExists: isTranscriptEntryOnActivePathInTransaction(
-        database,
-        resolved.sessionId,
-        params.entryId,
-      ),
+      cachedIdentityExists: canonicalCurrentTurnId === params.entryId,
     };
   });
 }
