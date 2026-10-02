@@ -28,6 +28,7 @@ import {
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE } from "../internal-runtime-context.js";
+import { createZeroUsageFixture } from "../test-helpers/usage-fixtures.js";
 import { SessionManager } from "./session-manager.js";
 
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
@@ -41,6 +42,19 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
 
 function assistantMessage(text: string) {
   return { role: "assistant" as const, content: text, timestamp: 1 };
+}
+
+function buildAssistantMessage(text: string) {
+  return {
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text }],
+    api: "messages" as const,
+    provider: "anthropic" as const,
+    model: "sonnet-4.6" as const,
+    usage: createZeroUsageFixture(),
+    stopReason: "stop" as const,
+    timestamp: 1,
+  };
 }
 
 function userMessage(key: string, content = "hi") {
@@ -257,7 +271,7 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     // selects. The leaf-control write marks the projection dirty (it never forward-indexes
     // through a branch change).
     const m2 = SessionManager.open(scope, dir);
-    m2.appendMessage(assistantMessage("late"));
+    m2.appendMessage(buildAssistantMessage("late"));
     m2.appendLeafControl({ targetId: "existing-assistant", appendParentId: "existing-assistant" });
 
     const database = openOpenClawAgentDatabase({
@@ -310,7 +324,7 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     // longer the canonical current turn (the current-turn walk stops at the assistant answer).
     // Then dirty the projection the way a concurrent side-append does.
     const m2 = SessionManager.open(scope, dir);
-    m2.appendMessage(assistantMessage("completed answer"));
+    m2.appendMessage(buildAssistantMessage("completed answer"));
     markIndexDirty(scope, dir);
 
     // Non-vacuity: K is still on the visible path (it is an ancestor of the assistant answer),
