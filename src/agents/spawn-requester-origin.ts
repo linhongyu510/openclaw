@@ -225,7 +225,15 @@ export function resolveSpawnRequesterConversationTarget(source: SpawnRequesterCo
     ? normalizeNonEmptySpawnThreadValue(source.currentThreadTs)
     : undefined;
   const to = explicitTo ?? currentTo;
-  const threadId = explicitThreadId ?? currentThreadId;
+  // Destination and thread must come from the *same* conversation. When an
+  // explicit recipient (`agentTo`) is selected, the thread must also be the
+  // explicit one (`agentThreadId`); falling back to the ambient `currentThreadTs`
+  // would pair the explicit destination with a thread from a different ambient
+  // conversation, and the channel resolver treats that thread id as the child's
+  // conversation id. Only when the destination itself is the ambient current
+  // conversation (CLI run-bound / session-attach case) may the ambient thread
+  // id follow.
+  const threadId = explicitTo !== undefined ? explicitThreadId : currentThreadId;
   return {
     ...(to ? { to } : {}),
     ...(threadId !== undefined ? { threadId } : {}),

@@ -58,16 +58,21 @@ describe("resolveSpawnRequesterConversationTarget", () => {
     ).toEqual({ to: "channel:123", threadId: "456" });
   });
 
-  it("falls back to currentThreadTs only when agentThreadId is absent", () => {
+  it("pairs explicit agentTo with agentThreadId only — ambient currentThreadTs does not follow", () => {
+    // Regression for ClawSweeper Rev 7 P1: an explicit recipient paired with a
+    // missing explicit thread must NOT fall back to the ambient currentThreadTs.
+    // Otherwise the channel resolver treats that ambient thread id as the child's
+    // conversation id and binds the explicit destination to a thread that belongs
+    // to a different ambient conversation (mixed conversation identity).
     expect(
       resolveSpawnRequesterConversationTarget({
-        currentMessagingTarget: "channel:resolved",
-        currentChannelId: "guild:fallback",
+        currentMessagingTarget: "channel:source",
+        currentChannelId: "source-native",
         currentThreadTs: "999",
         agentTo: "channel:123",
         agentThreadId: undefined,
       }),
-    ).toEqual({ to: "channel:123", threadId: "999" });
+    ).toEqual({ to: "channel:123" });
   });
 
   it("keeps regular channel turns on the explicit agentTo/agentThreadId path", () => {
