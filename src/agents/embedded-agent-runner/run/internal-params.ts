@@ -24,9 +24,11 @@ export type EmbeddedContextAccountingEvent = Readonly<
    * stop/toolUse response without a refusal. It does NOT exclude silent
    * overflow responses.
    *
-   * `admitted` is the narrow admission signal: the provider actually accepted
-   * the prompt and produced a usable turn, excluding rejected, aborted,
-   * zero-usage, and context-overflow responses. Consumers renewing a per-episode
+   * `admitted` is the narrow admission signal: the provider completed a
+   * non-refusal stop/toolUse turn, excluding aborted/rejected responses and
+   * silent context-overflow responses. It deliberately does NOT require nonzero
+   * usage--a provider/proxy can finish a turn without reporting counters, and
+   * that still counts as accepted progress. Consumers renewing a per-episode
    * recovery budget must key off `admitted`, not `successful`.
    */
   | {
