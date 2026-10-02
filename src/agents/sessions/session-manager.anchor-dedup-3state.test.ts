@@ -25,6 +25,7 @@ import { resolveSessionTranscriptDatabasePath } from "../../config/sessions/sess
 import {
   closeOpenClawAgentDatabasesAsync,
   openOpenClawAgentDatabase,
+  runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { SessionManager } from "./session-manager.js";
 
@@ -227,5 +228,63 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
       /Session transcript anchor was not returned/,
     );
+  });
+
+  it("G: dirty index but cached turn displaced off the canonical active path still rejects", async () => {
+    const dir = tempDirs.make("openclaw-anchor-3state-g-");
+    const scope = {
+      agentId: "main",
+      sessionId: "anchor-3state-g",
+      sessionKey: "agent:main:dashboard:anchor-3state-g",
+      storePath: path.join(dir, "sessions.json"),
+    };
+    const user = userMessage("anchor-3state-g:user");
+    await seedSession(scope);
+
+    const m1 = SessionManager.open(scope, dir);
+    const appendedId = m1.appendMessage(user);
+
+    // Simulate a competing branch / alternative-parent rewrite: the cached user's identity row
+    // remains in the historical log, but it is no longer on the canonical active path (its
+    // active-projection row is gone) AND the index is dirty. Degrading here would false-ack an
+    // inactive turn; the active-path join must yield no row -> reject.
+    const database = openOpenClawAgentDatabase({
+      agentId: scope.agentId,
+      path: resolveSessionTranscriptDatabasePath({ ...scope, storePath: scope.storePath }),
+    });
+    database.db
+      .prepare("DELETE FROM session_transcript_active_events WHERE session_id = ?")
+      .run(scope.sessionId);
+    database.db
+      .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
+      .run(scope.sessionId);
+
+    expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
+      /Session transcript anchor was not returned/,
+    );
+    void appendedId;
+  });
+
+  it("H: duplicate delivery inside an enclosing write transaction does not throw nested-tx error", async () => {
+    const dir = tempDirs.make("openclaw-anchor-3state-h-");
+    const scope = {
+      agentId: "main",
+      sessionId: "anchor-3state-h",
+      sessionKey: "agent:main:dashboard:anchor-3state-h",
+      storePath: path.join(dir, "sessions.json"),
+    };
+    const user = userMessage("anchor-3state-h:user");
+    await seedSession(scope);
+
+    const m1 = SessionManager.open(scope, dir);
+    m1.appendMessage(user);
+
+    // The Rev6 regression: replaying a cached duplicate inside an enclosing write transaction
+    // must join via a savepoint, not throw "cannot start a transaction within a transaction".
+    expect(() =>
+      runOpenClawAgentWriteTransaction(() => {
+        m1.appendMessageWithTranscriptAnchor(user);
+      }),
+    ).not.toThrow(/cannot start a transaction within a transaction/);
   });
 });

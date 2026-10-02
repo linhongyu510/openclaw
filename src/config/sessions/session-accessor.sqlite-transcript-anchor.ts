@@ -1,4 +1,5 @@
 import { executeSqliteQueryTakeFirstSync } from "../../infra/kysely-sync.js";
+import { runSqliteDeferredTransactionSync } from "../../infra/sqlite-transaction.js";
 import {
   openOpenClawAgentDatabase,
   type OpenClawAgentDatabase,
@@ -144,33 +145,60 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
   const resolved = resolveSqliteTranscriptScope(params);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
   const db = database.db;
-  // The handle may already be inside a caller write transaction (dedup can run re-entrantly
-  // during an append). Do NOT open an unconditional BEGIN: it cannot join that transaction and
-  // would throw "cannot start a transaction within a transaction". Reads run on whatever
-  // snapshot the cached handle already holds (an existing tx) or as sequential statements.
-  const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
-  if (!indexDirty) {
+  // One nested-safe deferred snapshot (savepoint-aware: it joins an enclosing write
+  // transaction via a savepoint instead of throwing "cannot start a transaction within a
+  // transaction"). Within it we read reconcile state AND the canonical active-path join, so a
+  // between-read writer cannot change the verdict.
+  return runSqliteDeferredTransactionSync(db, () => {
+    const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
+    // Canonical active-path join (identities ⨝ active ⨝ rewrite). This is the authoritative
+    // "is the cached entry still the current active turn" check -- NOT the raw identity log,
+    // which only proves the event historically existed.
+    const row = executeSqliteQueryTakeFirstSync(
+      db,
+      getSessionKysely(db)
+        .selectFrom("transcript_event_identities as identity")
+        .innerJoin("session_transcript_active_events as active", (join) =>
+          join
+            .onRef("active.session_id", "=", "identity.session_id")
+            .onRef("active.event_seq", "=", "identity.seq"),
+        )
+        .innerJoin("transcript_rewrite_watermarks as rewrite", (join) =>
+          join.onRef("rewrite.session_id", "=", "identity.session_id"),
+        )
+        .select([
+          "identity.seq",
+          "identity.parent_id",
+          "identity.message_idempotency_key",
+          "active.message_position",
+          "rewrite.generation",
+        ])
+        .where("identity.session_id", "=", resolved.sessionId)
+        .where("identity.event_id", "=", params.entryId)
+        .limit(1),
+    );
+    const activeAnchor = createTranscriptEntryAnchor({
+      database,
+      resolved,
+      entryId: params.entryId,
+      row,
+    });
+    if (!indexDirty) {
+      // Clean index: return the anchor when the cached turn is active; otherwise it is a
+      // clean-missing/stale turn -> reject.
+      return {
+        anchor: activeAnchor,
+        indexDirty: false,
+        cachedIdentityExists: Boolean(activeAnchor),
+      };
+    }
+    // Dirty index: degrade ONLY if the cached entry is still on the canonical active path in
+    // this snapshot. If it was branched away, alternative-parent rewritten, or suffix-removed,
+    // the active join yields no valid row -> reject (fail-closed), never false-ack.
     return {
-      anchor: readActiveTranscriptEntryAnchorInTransaction({
-        database,
-        resolved,
-        entryId: params.entryId,
-      }),
-      indexDirty: false,
-      cachedIdentityExists: true,
+      anchor: undefined,
+      indexDirty: true,
+      cachedIdentityExists: Boolean(activeAnchor),
     };
-  }
-  // Dirty projection: the active join cannot certify anything. Revalidate against the
-  // authoritative identity log. Suffix removal physically deletes those rows, so a missing
-  // identity row means the cached turn is gone -> the caller must reject, not degrade.
-  const identity = executeSqliteQueryTakeFirstSync(
-    db,
-    getSessionKysely(db)
-      .selectFrom("transcript_event_identities")
-      .select("event_id")
-      .where("session_id", "=", resolved.sessionId)
-      .where("event_id", "=", params.entryId)
-      .limit(1),
-  );
-  return { anchor: undefined, indexDirty: true, cachedIdentityExists: Boolean(identity) };
+  });
 }
