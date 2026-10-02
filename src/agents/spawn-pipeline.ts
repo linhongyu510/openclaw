@@ -72,20 +72,16 @@ export async function runSpawnPipeline<TState>(
       ({ runId } = await params.adapter.dispatchTurn(state));
       phase = "register";
       params.assertActive?.();
-      // Running and optional registration keep their synchronous handoff.
       registration = params.buildRegistration(state, runId);
-      const completion = registration.queued
-        ? registerSubagentRun(registration, {
-            assertCurrent: params.assertActive,
-            retainOwnership: (scope) => {
+      await registerSubagentRun(registration, {
+        assertCurrent: params.assertActive,
+        retainOwnership: registration.queued
+          ? (scope) => {
               registrationScope = scope;
-            },
-          })
-        : registerSubagentRun(registration);
-      if (completion) {
-        await completion;
-      }
-      // Required queued registrations await here; ordinary child admission stays synchronous.
+            }
+          : undefined,
+      });
+      // Release launch admission only after any authority preparation and registry acknowledgement.
       params.admissionReservation?.release();
     } catch (error) {
       await params.adapter.cleanupOnFailure({

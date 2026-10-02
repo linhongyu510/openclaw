@@ -1,9 +1,12 @@
 import { parentPort, type MessagePort, type Transferable } from "node:worker_threads";
+import { loggingState } from "../logging/state.js";
 import { createDeferredCore, type Deferred } from "../shared/deferred.js";
 import { cancelWorkerIdleGc, scheduleWorkerIdleGc } from "./worker-idle-gc.js";
+import { serveWorkerMemorySamples } from "./worker-memory.js";
 import {
   createWorkerTaskControl,
   observeWorkerTaskCancellation,
+  withWorkerTaskNativeSectionScope,
   type WorkerTaskControl,
 } from "./worker-task-native-sections.js";
 
@@ -46,13 +49,17 @@ export function serveOwnedWorkerTasks<Output>(
   ) => Output | Promise<Output>,
   options: {
     transferList?: (value: Output) => Transferable[];
-    closeResource?: (key?: string) => void;
+    closeResource?: (key?: string) => void | Promise<void>;
+    encodeResourceError?: (error: unknown) => unknown;
   } = {},
 ): void {
   const port = parentPort;
   if (!port) {
     return;
   }
+  // Results use the host port; worker-local diagnostics must keep JSON stdout clean.
+  loggingState.forceConsoleToStderr = true;
+  let memorySamplesStarted = false;
   let active: WorkerConversation | undefined;
   let execution = Promise.resolve();
   let resourceClosures = Promise.resolve();
@@ -68,7 +75,12 @@ export function serveOwnedWorkerTasks<Output>(
       closeResource?: true;
       key?: string;
       resourcePort?: MessagePort;
+      sampleMemory?: boolean;
     }) => {
+      if (message.sampleMemory && !memorySamplesStarted) {
+        memorySamplesStarted = true;
+        serveWorkerMemorySamples(port);
+      }
       cancelWorkerIdleGc();
       if (message.closeResource && message.resourcePort) {
         const receipt = message.resourcePort;
@@ -79,7 +91,9 @@ export function serveOwnedWorkerTasks<Output>(
             if (!options.closeResource) {
               throw new Error("Worker does not own retained resources");
             }
-            options.closeResource(message.key);
+            return options.closeResource(message.key);
+          })
+          .then(() => {
             receipt.postMessage({ ok: true }, []);
           })
           .catch((error: unknown) => {
@@ -87,6 +101,7 @@ export function serveOwnedWorkerTasks<Output>(
               {
                 ok: false,
                 error: error instanceof Error ? error.message : String(error),
+                detail: options.encodeResourceError?.(error),
               },
               [],
             );
@@ -201,7 +216,11 @@ export function serveOwnedWorkerTasks<Output>(
           try {
             await precedingClosures;
             control.throwIfCancelled();
-            return await handler(message.input, channel, control);
+            return await withWorkerTaskNativeSectionScope(
+              nativeSections,
+              () => active === task,
+              () => handler(message.input, channel, control),
+            );
           } finally {
             await stopObserving?.();
             active = undefined;

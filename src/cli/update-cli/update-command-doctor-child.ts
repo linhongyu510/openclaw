@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { hasErrnoCode } from "../../infra/errors.js";
 import type { UpdateRequester } from "../../infra/update-requester-authority.js";
 import type { UpdateRecoveryFence } from "../../infra/update-run-recovery.js";
@@ -15,7 +15,7 @@ import {
 import { parseOpenClawSchemaVersions } from "../../state/openclaw-schema-versions.js";
 import { withUpdateCommandExecutorChild } from "./update-command-executor.js";
 import type { UpdateDoctorInput } from "./update-command-migrated-types.js";
-import { UpdateCommandRecoveryPendingError } from "./update-command-recovery.js";
+import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-error.js";
 
 /** Inspect the same published --check contract consumed by candidate canary. */
 export async function inspectUpdateDoctorChildSupport(
@@ -60,19 +60,15 @@ export async function inspectUpdateDoctorChildSupport(
     );
   }
   assertCurrent();
-  let contract: unknown;
-  try {
-    contract = JSON.parse(result.stdout);
-  } catch {
-    // A broken check is not evidence of an older, supported CLI contract.
-  }
+  // A broken check is not evidence of an older, supported CLI contract.
+  const contract = safeParseJsonRecord(result.stdout);
   if (
     result.code !== 0 ||
     result.termination !== "exit" ||
     result.cleanup !== "normal" ||
     result.outputLimitExceeded ||
     result.outputErrorStream ||
-    !isRecord(contract) ||
+    !contract ||
     !parseOpenClawSchemaVersions(contract)
   ) {
     throw new UpdateCommandRecoveryPendingError("Target Doctor capability could not be inspected.");
@@ -91,6 +87,7 @@ export type UpdateDoctorChildContext = {
   requester?: Readonly<UpdateRequester>;
   /** The parent mutation fence is suspended while its child owns effects. */
   assertRequesterCurrent: () => void;
+  onStateHandoff?: () => void;
 };
 
 /** Package and finalization Doctors use the same private-input/native-child owner. */
@@ -125,6 +122,9 @@ export async function withUpdateDoctorChild<T>(
           beforeInput: (pid, spawnedArgv) => {
             context.assertRequesterCurrent();
             bindChild(pid, spawnedArgv);
+            // Only the bound target may read state-backed policy after migration.
+            // The parent retains identity and native custody, never schema admission.
+            context.onStateHandoff?.();
           },
           killProcessTree: true,
           requireProcessTreeExtinction: true,

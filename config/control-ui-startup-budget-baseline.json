@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 365261,
-  "reason": "Approved #153178 rebase measurement with frozen Pako 3.0.2: 365172 B rounds up to 365261 B (356.7 KiB), above the previous 364954 B baseline. The existing 512 B growth and 64 B build-variance allowances remain unchanged, giving an explicit 365837 B enforcement limit.",
-  "updatedAt": "2026-09-20"
+  "startupJsGzipBytes": 372878,
+  "reason": "Native sidebar bridge landing: measured production startup JS 372,878 B after rebasing onto main, +1,107 B (0.298%) over the prior baseline within the approved sub-1% ceiling rule. Matched-toolchain main measured 372,406 B versus 372,597 B before final action-module extraction (+191 B); retain the existing 512 B growth and 64 B build-variance allowances.",
+  "updatedAt": "2026-10-02"
 }

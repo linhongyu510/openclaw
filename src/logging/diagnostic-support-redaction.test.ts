@@ -45,6 +45,24 @@ describe("diagnostic support redaction", () => {
   const tempDir = path.join(os.tmpdir(), "openclaw-support-redaction-test");
 
   it.each([
+    ['"dist/index.js": fields=size,mtimeNs,ctimeNs,sha256', true],
+    ['"node_modules/.package-lock.json": fields=added', true],
+    ['"node_modules/@openclaw/fs-safe/index.js": fields=sha256', true],
+    ['".": fields=dev:ino,mode', true],
+    ['"/private/state.js": fields=sha256', false],
+    ['"../private/state.js": fields=sha256', false],
+    ['"node_modules/@private_team/module/index.js": fields=sha256', false],
+    ['"node_modules/@org/module/index.js": fields=sha256', false],
+    ['"dist/index.js": fields=sha256,private-value', false],
+    ['"dist/index.js": fields=sha256; private-text', false],
+  ])("bounds public package drift diagnostics: %s", (detail, allowed) => {
+    const line = `Package rollback entry ${detail}`;
+    expect(redactPublicSupportDiagnosticLine(line, { env: {}, stateDir: tempDir })).toBe(
+      allowed ? line : "[redacted-diagnostic]",
+    );
+  });
+
+  it.each([
     "EACCES",
     "EPERM",
     "ENOTEMPTY",
@@ -366,9 +384,11 @@ it("preserves exact typed lease guidance without widening maintenance prose", ()
     guidance + " /private/state.db token=fixture-only-token alice@example.invalid",
     "Doctor could not enter maintenance. OpenClawAgentDatabaseLeaseActiveError: private message",
   ]) {
-    expect(redactPublicSupportDiagnosticLine(input, context)).toBe(
-      "Doctor could not enter maintenance.",
-    );
+    for (const prefix of ["", "DoctorMaintenanceRefusalError: "]) {
+      expect(redactPublicSupportDiagnosticLine(`${prefix}${input}`, context)).toBe(
+        `${prefix}Doctor could not enter maintenance.`,
+      );
+    }
   }
   expect(
     redactPublicSupportDiagnosticLine(

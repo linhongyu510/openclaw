@@ -34,6 +34,7 @@ type QuestionPanelViewModel = {
   submitting?: boolean;
   drafts: Map<string, QuestionDraft>;
   error?: string | null;
+  notice?: string;
   requestPosition?: { current: number; total: number };
 };
 
@@ -49,15 +50,12 @@ export type QuestionPanelProps = {
   onNextRequest?: () => void;
 };
 
-export type QuestionPanelOptions = {
-  onChange?: () => void;
-  onSubmit?: (answers: Record<string, string[]>) => void | Promise<void>;
-  onSkip?: () => void | Promise<void>;
+export type QuestionPanelOptions = Pick<
+  QuestionPanelProps,
+  "onChange" | "onSubmit" | "onSkip" | "onCollapsedChange" | "onPreviousRequest" | "onNextRequest"
+> & {
   collapsed?: boolean;
-  onCollapsedChange?: (collapsed: boolean) => void;
-  requestPosition?: { current: number; total: number };
-  onPreviousRequest?: () => void;
-  onNextRequest?: () => void;
+  requestPosition?: QuestionPanelViewModel["requestPosition"];
 };
 
 export function createGatewayQuestionPanelProps(
@@ -627,6 +625,7 @@ class ChatQuestionPanel extends OpenClawLightDomElement {
         })}
 
         <div class="chat-question-panel__footer">
+          ${model.notice ? html`<span class="chat-question-panel__error" role="status">${model.notice}</span>` : nothing}
           ${
             model.error
               ? html`<span class="chat-question-panel__error" role="status">
@@ -639,7 +638,7 @@ class ChatQuestionPanel extends OpenClawLightDomElement {
                           aria-label=${t("chat.actions.dismissError")}
                           @click=${props.onDismissError}
                         >
-                          ×
+                          ${icons.x}
                         </button>`
                       : nothing
                   }
@@ -668,8 +667,12 @@ class ChatQuestionPanel extends OpenClawLightDomElement {
                 >
                   ${
                     this.pendingAction?.kind === "skip"
-                      ? t("chat.questions.skipping")
-                      : t("chat.questions.skip")
+                      ? t(
+                          model.nonBlocking
+                            ? "chat.asyncQuestions.dismissing"
+                            : "chat.questions.skipping",
+                        )
+                      : t(model.nonBlocking ? "chat.asyncQuestions.dismiss" : "chat.questions.skip")
                   }
                 </button>`
               : nothing

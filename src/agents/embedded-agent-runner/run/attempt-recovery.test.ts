@@ -35,6 +35,30 @@ const tempDirs = createTempDirTracker();
 const requireRecord = createRequireRecord("record", "expected-label-object-capitalized");
 afterEach(() => tempDirs.cleanup());
 
+it.each(["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "ENETUNREACH"])(
+  "fails fast on %s for setup while normal runs retain connection retries",
+  async (errorCode) => {
+    const scenario = {
+      errorMessage: "Connection error.",
+      errorCode,
+      noTools: true,
+      replaySafe: true,
+      content: [],
+    } satisfies TransportDropScenario;
+    vi.mocked(sleepWithAbort).mockClear();
+    const setup = await recoverAfterTransportDrop({ ...scenario, retryConnectionErrors: false });
+    expect(setup.recovery.action).toBe("proceed");
+    expect(sleepWithAbort).not.toHaveBeenCalled();
+    await expect(handleAssistantFailureAfterRecovery(setup)).rejects.toMatchObject({
+      reason: "timeout",
+      code: errorCode,
+    });
+    const ordinary = await recoverAfterTransportDrop(scenario);
+    expect(ordinary.recovery.action).toBe("retry");
+    expect(sleepWithAbort).toHaveBeenCalledOnce();
+  },
+);
+
 function handleAssistantFailureAfterRecovery(
   fixture: Awaited<ReturnType<typeof recoverAfterTransportDrop>>,
   previousRetryFailoverReason: Parameters<
@@ -54,11 +78,11 @@ function handleAssistantFailureAfterRecovery(
     attemptAssistant: assistant,
     currentAttemptAssistant: assistant,
     terminalState: resolveEmbeddedRunAttemptTerminalState({ attempt, assistant }),
-    activeErrorContext: { provider: "openai", model: "gpt-5.6-luna" },
+    activeErrorContext: { provider: "openai", model: "synthetic-model" },
     provider: "openai",
     providerOwner: undefined,
-    modelId: "gpt-5.6-luna",
-    model: "gpt-5.6-luna",
+    modelId: "synthetic-model",
+    model: "synthetic-model",
     thinkLevel: "off",
     getThinkLevel: () => "off",
     attemptedThinking: new Set(["off"]),
@@ -79,6 +103,12 @@ function handleAssistantFailureAfterRecovery(
   });
 }
 
+const outputLimitDetails = {
+  eventType: "response.incomplete",
+  stopReason: "length",
+  incompleteReason: "max_output_tokens",
+};
+
 const outputLimitScenario = {
   errorCode: "incomplete_tool_call",
   errorMessage: "Responses stream completed with an incomplete terminal tool call",
@@ -86,7 +116,7 @@ const outputLimitScenario = {
     {
       type: "openai_responses_terminal",
       timestamp: 1,
-      details: { eventType: "response.incomplete", incompleteReason: "max_output_tokens" },
+      details: outputLimitDetails,
     },
   ],
   usage: createMockUsage(440_445, 128_000),
@@ -179,7 +209,7 @@ describe("recoverEmbeddedRunAttempt", () => {
     });
 
     expect(recovery).toMatchObject({ action: "retry", lastRetryFailoverReason: null });
-    expect(markOwnedTranscriptRetry).toHaveBeenCalledOnce();
+    expect(markOwnedTranscriptRetry).toHaveBeenCalledTimes(2);
     expect(continueFromCurrentTranscript).toHaveBeenCalledExactlyOnceWith({
       includeToolFailureInstruction: false,
     });
@@ -194,11 +224,14 @@ describe("recoverEmbeddedRunAttempt", () => {
     );
   });
 
-  it("keeps repeated output-limit recovery inside the existing retry budget", async () => {
+  it("allows only one output-limit continuation even after successful model progress", async () => {
     const { recovery, recover, failoverRetryController, continueFromCurrentTranscript } =
       await recoverAfterTransportDrop(outputLimitScenario);
     expect(recovery.action).toBe("retry");
-    failoverRetryController.observeAttempt({ providerRetryMaxRetries: 1 });
+    failoverRetryController.observeAttempt({
+      providerRetryMaxRetries: 8,
+      hasSuccessfulModelResponse: true,
+    });
 
     expect(await recover()).toEqual({ action: "proceed" });
     expect(failoverRetryController.transientRetryCount).toBe(1);
@@ -233,9 +266,9 @@ describe("recoverEmbeddedRunAttempt", () => {
       expect(recovery.action).toBe("retry");
       now.mockReturnValue(startedAt + 16 * 60_000);
 
-      expect(await recover()).toMatchObject({ action: "retry" });
-      expect(failoverRetryController.transientRetryCount).toBe(2);
-      expect(continueFromCurrentTranscript).toHaveBeenCalledTimes(2);
+      expect(await recover()).toMatchObject({ action: "proceed" });
+      expect(failoverRetryController.transientRetryCount).toBe(1);
+      expect(continueFromCurrentTranscript).toHaveBeenCalledTimes(1);
       now.mockReturnValue(startedAt + 32 * 60_000);
       await expect(
         failoverRetryController.maybeRetryTransient({ reason: "server_error" }),
@@ -278,7 +311,13 @@ describe("recoverEmbeddedRunAttempt", () => {
   ])("does not resume an incomplete call after $eventType/$incompleteReason", async (details) => {
     const { recovery, continueFromCurrentTranscript } = await recoverAfterTransportDrop({
       ...outputLimitScenario,
-      diagnostics: [{ type: "openai_responses_terminal", timestamp: 1, details }],
+      diagnostics: [
+        {
+          type: "openai_responses_terminal",
+          timestamp: 1,
+          details: { ...outputLimitDetails, ...details },
+        },
+      ],
     });
     expect(recovery).toEqual({ action: "proceed" });
     expect(continueFromCurrentTranscript).not.toHaveBeenCalled();
@@ -746,7 +785,7 @@ describe("recoverEmbeddedRunAttempt", () => {
     const attempt = makeEmbeddedRunnerAttempt({
       modelAttempt: {
         provider: "openai",
-        model: "gpt-5.6-luna",
+        model: "synthetic-model",
         credentialSource: {
           kind: "direct",
           evidence: "environment",
@@ -778,8 +817,8 @@ describe("recoverEmbeddedRunAttempt", () => {
       },
       preparedRuntime: {
         provider: "openai",
-        modelId: "gpt-5.6-luna",
-        model: { id: "gpt-5.6-luna" },
+        modelId: "synthetic-model",
+        model: { id: "synthetic-model" },
         genericCompactionRecoveryAllowed: false,
         snapshot: () => ({
           thinkLevel: "off",
@@ -796,7 +835,7 @@ describe("recoverEmbeddedRunAttempt", () => {
         terminalState,
         setTerminalLifecycleMeta,
         attemptCompactionCount: 0,
-        activeErrorContext: { provider: "openai", model: "gpt-5.6-luna" },
+        activeErrorContext: { provider: "openai", model: "synthetic-model" },
         resolveReplayInvalidForAttempt: () => false,
         canRestartForLiveSwitch: false,
       },
@@ -888,8 +927,8 @@ describe("recoverEmbeddedRunAttempt", () => {
       },
       preparedRuntime: {
         provider: "openai",
-        modelId: "gpt-5.6-luna",
-        model: { id: "gpt-5.6-luna" },
+        modelId: "synthetic-model",
+        model: { id: "synthetic-model" },
         genericCompactionRecoveryAllowed: false,
         maybeRefreshRuntimeAuthForAuthError: promptFailover,
         snapshot: () => ({
@@ -909,7 +948,7 @@ describe("recoverEmbeddedRunAttempt", () => {
         terminalState,
         setTerminalLifecycleMeta: vi.fn(),
         attemptCompactionCount: 0,
-        activeErrorContext: { provider: "openai", model: "gpt-5.6-luna" },
+        activeErrorContext: { provider: "openai", model: "synthetic-model" },
         resolveReplayInvalidForAttempt: () => false,
         canRestartForLiveSwitch: false,
       },

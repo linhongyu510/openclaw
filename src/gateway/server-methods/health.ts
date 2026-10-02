@@ -1,8 +1,8 @@
-// Health gateway methods return cached or refreshed status summaries while
-// detecting stale channel runtime state against live gateway snapshots.
 import { isFutureDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
 import { getPreparedModelRuntimeStartupStatus } from "../../agents/prepared-model-runtime.startup-status.js";
 import type { ChannelAccountSnapshot } from "../../channels/plugins/types.public.js";
+import { readChildRuntimeViability } from "../../infra/child-runtime-viability.js";
+import { formatErrorMessage as formatError } from "../../infra/errors.js";
 import { readGatewayMaintenanceWork } from "../../infra/gateway-active-work.js";
 import { getStatusSummary } from "../../status/summary.js";
 import type { GatewayHotReloadStatus } from "../config-reload-status.types.js";
@@ -13,7 +13,6 @@ import { createGatewayServerActiveWorkInspectors } from "../server-active-work.j
 import type { ChannelRuntimeSnapshot } from "../server-channel-runtime.types.js";
 import { HEALTH_REFRESH_INTERVAL_MS } from "../server-constants.js";
 import type { GatewayShutdownStatus } from "../server-public.js";
-import { formatError } from "../server-utils.js";
 import { shouldScheduleBackgroundHealthRefresh } from "../server/health-refresh-admission.js";
 import { readGatewayProcessVitals, readGatewayWorkerPoolFacts } from "../server/process-vitals.js";
 import { getSessionRowProjection } from "../session-row-projection-access.js";
@@ -35,7 +34,6 @@ function cachedLifecycleDiffersFromRuntime(params: {
   return params.cachedAccount === undefined;
 }
 
-/** Checks whether cached channel health is stale against the live runtime snapshot. */
 function cachedHealthDiffersFromRuntime(
   cached: HealthSummary,
   runtime: ChannelRuntimeSnapshot,
@@ -89,15 +87,15 @@ function cachedHealthDiffersFromRuntime(
   );
 }
 
-/** Merges cheap live runtime facts into a cached health summary before responding. */
 async function mergeCachedHealthRuntimeState(params: {
   cached: HealthSummary;
-  eventLoop?: HealthSummary["eventLoop"];
+  getEventLoopHealth?: () => HealthSummary["eventLoop"];
   configReloadHotReloadStatus?: GatewayHotReloadStatus;
 }): Promise<HealthSummary> {
   const {
     contextEngines: _cachedContextEngines,
     deliveryQueues: _cachedDeliveryQueues,
+    eventLoop: _cachedEventLoop,
     ...cached
   } = params.cached;
   // Dead-letter counts are cheap live reads. Preserve the grouped pressure
@@ -105,11 +103,13 @@ async function mergeCachedHealthRuntimeState(params: {
   const deliveryQueues = await buildDeliveryQueueHealthSummary(
     _cachedDeliveryQueues?.ingressPressure ?? [],
   );
-  const contextEngines = buildContextEngineHealthSummary();
+  const contextEngines = await buildContextEngineHealthSummary();
+  // A reset sampler has no current window; never revive the cached reading.
+  const eventLoop = params.getEventLoopHealth?.();
   return {
     ...cached,
     modelRuntime: getPreparedModelRuntimeStartupStatus(),
-    ...(params.eventLoop ? { eventLoop: params.eventLoop } : {}),
+    ...(eventLoop ? { eventLoop } : {}),
     ...(contextEngines ? { contextEngines } : {}),
     ...(deliveryQueues ? { deliveryQueues } : {}),
     ...(params.configReloadHotReloadStatus
@@ -118,7 +118,6 @@ async function mergeCachedHealthRuntimeState(params: {
   };
 }
 
-/** Gateway handlers for health snapshots and status summaries. */
 export const healthHandlers: GatewayRequestHandlers = {
   health: async ({ respond, context, params, client }) => {
     const { getHealthCache, refreshHealthSnapshot, logHealth } = context;
@@ -147,11 +146,15 @@ export const healthHandlers: GatewayRequestHandlers = {
     ) {
       respond(
         true,
-        await mergeCachedHealthRuntimeState({
-          cached,
-          eventLoop: context.getEventLoopHealth?.(),
-          configReloadHotReloadStatus: context.getConfigReloaderHotReloadStatus?.(),
-        }),
+        {
+          ...(await mergeCachedHealthRuntimeState({
+            cached,
+            getEventLoopHealth: context.getEventLoopHealth,
+            configReloadHotReloadStatus: context.getConfigReloaderHotReloadStatus?.(),
+          })),
+          // Live check. The cache must not keep a path that disappeared after it was stored.
+          childRuntime: readChildRuntimeViability(),
+        },
         undefined,
         { cached: true },
       );
@@ -164,7 +167,15 @@ export const healthHandlers: GatewayRequestHandlers = {
     }
     await respondUnavailableOnThrow(respond, async () => {
       const snap = await refreshHealthSnapshot({ probe: wantsProbe, includeSensitive });
-      respond(true, { ...snap, modelRuntime: getPreparedModelRuntimeStartupStatus() }, undefined);
+      respond(
+        true,
+        {
+          ...snap,
+          modelRuntime: getPreparedModelRuntimeStartupStatus(),
+          childRuntime: readChildRuntimeViability(),
+        },
+        undefined,
+      );
     });
   },
   status: async ({ respond, client, params, context }) => {
@@ -199,6 +210,7 @@ export const healthHandlers: GatewayRequestHandlers = {
         workerPools,
         pid: process.pid,
         shutdownBudget: shutdownStatus,
+        childRuntime: readChildRuntimeViability(),
       },
       undefined,
     );

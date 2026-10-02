@@ -16,7 +16,7 @@ import {
   getUpdateRun,
   recordUpdateRunVerification,
 } from "../../infra/update-run-ledger.js";
-import type { UpdateRunResult } from "../../infra/update-runner.js";
+import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import { defaultRuntime } from "../../runtime.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { VERSION } from "../../version.js";
@@ -190,6 +190,7 @@ export function taskRecovery(record: (phase: string) => void = () => {}) {
   return {
     suspended: Promise.resolve(true),
     beginMutation: vi.fn(() => record("mutation")),
+    assertRecoveryCurrent: vi.fn(),
     restore: vi.fn(async () => record("restore")),
     handoff: vi.fn(),
     complete: vi.fn(async () => record("complete")),

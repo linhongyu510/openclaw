@@ -14,7 +14,6 @@ import { serializeConversation } from "../../packages/agent-core/src/harness/com
 import { convertToLlm } from "../../packages/agent-core/src/harness/messages.js";
 import { adjustMaxTokensForThinking } from "../../packages/ai/src/providers/simple-options.js";
 import {
-  BASE_CHUNK_RATIO,
   buildStageSplitPlan,
   estimateMessagesTokens,
   projectCompactionMessagesForPlanning,
@@ -36,6 +35,7 @@ beforeEach(() => {
 
 // Mirrors the reported deployment: a 262K-window summarizer over a ~164K transcript.
 const LARGE_CONTEXT_WINDOW = 262_144;
+const TEST_BASE_CHUNK_RATIO = 0.4; // mirrors compaction-planning BASE_CHUNK_RATIO
 const LARGE_SUMMARY_OUTPUT_BUDGET = 65_536;
 const TEST_MODEL = {
   id: "test-summary-model",
@@ -531,7 +531,7 @@ describe("compaction single-pass fast path", () => {
     // which is why the fast path cannot be expressed via maxChunkTokens alone.
     const messages = buildTranscript(120, 5_500);
     const widestBudget =
-      Math.floor(LARGE_CONTEXT_WINDOW * BASE_CHUNK_RATIO) - SUMMARIZATION_OVERHEAD_TOKENS;
+      Math.floor(LARGE_CONTEXT_WINDOW * TEST_BASE_CHUNK_RATIO) - SUMMARIZATION_OVERHEAD_TOKENS;
 
     expect(estimateMessagesTokens(messages)).toBeGreaterThan(widestBudget);
   });

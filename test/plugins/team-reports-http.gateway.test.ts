@@ -11,6 +11,7 @@ import type { OpenClawConfig } from "../../src/config/types.openclaw.js";
 import type { ResolvedGatewayAuth } from "../../src/gateway/auth.js";
 import { CONTROL_UI_PLUGIN_AUTH_GRANT_TTL_MS } from "../../src/gateway/control-ui-contract.js";
 import { setControlUiPluginAuthCookie } from "../../src/gateway/control-ui-plugin-auth-cookie.js";
+import { resolveControlUiPluginAuthCookieGeneration } from "../../src/gateway/http-auth-plugin-cookie.js";
 import {
   authorizePluginGatewayHttpRequestOrReply,
   resolveSharedSecretHttpOperatorScopes,
@@ -28,10 +29,10 @@ import { createSubsystemLogger } from "../../src/logging/subsystem.js";
 import { sessionChanges } from "../../src/sessions/session-row-changes.js";
 import { trackAsyncWork } from "../../src/shared/async-work-scope.js";
 import {
-  ensureProfileForEmail,
   setUserProfileRole,
   syncGitHubIdentity,
-} from "../../src/state/user-profiles.js";
+} from "../../src/state/user-profile-writes.worker.js";
+import { ensureProfileForEmail } from "../../src/state/user-profiles.js";
 import { withOpenClawTestState } from "../../src/test-utils/openclaw-test-state.js";
 import { createDeferred, withTestTimeout } from "../helpers/promise.js";
 
@@ -223,7 +224,10 @@ async function withReports(
                   },
                 ],
                 {
-                  generation: resolveSharedGatewaySessionGeneration(auth),
+                  generation: resolveControlUiPluginAuthCookieGeneration(
+                    resolveSharedGatewaySessionGeneration(auth),
+                    cfg,
+                  ),
                   profileId: reader.id,
                   nowMs: issuedAt,
                 },

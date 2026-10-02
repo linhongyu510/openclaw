@@ -1,4 +1,3 @@
-// Builds plugin status snapshots for CLI and diagnostics.
 import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizeOpenClawVersionBase } from "../config/version.js";
@@ -39,6 +38,7 @@ import {
 } from "./plugin-metadata-snapshot.js";
 import { normalizePluginPolicyId } from "./plugin-policy-id.js";
 import { resolveBundledProviderCompatPluginIds } from "./providers.js";
+import { groupPluginRecords } from "./record-groups.js";
 import type { PluginRegistry } from "./registry.js";
 import { listImportedRuntimePluginIds } from "./runtime.js";
 import { buildPluginRuntimeLoadOptions } from "./runtime/load-context.js";
@@ -197,6 +197,7 @@ type PluginReportParams = {
   onlyPluginIds?: readonly string[];
   /** Capture full registrations without starting channel runtime sidecars. */
   runtimeInspection?: boolean;
+  loadMode?: "validate";
   workspaceDir?: string;
   /** Use an explicit env when plugin roots should resolve independently from process.env. */
   env?: NodeJS.ProcessEnv;
@@ -279,6 +280,7 @@ function preparePluginReport(params: PluginReportParams | undefined) {
       env: params?.env,
       loadModules: true,
       cache: true,
+      mode: params?.loadMode,
       onlyPluginIds,
       toolDiscovery: params?.runtimeInspection,
     }),
@@ -558,35 +560,18 @@ function buildPluginInspectRecord(
   };
 }
 
-function groupByPluginId<T>(rows: readonly T[], getPluginId: (row: T) => string | undefined) {
-  const grouped = new Map<string, T[]>();
-  for (const row of rows) {
-    const pluginId = getPluginId(row);
-    if (pluginId === undefined) {
-      continue;
-    }
-    const group = grouped.get(pluginId);
-    if (group) {
-      group.push(row);
-    } else {
-      grouped.set(pluginId, [row]);
-    }
-  }
-  return grouped;
-}
-
 export function buildAllPluginInspectReports(params: PluginInspectParams): PluginInspectReport[] {
   const context = resolvePluginInspectContext(params);
   const { report } = context;
   if (report.plugins.length < 2) {
     return report.plugins.map((plugin) => buildPluginInspectRecord(plugin, context));
   }
-  const typedHooks = groupByPluginId(report.typedHooks, (entry) => entry.pluginId);
-  const hooks = groupByPluginId(report.hooks, (entry) => entry.pluginId);
-  const tools = groupByPluginId(report.tools, (entry) => entry.pluginId);
-  const diagnostics = groupByPluginId(report.diagnostics, (entry) => entry.pluginId);
-  const sessionCatalogs = groupByPluginId(report.sessionCatalogs, (entry) => entry.pluginId);
-  const gatewayMethodDescriptors = groupByPluginId(
+  const typedHooks = groupPluginRecords(report.typedHooks, (entry) => entry.pluginId);
+  const hooks = groupPluginRecords(report.hooks, (entry) => entry.pluginId);
+  const tools = groupPluginRecords(report.tools, (entry) => entry.pluginId);
+  const diagnostics = groupPluginRecords(report.diagnostics, (entry) => entry.pluginId);
+  const sessionCatalogs = groupPluginRecords(report.sessionCatalogs, (entry) => entry.pluginId);
+  const gatewayMethodDescriptors = groupPluginRecords(
     report.gatewayMethodDescriptors ?? [],
     (descriptor) => (descriptor.owner.kind === "plugin" ? descriptor.owner.pluginId : undefined),
   );

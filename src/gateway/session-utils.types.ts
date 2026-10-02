@@ -51,7 +51,6 @@ export type GatewaySessionRow = Omit<SessionRow, "archivedBy" | "updatedAt" | "w
   updatedAt: number | null;
   archivedBy?: SessionEntry["archivedBy"];
   agentStatus?: SessionEntry["agentStatus"];
-  activitySummary?: import("../../packages/gateway-protocol/src/schema/sessions-activity-summary.js").SessionActivitySummary;
   observerDigest?: Pick<
     SessionObserverDigest,
     "agentId" | "runId" | "headline" | "health" | "updatedAt" | "revision"
@@ -112,6 +111,11 @@ const sessionRowSchemaDriftGuard: Pick<GatewaySessionRow, keyof SessionRow> exte
 void sessionRowSchemaDriftGuard;
 
 export type GatewayAgentRow = SharedGatewayAgentRow;
+
+export type SessionTitleFields = {
+  firstUserMessage: string | null;
+  lastMessagePreview: string | null;
+};
 
 export type SessionPreviewItem = {
   role: "user" | "assistant" | "tool" | "system" | "other";
