@@ -186,13 +186,16 @@ export function createEmbeddedModelState(
                 lastCallUsage: normalizeUsage(message.usage),
               }),
               successful: true,
-              // Admitted: provider accepted the prompt and produced a usable turn.
-              // Excludes silent overflow (stop/toolUse but usage exceeds window).
+              // Admitted: provider accepted the prompt and completed a usable
+              // non-refusal turn. We deliberately do NOT require nonzero usage:
+              // a provider/proxy can complete a stop/toolUse while omitting
+              // counters, and main renews the budget on any completed turn.
+              // The only false-positive this guards against is silent overflow,
+              // which `isContextOverflow` excludes on its own.
               admitted:
                 (message.stopReason === "stop" ||
                   message.stopReason === "toolUse" ||
                   message.stopReason === "length") &&
-                hasNonzeroUsage(normalizeUsage(message.usage)) &&
                 !isContextOverflow(
                   message,
                   params.contextWindowTokens ?? params.session.model?.contextWindow,

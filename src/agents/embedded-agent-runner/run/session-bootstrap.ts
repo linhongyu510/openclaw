@@ -163,9 +163,11 @@ export function isNoRealConversationCompactionNoop(params: {
  *
  * `compacted: true` only says the engine wrote a compaction entry; it does not
  * say the prompt got smaller. When the engine reports both token counts and
- * `tokensAfter` did not drop below `tokensBefore`, the transcript is unchanged
- * in size, so retrying the same prompt cannot succeed and the overflow budget
- * must not be charged for it.
+ * `tokensAfter` did not drop below `tokensBefore`, the compaction measured no
+ * reduction. This is a diagnosis only: it does NOT mean retry is impossible
+ * (the context engine reassembles messages independently, so a later prompt can
+ * still differ) and it does NOT refund the attempt — the caller keeps bounded
+ * retry/reassembly running and keeps the overflow budget charged.
  *
  * Engines that omit either count are treated as progress: the counts are
  * optional in the contract, and an absent measurement is not evidence of a
