@@ -27,6 +27,7 @@ import {
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
+import { OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE } from "../internal-runtime-context.js";
 import { SessionManager } from "./session-manager.js";
 
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
@@ -322,6 +323,35 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
       /Session transcript anchor was not returned/,
     );
+  });
+
+  it("G3: runtime-context metadata above the cached turn stays traversable while dirty", async () => {
+    const dir = tempDirs.make("openclaw-anchor-3state-g3-");
+    const scope = {
+      agentId: "main",
+      sessionId: "anchor-3state-g3",
+      sessionKey: "agent:main:dashboard:anchor-3state-g3",
+      storePath: path.join(dir, "sessions.json"),
+    };
+    const user = userMessage("anchor-3state-g3:user");
+    await seedSession(scope);
+
+    const m1 = SessionManager.open(scope, dir);
+    const appendedId = m1.appendMessage(user);
+
+    // A second manager appends a runtime-context metadata row on top of K (the tail). The
+    // manager's current-turn walk SKIPS this row, so K is still the canonical current turn.
+    const m2 = SessionManager.open(scope, dir);
+    m2.appendCustomMessageEntry(OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE, "child context", false);
+    markIndexDirty(scope, dir);
+
+    // The durable current-turn walk must also skip the runtime-context row (its customType is
+    // preserved in the resolver's projection) and resolve back to K, so replaying the duplicate
+    // degrades (idempotent) instead of throwing as if K had completed.
+    const dedup = m1.appendMessageWithTranscriptAnchor(user);
+    expect(dedup.appended).toBe(false);
+    expect(dedup.entryId).toBe(appendedId);
+    expect(dedup.anchor).toBeUndefined();
   });
 
   it("H: duplicate delivery inside an enclosing write transaction reaches the replay", async () => {

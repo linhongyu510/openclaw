@@ -270,7 +270,7 @@ export function resolveTranscriptCanonicalCurrentTurnEntryIdInTransaction(
   database: Pick<OpenClawAgentDatabase, "db" | "path">,
   sessionId: string,
 ): string | null {
-  const tree = scanSessionTranscriptTree(readTranscriptNavigationEvents(database, sessionId));
+  const tree = scanSessionTranscriptTree(readCurrentTurnNavigationEvents(database, sessionId));
   const walk = walkSessionCurrentTurn(tree.appendParentId, PREPARED_ASSISTANT_MAX_ANCESTORS);
   let next = walk.next();
   while (!next.done) {
@@ -286,6 +286,36 @@ export function resolveTranscriptCanonicalCurrentTurnEntryIdInTransaction(
     next = walk.next(facts);
   }
   return next.value;
+}
+
+/**
+ * Like readTranscriptNavigationEvents but additionally retains `customType`, which the shared
+ * navigation projection strips. The current-turn traversability rules must classify
+ * `custom_message` rows by customType (runtime-context is traversable); without it every
+ * custom_message would look like a non-traversable turn boundary.
+ */
+function readCurrentTurnNavigationEvents(
+  database: Pick<OpenClawAgentDatabase, "db" | "path">,
+  sessionId: string,
+): unknown[] {
+  const db = getSessionKysely(database.db);
+  return Array.from(
+    iterateSqliteQuerySync(
+      database.db,
+      db
+        .selectFrom("transcript_events")
+        .select(
+          /* kysely-allow-raw: current-turn walk needs the customType discriminator plus tree facts. */ sql<string>`json_set(
+            ${projectTranscriptNavigationSql(transcriptEventNavigationSql())},
+            '$.customType',
+            json_extract(${transcriptEventNavigationSql()}, '$.customType')
+          )`.as("event_json"),
+        )
+        .where("session_id", "=", sessionId)
+        .orderBy("seq", "asc"),
+    ),
+    (row) => JSON.parse(row.event_json) as unknown,
+  );
 }
 
 /**
