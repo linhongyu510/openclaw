@@ -1,7 +1,4 @@
-import {
-  CompactionError,
-  SummaryOutputBudgetError,
-} from "../../packages/agent-core/src/harness/types.js";
+import { CompactionError } from "../../packages/agent-core/src/harness/types.js";
 /**
  * Summarization and fallback helpers for transcript compaction.
  */
@@ -16,12 +13,10 @@ import {
   buildSummarizationStagePlanWithWorker,
   buildSummaryChunksWithWorker,
 } from "./compaction-planning-worker.js";
+import { shouldRetryCompactionChunkError } from "./compaction-retry-policy.js";
 import { DEFAULT_CONTEXT_TOKENS } from "./defaults.js";
 import { isTimeoutError } from "./failover-error.js";
-import {
-  isContextOverflowError,
-  isLikelyContextOverflowError,
-} from "./failover/context-overflow.js";
+import { isContextOverflowError } from "./failover/context-overflow.js";
 import type {
   AgentMessage,
   CompactionSummaryPrompt,
@@ -151,11 +146,7 @@ async function summarizeChunks(params: CompactionSummaryParams): Promise<string>
           sleep: (ms) => sleepWithAbort(ms, params.signal),
           // Caller aborts and transport timeouts are terminal; provider-side
           // AbortErrors without caller cancellation remain retryable.
-          shouldRetry: (err) =>
-            !params.signal.aborted &&
-            !(err instanceof SummaryOutputBudgetError) &&
-            !isLikelyContextOverflowError(formatErrorMessage(err)) &&
-            (isAbortError(err) || !isTimeoutError(err)),
+          shouldRetry: (err) => shouldRetryCompactionChunkError(err, params.signal.aborted),
         },
       );
     } catch (err) {
