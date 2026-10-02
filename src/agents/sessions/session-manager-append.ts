@@ -567,7 +567,7 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
         }
         // Read the anchor and the reconcile state in a single DB snapshot so we can tell
         // apart the two ways an anchor can be missing.
-        const { anchor, indexDirty } = readActiveTranscriptEntryAnchorStatus({
+        const { anchor, indexDirty, cachedIdentityExists } = readActiveTranscriptEntryAnchorStatus({
           ...this.persistenceTarget,
           entryId: current.id,
         });
@@ -583,7 +583,7 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
         // the index dirty for ~0.5-10s. Hard-throwing there turned a benign duplicate
         // delivery into "Session transcript anchor was not returned". Degrade to an
         // idempotent no-op without a certifying anchor.
-        if (indexDirty) {
+        if (indexDirty && cachedIdentityExists) {
           return {
             entryId: current.id,
             message: current.message,

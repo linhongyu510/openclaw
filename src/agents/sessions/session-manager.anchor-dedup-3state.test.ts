@@ -195,4 +195,37 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     expect(dedup.entryId).toBe(appendedId);
     expect(dedup.anchor).toBeUndefined();
   });
+
+  it("F: dirty index but cached turn's identity row is gone still rejects (no false-ack)", async () => {
+    const dir = tempDirs.make("openclaw-anchor-3state-f-");
+    const scope = {
+      agentId: "main",
+      sessionId: "anchor-3state-f",
+      sessionKey: "agent:main:dashboard:anchor-3state-f",
+      storePath: path.join(dir, "sessions.json"),
+    };
+    const user = userMessage("anchor-3state-f:user");
+    await seedSession(scope);
+
+    const m1 = SessionManager.open(scope, dir);
+    const appendedId = m1.appendMessage(user);
+
+    // Simulate another writer that both leaves the projection dirty AND physically removes
+    // the cached turn's authoritative identity row (what a suffix remove does). Degrading on
+    // "dirty" alone would false-acknowledge a non-existent turn; it must reject instead.
+    const database = openOpenClawAgentDatabase({
+      agentId: scope.agentId,
+      path: resolveSessionTranscriptDatabasePath({ ...scope, storePath: scope.storePath }),
+    });
+    database.db
+      .prepare("DELETE FROM transcript_event_identities WHERE session_id = ? AND event_id = ?")
+      .run(scope.sessionId, appendedId);
+    database.db
+      .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
+      .run(scope.sessionId);
+
+    expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
+      /Session transcript anchor was not returned/,
+    );
+  });
 });

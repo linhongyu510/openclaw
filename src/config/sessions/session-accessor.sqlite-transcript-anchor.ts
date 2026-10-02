@@ -118,13 +118,21 @@ export interface ActiveTranscriptAnchorRead {
    * active row for the cached entry.
    */
   indexDirty: boolean;
+  /**
+   * True only when indexDirty is set AND the cached entry still has a row in the
+   * authoritative `transcript_event_identities` log. A suffix remove physically deletes
+   * those rows, so during a dirty projection we revalidate against this log instead of
+   * blanket-degrading: a cached turn another writer deleted must not be false-acked.
+   */
+  cachedIdentityExists: boolean;
 }
 
 /**
  * Reads the active anchor together with the reconcile state against ONE opened database
- * snapshot. This lets callers distinguish a transiently dirty index (benign duplicate
- * delivery during the ~0.5-10s reconcile window) from a clean index whose active projection
- * no longer contains the cached entry (another writer removed/rewrote it).
+ * snapshot (a single deferred read transaction on a fresh connection). This distinguishes a
+ * transiently dirty index (benign duplicate during the reconcile window) from a clean index
+ * whose active projection lacks the cached entry, and -- while dirty -- revalidates the cached
+ * turn against the authoritative identity log so a deleted turn still rejects.
  */
 export function readActiveTranscriptEntryAnchorStatus(params: {
   agentId?: string;
@@ -135,17 +143,37 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
 }): ActiveTranscriptAnchorRead {
   const resolved = resolveSqliteTranscriptScope(params);
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
-  // Fail-closed: observe reconcile state first, on the same snapshot used for the anchor join.
-  const indexDirty = sessionTranscriptIndexNeedsReconcile(database.db, resolved.sessionId);
-  if (indexDirty) {
-    return { anchor: undefined, indexDirty: true };
+  const db = database.db;
+  // Fail-closed: reconcile probe, active-anchor join, and identity revalidation all run in one
+  // read transaction so they observe a consistent snapshot, not three autocommits racing a writer.
+  db.exec("BEGIN");
+  try {
+    const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
+    if (!indexDirty) {
+      return {
+        anchor: readActiveTranscriptEntryAnchorInTransaction({
+          database,
+          resolved,
+          entryId: params.entryId,
+        }),
+        indexDirty: false,
+        cachedIdentityExists: true,
+      };
+    }
+    // Dirty projection: the active join cannot certify anything. Revalidate against the
+    // authoritative identity log. Suffix removal physically deletes those rows, so a missing
+    // identity row means the cached turn is gone -> the caller must reject, not degrade.
+    const identity = executeSqliteQueryTakeFirstSync(
+      db,
+      getSessionKysely(db)
+        .selectFrom("transcript_event_identities")
+        .select("event_id")
+        .where("session_id", "=", resolved.sessionId)
+        .where("event_id", "=", params.entryId)
+        .limit(1),
+    );
+    return { anchor: undefined, indexDirty: true, cachedIdentityExists: Boolean(identity) };
+  } finally {
+    db.exec("COMMIT");
   }
-  return {
-    anchor: readActiveTranscriptEntryAnchorInTransaction({
-      database,
-      resolved,
-      entryId: params.entryId,
-    }),
-    indexDirty: false,
-  };
 }
