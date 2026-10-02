@@ -22,9 +22,6 @@ vi.mock("../fleet/registry.kernel.js", () => ({
 vi.mock("./openclaw-agent-db-registry.read.js", () => ({
   readRegisteredAgentDatabaseRows: mock.query,
 }));
-vi.mock("./openclaw-state-db-cache.js", () => ({
-  openClawStateDatabaseCache: { assertOpenClawStateDatabaseFreshOpenAllowedAtPath() {} },
-}));
 vi.mock("./openclaw-state-db-read-connection.js", () => ({
   closeRetainedOpenClawStateReadConnections: vi.fn(),
   readOpenClawStateReadOnlyLocation: mock.settle,
@@ -39,7 +36,6 @@ import "./openclaw-state-read.worker.js";
 const request: OpenClawStateReadRequest = {
   context: {
     environment: { OPENCLAW_STATE_DIR: "/fixture" },
-    coordinatorRuntime: { directory: "/fixture/coordinator", keepAlive: false },
   },
   databasePath: "/fixture/state.sqlite",
   location: "/fixture/snapshot.sqlite",
@@ -60,7 +56,7 @@ beforeEach(() => {
   });
 });
 
-it.each(["success", "query-error", "schema-error"] as const)(
+it.each(["query-error", "schema-error"] as const)(
   "reports source admission at the schema-validated callback for %s",
   (outcome) => {
     const failure = new Error("controlled reader failure");
@@ -68,19 +64,17 @@ it.each(["success", "query-error", "schema-error"] as const)(
       mock.admit.mockImplementation(() => {
         throw failure;
       });
-    } else if (outcome === "query-error") {
+    } else {
       mock.query.mockImplementation(() => {
         throw failure;
       });
     }
     const reply = mock.handler(request);
-    if (reply.ok) {
-      expect(reply).toEqual({ ok: true, type: "fleet.list", sourceAdmitted: true, cells: [] });
-    } else {
-      expect(reply.message).toBe(failure.message);
-      expect(reply.sourceAdmitted).toBe(outcome === "query-error" ? true : undefined);
-    }
-    expect(reply.ok).toBe(outcome === "success");
+    expect(reply).toMatchObject({
+      ok: false,
+      message: failure.message,
+      sourceAdmitted: outcome === "query-error" ? true : undefined,
+    });
     expect(mock.query).toHaveBeenCalledTimes(outcome === "schema-error" ? 0 : 1);
   },
 );

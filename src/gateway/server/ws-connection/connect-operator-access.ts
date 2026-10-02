@@ -1,3 +1,4 @@
+import { ConnectErrorDetailCodes } from "../../../../packages/gateway-protocol/src/connect-error-details.js";
 import { ErrorCodes } from "../../../../packages/gateway-protocol/src/index.js";
 import { getRuntimeConfig } from "../../../config/io.js";
 import {
@@ -22,7 +23,7 @@ export function prepareGatewayConnectOperatorAccess(client: GatewayWsClient): vo
   const operatorAccessAuthority = profile
     ? resolveGatewayOperatorAccessAuthority(profile.profileId, config)
     : undefined;
-  if (operatorAccessAuthority) {
+  if (operatorAccessAuthority !== undefined) {
     client.internal = { ...client.internal, operatorAccessAuthority };
   }
 }
@@ -31,7 +32,9 @@ export async function rejectGatewayConnectOperatorAccess(
   context: GatewayConnectPhaseContext,
 ): Promise<void> {
   context.markHandshakeFailure("operator-access-denied");
-  context.sendHandshakeErrorResponse(ErrorCodes.FORBIDDEN, GATEWAY_OPERATOR_ACCESS_DENIED_MESSAGE);
+  context.sendHandshakeErrorResponse(ErrorCodes.FORBIDDEN, GATEWAY_OPERATOR_ACCESS_DENIED_MESSAGE, {
+    details: { code: ConnectErrorDetailCodes.OPERATOR_ACCESS_DENIED },
+  });
   await context.releasePendingNodePairingCleanup();
   context.handler.close(1008, GATEWAY_OPERATOR_ACCESS_DENIED_MESSAGE);
 }

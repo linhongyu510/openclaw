@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { retainSessionListForegroundWork } from "../session-projection-work.js";
 import { bindSessionRowProjection } from "../session-row-projection-access.js";
 import {
   createSessionRowProjection,
@@ -21,8 +22,9 @@ export const resolveRepositoryIdentity = vi.fn(async (checkoutPath: string) => (
 }));
 export const projectsHandlers = createProjectsHandlers({
   listRegistryRecords,
-  resolveRepositoryIdentity,
-} as never);
+  resolveRepositoryIdentities: (roots: string[]) =>
+    Promise.all(roots.map(resolveRepositoryIdentity)),
+});
 
 export async function initializeRepository(
   root: string,
@@ -57,11 +59,13 @@ export async function invokeProjectMethod(
       error?: { code?: string; message?: string };
     } | null;
   } = { result: null };
-  const ownedProjection =
-    !projection && method === "projects.list" && profileId && !params.includeObserved
-      ? await createSessionRowProjection({ cfg, modelCatalog: [] })
-      : undefined;
+  const releaseForegroundWork = retainSessionListForegroundWork();
+  let ownedProjection: SessionRowProjection | undefined;
   try {
+    ownedProjection =
+      !projection && method === "projects.list" && profileId && !params.includeObserved
+        ? await createSessionRowProjection({ cfg, modelCatalog: [] })
+        : undefined;
     await handlers[method]!({
       req: {} as never,
       params,
@@ -81,5 +85,6 @@ export async function invokeProjectMethod(
     return capture.result;
   } finally {
     ownedProjection?.dispose();
+    releaseForegroundWork();
   }
 }

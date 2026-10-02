@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { loadSessionEntry, replaceSessionEntrySync } from "../config/sessions/session-accessor.js";
 import { projectPublicSessionEntry } from "../config/sessions/session-entry-projection.js";
-import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
-import { ensureProfileForEmail, linkEmail } from "../state/user-profiles.js";
+import {
+  closeOpenClawAgentDatabasesAsync,
+  closeOpenClawAgentDatabasesForTest,
+} from "../state/openclaw-agent-db.js";
+import { linkEmail } from "../state/user-profile-writes.worker.js";
+import { ensureProfileForEmail } from "../state/user-profiles.js";
+import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
+import { readMentionStoreSnapshot } from "./mention-inbox-store.js";
 import {
   SESSION_KEY,
   SESSION_ID,
@@ -12,8 +17,6 @@ import {
 } from "./mention-inbox.test-support.js";
 import { identifiedClient } from "./server-methods/sessions-sharing.test-support.js";
 import { listSessionFixture } from "./session-list.test-support.js";
-
-afterEach(() => vi.useRealTimers());
 
 describe("personal session involvement", () => {
   it("includes a mentioned recipient without recording an authored contribution", async () => {
@@ -60,9 +63,9 @@ describe("personal session involvement", () => {
         displayName: "Renamed",
       });
       expect((await list()).sessions).toEqual([]);
-      vi.useFakeTimers();
-      await vi.advanceTimersByTimeAsync(8 * 24 * 60 * 60_000);
-      f.inbox.dispose();
+      await f.clock.advanceBy(8 * 24 * 60 * 60_000);
+      expect(readMentionStoreSnapshot(-1)?.sources).toHaveLength(0);
+      await f.inbox.dispose();
       const restarted = f.openInbox("after-retention");
       f.post("source-one", {}, restarted);
       expect((await list()).sessions).toEqual([]);
@@ -87,13 +90,16 @@ describe("personal session involvement", () => {
       await f.setSession({ displayName: "Existing session", label: "keep-label", pinnedAt: 12345 });
       const existing = loadSessionEntry(scope)!;
       expect(existing).not.toHaveProperty("profileInvolvement");
-      const reopen = () => {
-        f.dispose();
+      let inbox = f.inbox;
+      const reopen = async () => {
+        // Reopen this owner without stopping the fixture's shared scheduler.
+        await inbox.dispose();
+        await closeOpenClawAgentDatabasesAsync();
         closeOpenClawAgentDatabasesForTest();
-        closeOpenClawStateDatabaseForTest();
-        return f.openInbox("cold-reopen");
+        await closeStateDatabaseForTest();
+        inbox = f.openInbox("cold-reopen");
       };
-      let inbox = reopen();
+      await reopen();
       expect(loadSessionEntry(scope)).toEqual(existing);
       f.post("before-restart", {}, inbox);
       const mentioned = loadSessionEntry(scope)!.profileInvolvement!.profiles[f.bob.id]!;
@@ -117,19 +123,19 @@ describe("personal session involvement", () => {
         });
       };
       await setHidden(true);
-      inbox = reopen();
+      await reopen();
       check(true, 1);
       f.post("before-restart", {}, inbox);
       check(true, 1);
       await setHidden(false);
-      reopen();
+      await reopen();
       check(false, 1);
       await setHidden(true);
-      inbox = reopen();
+      await reopen();
       f.post("after-restart", {}, inbox);
       check(false, 2);
       const fresh = loadSessionEntry(scope)!.profileInvolvement;
-      reopen();
+      await reopen();
       check(false, 2);
       expect(loadSessionEntry(scope)!.profileInvolvement).toEqual(fresh);
     });

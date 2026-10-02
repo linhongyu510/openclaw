@@ -139,11 +139,44 @@ suite.define(() => {
             page.evaluate(() => document.activeElement?.getAttribute("data-position-marker-id"));
           const currentMarkerId = () =>
             rail.locator('[aria-current="true"]').getAttribute("data-position-marker-id");
+          const tabIntoCurrentPosition = async () => {
+            // Layout can publish a new reader position between host-side browser calls.
+            const entry = await rail.evaluateHandle((element) => {
+              let currentIds: Array<string | null> = [];
+              let tabStopIds: Array<string | null> = [];
+              const captureEntry = (event: KeyboardEvent) => {
+                if (event.key !== "Tab" || event.shiftKey) {
+                  return;
+                }
+                currentIds = [...element.querySelectorAll('[aria-current="true"]')].map((marker) =>
+                  marker.getAttribute("data-position-marker-id"),
+                );
+                tabStopIds = [...element.querySelectorAll('[tabindex="0"]')].map((marker) =>
+                  marker.getAttribute("data-position-marker-id"),
+                );
+              };
+              element.ownerDocument.addEventListener("keydown", captureEntry, true);
+              return {
+                read: () => ({ currentIds, tabStopIds }),
+                dispose: () =>
+                  element.ownerDocument.removeEventListener("keydown", captureEntry, true),
+              };
+            });
+            try {
+              await page.keyboard.press("Tab");
+              const { currentIds, tabStopIds } = await entry.evaluate((probe) => probe.read());
+              expect(currentIds).toHaveLength(1);
+              expect(currentIds[0]).not.toBeNull();
+              expect(tabStopIds).toEqual(currentIds);
+              await expect.poll(focusedMarkerId).toBe(currentIds[0]);
+            } finally {
+              await entry.evaluate((probe) => probe.dispose());
+              await entry.dispose();
+            }
+          };
           await expect.poll(() => rail.locator('[aria-current="true"]').count()).toBe(1);
           await transcript.focus();
-          const entryId = await currentMarkerId();
-          await page.keyboard.press("Tab");
-          await expect.poll(focusedMarkerId).toBe(entryId);
+          await tabIntoCurrentPosition();
           await page.keyboard.press("Home");
           await page.keyboard.press("ArrowDown");
           await expect.poll(focusedMarkerId).toBe("position-rail-1");
@@ -155,9 +188,7 @@ suite.define(() => {
           await page.keyboard.press("Tab");
           expect(await focusedMarkerId()).toBeNull();
           await transcript.focus();
-          const reentryId = await currentMarkerId();
-          await page.keyboard.press("Tab");
-          await expect.poll(focusedMarkerId).toBe(reentryId);
+          await tabIntoCurrentPosition();
           await captureUiProof(suite, page, "chat-position-rail", "native-tab-reentry.png");
           await page.keyboard.press("Shift+Tab");
           expect(await transcript.evaluate((element) => element === document.activeElement)).toBe(
@@ -361,6 +392,7 @@ suite.define(() => {
 
           const composer = page.locator(".agent-chat__composer-combobox textarea");
           await composer.focus();
+          await expect.poll(visibilityMatchesViewport).toBe(true);
           const strokeColors = () =>
             markers.evaluateAll((items) =>
               items.map(
@@ -369,22 +401,25 @@ suite.define(() => {
                     .backgroundColor,
               ),
             );
-          const restingColors = await strokeColors();
+          // The tick animates its background after visibility changes. Capture
+          // each marker's target color, not a transient animation frame.
+          const restingColors = await markers.evaluateAll((items) =>
+            items.map((item) => getComputedStyle(item).color),
+          );
           await markerForIndex(4).hover();
           await expect.poll(() => preview.textContent()).toContain("Transcript checkpoint 4");
-          await expect
-            .poll(() =>
-              markers.evaluateAll((items) =>
-                items
-                  .slice(0, 9)
-                  .map((item) =>
-                    Number.parseFloat(
-                      getComputedStyle(item.querySelector(".chat-position-rail__tick")!).width,
-                    ),
+          const waveWidths = () =>
+            markers.evaluateAll((items) =>
+              items
+                .slice(0, 9)
+                .map((item) =>
+                  Number.parseFloat(
+                    getComputedStyle(item.querySelector(".chat-position-rail__tick")!).width,
                   ),
-              ),
-            )
-            .toEqual([8, 12, 16, 24, 32, 24, 16, 12, 8]);
+                ),
+            );
+          const expectedWave = [8, 12, 16, 24, 32, 24, 16, 12, 8];
+          await expect.poll(waveWidths).toEqual(expectedWave);
           await expect
             .poll(strokeColors)
             .toEqual(restingColors.map((color, index) => (index === 4 ? colors.text : color)));
@@ -399,8 +434,13 @@ suite.define(() => {
           );
           expect(await preview.textContent()).toContain("Transcript checkpoint 4");
           await captureUiProof(suite, page, "chat-position-rail", "hover-reading.png");
+          await expect.poll(waveWidths).toEqual(expectedWave);
+          await expect
+            .poll(strokeColors)
+            .toEqual(restingColors.map((color, index) => (index === 4 ? colors.text : color)));
           await page.keyboard.press("Escape");
           await expect.poll(() => preview.count()).toBe(0);
+          await expect.poll(strokeSizes).toEqual(["8px × 2px"]);
           expect(await composer.evaluate((element) => element === document.activeElement)).toBe(
             true,
           );

@@ -18,6 +18,7 @@ import { createMountedPanes, refreshPane } from "./chat-pane-mounted.test-suppor
 import { renderChatPaneComposerControls } from "./chat-pane-session-controls.ts";
 import type { TestChatPane } from "./chat-pane.test-support.ts";
 import { readChatInputRunIds } from "./chat-pending-inputs.ts";
+import type { ChatPageHost } from "./chat-state-host.ts";
 import { refreshPageChat } from "./chat-state-refresh.ts";
 import { selectedChatSessionRow } from "./chat-state-route.ts";
 import { renderChatPermissionPicker } from "./components/chat-permission-picker.ts";
@@ -27,11 +28,80 @@ import {
 } from "./components/chat-transcript.test-support.ts";
 import { reduceChatSessionProjection } from "./history-merge.ts";
 import { adoptStartedChatRun } from "./run-lifecycle.ts";
+import { RealtimeTalkSession } from "./talk/session.ts";
 
 beforeEach(installTranscriptDomMocks);
 afterEach(resetTranscriptTestDom);
 
+function globalSession(
+  agentId: string,
+  overrides: Partial<GatewaySessionRow> = {},
+): GatewaySessionRow {
+  return {
+    key: "global",
+    agentId,
+    sessionId: `${agentId}-global`,
+    kind: "global",
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+function composerControls(state: ChatPageHost, agentDefaultModel?: string) {
+  return renderChatPaneComposerControls({
+    state,
+    selectedSession: selectedChatSessionRow(state),
+    agentDefaultModel,
+    modelAccess: { allowed: true, requiredScope: "operator.write" },
+    effortAccess: { allowed: true, requiredScope: "operator.write" },
+    contextWindowAccess: { allowed: true, requiredScope: "operator.write" },
+    permissionAccess: { allowed: true, requiredScope: "operator.write" },
+    canSelectFull: true,
+    onModelSetup: vi.fn(),
+  });
+}
+
 describe("mounted pane session event ownership", () => {
+  it("retires Talk on a provider pause and prevents it from starting again", async () => {
+    const row: GatewaySessionRow = {
+      key: "agent:main:provider-pause",
+      agentId: "main",
+      sessionId: "provider-pause",
+      kind: "direct",
+      updatedAt: 1,
+    };
+    const { sessions, mount, emitGatewayEvent } = createMountedPanes([row]);
+    await sessions.refresh({ agentId: "main", force: true });
+    const pane = mount(row.key);
+    await refreshPane(pane);
+    const client = pane.state.client;
+    if (!client) {
+      throw new Error("Expected connected pane");
+    }
+    const talk = new RealtimeTalkSession(client, row.key);
+    const stop = vi.spyOn(talk, "stop").mockResolvedValue(undefined);
+    pane.state.realtimeTalkSession = talk;
+    pane.state.realtimeTalkActive = true;
+    emitGatewayEvent("sessions.changed", {
+      sessionKey: row.key,
+      agentId: "main",
+      session: {
+        ...row,
+        updatedAt: 2,
+        providerReview: {
+          id: "provider-review",
+          runId: "stopped-run",
+          canContinue: false,
+        },
+      },
+    });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(pane.state.realtimeTalkSession).toBeNull();
+    expect(pane.state.realtimeTalkActive).toBe(false);
+    await pane.state.toggleRealtimeTalk();
+    expect(pane.state.realtimeTalkSession).toBeNull();
+  });
+
   it("publishes one shared event and applies its message to every mounted pane", async () => {
     const row: GatewaySessionRow = {
       key: "agent:main:shared",
@@ -90,13 +160,7 @@ describe("mounted pane session event ownership", () => {
   ] as const)(
     "keeps a foreign $key descriptor after history refresh without changing primary membership (archived: $archived)",
     async ({ key, kind, archived }) => {
-      const primary: GatewaySessionRow = {
-        key: "global",
-        agentId: "main",
-        sessionId: "main-global",
-        kind: "global",
-        updatedAt: 1,
-      };
+      const primary = globalSession("main");
       const selected: GatewaySessionRow = {
         key,
         agentId: "research",
@@ -144,7 +208,7 @@ describe("mounted pane session event ownership", () => {
   );
 
   it.each([false, true])(
-    "keeps a same-key successor and its first message after retirement (reentrant publication: %s)",
+    "keeps a same-key successor when its old descriptor retires (reentrant publication: %s)",
     async (reentrant) => {
       const previous: GatewaySessionRow = {
         key: "agent:main:replaced",
@@ -160,8 +224,21 @@ describe("mounted pane session event ownership", () => {
         updatedAt: 3,
         label: "Newest session",
       };
+      const message = {
+        role: "user",
+        content: "First message in the successor session",
+        __openclaw: { id: "successor-first-message", seq: 1 },
+      };
       const listed = [previous];
-      const { sessions, mount, emitGatewayEvent } = createMountedPanes(listed);
+      const history = () => ({
+        messages: listed[0]?.sessionId === next.sessionId ? [message] : [],
+        sessionInfo: listed[0],
+        sessionId: listed[0]?.sessionId,
+      });
+      const { sessions, mount, emitGatewayEvent } = createMountedPanes(listed, "main", undefined, {
+        "chat.history": history,
+        "chat.startup": history,
+      });
       let armed = false;
       const unsubscribe = sessions.subscribe((state) => {
         if (armed && state.result?.sessions.some((row) => row.sessionId === next.sessionId)) {
@@ -179,45 +256,29 @@ describe("mounted pane session event ownership", () => {
       listed.splice(0, 1, next);
       await sessions.refresh({ agentId: "main", force: true });
       expect(selectedChatSessionRow(pane.state)).toMatchObject(reentrant ? newest : next);
-      await pane.updateComplete;
-
       emitGatewayEvent("session.message", {
         sessionKey: next.key,
         agentId: "main",
         sessionId: next.sessionId,
-        hasActiveRun: true,
-        messageId: "successor-user",
+        messageId: "successor-first-message",
         messageSeq: 1,
-        message: {
-          role: "user",
-          content: "First successor prompt",
-          __openclaw: { id: "successor-user", seq: 1 },
-        },
-        session: { ...next, updatedAt: 4, hasActiveRun: true, status: "running" },
+        message,
+        session: { ...(reentrant ? newest : next), updatedAt: 4 },
       });
-      expect(pane.state.chatMessages).toContainEqual(
-        expect.objectContaining({ role: "user", content: "First successor prompt" }),
-      );
+      expect.soft(pane.state.currentSessionId).toBe(previous.sessionId);
+      expect.soft(pane.state.chatMessages).toEqual([]);
+      await refreshPane(pane);
+      expect(pane.state.currentSessionId).toBe(next.sessionId);
+      expect(pane.state.chatMessages).toContainEqual(expect.objectContaining(message));
     },
   );
 
   it("does not admit fenced hidden history and hydrates its foreign descriptor when presented", async () => {
-    const primary: GatewaySessionRow = {
-      key: "global",
-      agentId: "main",
-      sessionId: "main-global",
-      kind: "global",
-      updatedAt: 1,
-    };
-    const original: GatewaySessionRow = {
-      key: "global",
-      agentId: "research",
-      sessionId: "research-global",
-      kind: "global",
+    const primary = globalSession("main");
+    const original = globalSession("research", {
       archived: true,
-      updatedAt: 1,
       label: "Earlier history",
-    };
+    });
     const latest = { ...original, updatedAt: 2, label: "Current research session" };
     const oldHistory = createDeferred<ChatHistoryResult>();
     const freshHistory = createDeferred<ChatHistoryResult>();
@@ -259,8 +320,8 @@ describe("mounted pane session event ownership", () => {
     vi.spyOn(sessions, "observeRow").mockImplementation((target, listener, options) => {
       const observation = observeRow(
         target,
-        (row) => {
-          listener(row);
+        (row, notification) => {
+          listener(row, notification);
           if (
             options?.onEvent &&
             row !== null &&
@@ -462,17 +523,7 @@ describe("mounted pane session event ownership", () => {
         adoptStartedChatRun(state, "current-run", 2);
         const container = document.createElement("div");
         const draw = () => {
-          const controls = renderChatPaneComposerControls({
-            state,
-            selectedSession: selectedChatSessionRow(state),
-            agentDefaultModel: "example/primary",
-            modelAccess: { allowed: true, requiredScope: "operator.write" },
-            effortAccess: { allowed: true, requiredScope: "operator.write" },
-            contextWindowAccess: { allowed: true, requiredScope: "operator.write" },
-            permissionAccess: { allowed: true, requiredScope: "operator.write" },
-            canSelectFull: true,
-            onModelSetup: vi.fn(),
-          });
+          const controls = composerControls(state, "example/primary");
           render(controls.composerControls, container);
           return container.querySelector<HTMLElement>("[data-chat-model-select]");
         };
@@ -507,25 +558,15 @@ describe("mounted pane session event ownership", () => {
   );
 
   it("projects an admitted equal-clock terminal descriptor while a newer local run continues", async () => {
-    const primary: GatewaySessionRow = {
-      key: "global",
-      agentId: "main",
-      sessionId: "main-global",
-      kind: "global",
-      updatedAt: 100,
-    };
-    const running: GatewaySessionRow = {
-      key: "global",
-      agentId: "research",
-      sessionId: "research-global",
-      kind: "global",
+    const primary = globalSession("main", { updatedAt: 100 });
+    const running = globalSession("research", {
       updatedAt: 100,
       startedAt: 50,
       hasActiveRun: true,
       status: "running",
       activeRunIds: ["completed-run"],
       lastRunId: "completed-run",
-    };
+    });
     const terminal = {
       key: running.key,
       agentId: running.agentId,
@@ -578,6 +619,10 @@ describe("mounted pane session event ownership", () => {
         runId: "newer-run",
         state: "delta",
         deltaText: "The newer run continues.",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "The newer run continues." }],
+        },
       });
       expect(continuing.state.chatStream).toBe("The newer run continues.");
       holdLaterReads = true;
@@ -613,22 +658,11 @@ describe("mounted pane session event ownership", () => {
   });
 
   it("recovers a foreign pane's permission picker from history after scoped readback fails", async () => {
-    const primary: GatewaySessionRow = {
-      key: "global",
-      agentId: "main",
-      sessionId: "main-global",
-      kind: "global",
-      updatedAt: 1,
-    };
-    const selected: GatewaySessionRow = {
-      key: "global",
-      agentId: "research",
-      sessionId: "research-global",
-      kind: "global",
-      updatedAt: 1,
+    const primary = globalSession("main");
+    const selected = globalSession("research", {
       permissionMode: "workspace",
       label: "Initial research session",
-    };
+    });
     const observed = { ...selected, label: "Observed research session" };
     const recovered = { ...observed, label: "Recovered through history" };
     const historyReply = createDeferred<ChatHistoryResult>();
@@ -681,26 +715,14 @@ describe("mounted pane session event ownership", () => {
       });
       expect(descriptor.row).toMatchObject(observed);
       expect(selectedChatSessionRow(state)).toMatchObject(observed);
-      const controls = () =>
-        renderChatPaneComposerControls({
-          state,
-          selectedSession: selectedChatSessionRow(state),
-          agentDefaultModel: undefined,
-          modelAccess: { allowed: true, requiredScope: "operator.write" },
-          effortAccess: { allowed: true, requiredScope: "operator.write" },
-          contextWindowAccess: { allowed: true, requiredScope: "operator.write" },
-          permissionAccess: { allowed: true, requiredScope: "operator.write" },
-          canSelectFull: true,
-          onModelSetup: vi.fn(),
-        });
       const container = document.createElement("div");
       const draw = () => {
-        render(renderChatPermissionPicker(controls().permissionPicker), container);
+        render(renderChatPermissionPicker(composerControls(state).permissionPicker), container);
         return container.querySelector<HTMLButtonElement>("[data-chat-permission-select]");
       };
       expect(draw()?.dataset.chatSelectValue).toBe("workspace");
 
-      await controls().permissionPicker.onSelect("full");
+      await composerControls(state).permissionPicker.onSelect("full");
       expect(patch.mock.calls[0]?.[1]).toMatchObject({
         key: "global",
         agentId: "research",
@@ -909,13 +931,14 @@ describe("mounted pane session event ownership", () => {
           }
         };
         assertProjection();
+        expect(delivered).toHaveBeenCalledOnce();
         if (generation === "stale") {
-          expect(delivered).not.toHaveBeenCalled();
-        } else {
-          expect(delivered).toHaveBeenCalledOnce();
-          if (generation === "rowless" || reentrant) {
-            expect(delivered.mock.calls[0]?.[1]).toEqual({ applied: false });
-          }
+          expect(delivered.mock.calls[0]?.[1]).toEqual({
+            applied: false,
+            generationRejected: true,
+          });
+        } else if (generation === "rowless" || reentrant) {
+          expect(delivered.mock.calls[0]?.[1]).toEqual({ applied: false });
         }
         laterHistory.reject(new Error("Incarnation history temporarily unavailable"));
         await refresh;

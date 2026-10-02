@@ -6,6 +6,7 @@ import { createStorageMock } from "../../test-helpers/storage.ts";
 import { chatOutboxOwner, listChatOutboxAttention } from "./chat-outbox-owner.ts";
 import {
   admitStoredChatComposerQueueItem,
+  loadChatComposerSnapshot,
   removeStoredChatComposerQueueItem,
 } from "./composer-persistence.ts";
 
@@ -46,6 +47,7 @@ it("projects only actionable submissions, without message or diagnostic content"
     "submitting",
     "failed",
     "unconfirmed",
+    "held",
   ] as const) {
     const row = { ...item(String(state), state), sendError: "private diagnostic" };
     expect(
@@ -57,7 +59,7 @@ it("projects only actionable submissions, without message or diagnostic content"
     ).toBe(true);
   }
   const attention = listChatOutboxAttention(host);
-  expect(attention.map((row) => row.id)).toEqual(["failed", "unconfirmed"]);
+  expect(attention.map((row) => row.id)).toEqual(["failed", "unconfirmed", "held"]);
   expect(JSON.stringify(attention)).not.toMatch(/Private message|private diagnostic/);
   expect(attention[1]).toMatchObject({ unconfirmed: true, command: false, ...scope });
   expect(listChatOutboxAttention({ ...host, settings: { gatewayUrl: "ws://other.test" } })).toEqual(
@@ -90,8 +92,15 @@ it("does not mistake an active settings wait or send overlay for a failed messag
 
 it("retains incidents through failed removal and clears them only after canonical retirement", () => {
   const host = hostFor();
-  const row = item("review", "unconfirmed");
-  admitStoredChatComposerQueueItem(host, captureChatOutboxAdmission(host, host.sessionKey), row);
+  const input = item("review", "unconfirmed");
+  expect(
+    admitStoredChatComposerQueueItem(
+      host,
+      captureChatOutboxAdmission(host, host.sessionKey),
+      input,
+    ),
+  ).toBe(true);
+  const row = loadChatComposerSnapshot(host, host.sessionKey)!.queue[0]!;
   expect(listChatOutboxAttention(host)).toHaveLength(1);
   const write = vi.spyOn(sessionStorage, "setItem").mockImplementation(() => {
     throw new Error("quota");

@@ -1,7 +1,7 @@
 import type { CliBackendConfig } from "../../plugins/cli-backend.types.js";
 import type { BootstrapMode } from "../bootstrap-mode.js";
 import { hashCliSessionText } from "../cli-session.js";
-import type { EmbeddedContextFile } from "../embedded-agent-helpers.js";
+import type { EmbeddedContextFile } from "../embedded-agent-helpers/context-file.js";
 
 export function canTransportSystemPrompt(backend: CliBackendConfig): boolean {
   return (
@@ -19,9 +19,7 @@ export function resolveCliBootstrapPromptHash(params: {
   bootstrapTruncationNotice?: string;
   contextFiles: EmbeddedContextFile[];
 }): string | undefined {
-  const personal = params.contextFiles.filter((file) =>
-    /[\\/]users[\\/][^\\/]+[\\/]USER\.md$/.test(file.path),
-  );
+  const personal = params.contextFiles.filter((file) => file.personalUser);
   if (
     params.bootstrapMode === "none" &&
     params.bootstrapTruncationNotice === undefined &&

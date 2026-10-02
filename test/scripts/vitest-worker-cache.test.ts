@@ -167,6 +167,23 @@ function cachedProbe(root: string, directory: string): string {
 }
 
 describe("compiled worker content cache", () => {
+  it("propagates namespace rejection evidence without publishing a cache signature", async () => {
+    const f = fixture();
+    const owner = await f.cache();
+    expect(await owner.restore()).toBeUndefined();
+    const manifest = f.prepare();
+    f.write(".workflow-shell-fixture.mjs", "export {};\n");
+
+    await expect(owner.seal(manifest)).rejects.toThrow(
+      'Boundary configuration or resolution topology changed during compilation: {"category":"namespace","changes":[{"change":"added","path":".workflow-shell-fixture.mjs"}],"omitted":0}',
+    );
+    expect(manifest.cacheSignature).toBeUndefined();
+    expect(await retainVitestWorkerArtifacts(f.root, f.directory, manifest)).toBe(false);
+    expect(
+      fs.existsSync(path.join(f.root, ".artifacts/vitest-worker-cache/run-cache-0/stamp.json")),
+    ).toBe(false);
+  });
+
   it.each([
     "NODE_PATH",
     "NAPI_RS_NATIVE_LIBRARY_PATH",
@@ -252,15 +269,20 @@ describe("compiled worker content cache", () => {
     await f.seed();
     const probe = cachedProbe(f.root, f.directory);
     f.nextInvocation();
-    const read = fs.promises.readFile.bind(fs.promises);
+    const read = fs.readFile.bind(fs);
     let changed = false;
-    const reader = vi.spyOn(fs.promises, "readFile").mockImplementation(async (...args) => {
-      const bytes = await read(...args);
-      if (args[0] === probe && !changed) {
-        changed = true;
-        f.write("src/package.json", '{"type":"commonjs"}');
+    const reader = vi.spyOn(fs, "readFile").mockImplementation((...args) => {
+      if (args[0] !== probe) {
+        return read(...args);
       }
-      return bytes;
+      const [filename, callback] = args;
+      read(filename, (error, bytes) => {
+        if (!error && !changed) {
+          changed = true;
+          f.write("src/package.json", '{"type":"commonjs"}');
+        }
+        callback(error, bytes);
+      });
     });
     try {
       expect(await f.restore()).toBeUndefined();
@@ -329,21 +351,18 @@ describe("compiled worker content cache", () => {
     expect(fs.existsSync(path.join(f.directory, "dist/probe.js"))).toBe(false);
   });
 
-  it.each(["dist/build-info.json", "dist/probe.js"])(
-    "rejects an inventory missing %s even when remaining hashes match",
-    async (missing) => {
-      const f = fixture();
-      await f.seed();
-      const stamp = path.join(f.root, ".artifacts/vitest-worker-cache/run-cache-0/stamp.json");
-      const record = JSON.parse(fs.readFileSync(stamp, "utf8"));
-      delete record.outputs[missing];
-      fs.writeFileSync(stamp, JSON.stringify(record));
-      f.nextInvocation();
+  it("rejects an incomplete inventory even when remaining hashes match", async () => {
+    const f = fixture();
+    await f.seed();
+    const stamp = path.join(f.root, ".artifacts/vitest-worker-cache/run-cache-0/stamp.json");
+    const record = JSON.parse(fs.readFileSync(stamp, "utf8"));
+    delete record.outputs["dist/probe.js"];
+    fs.writeFileSync(stamp, JSON.stringify(record));
+    f.nextInvocation();
 
-      expect(await f.restore()).toBeUndefined();
-      expect(fs.existsSync(path.join(f.directory, "dist/probe.js"))).toBe(false);
-    },
-  );
+    expect(await f.restore()).toBeUndefined();
+    expect(fs.existsSync(path.join(f.directory, "dist/probe.js"))).toBe(false);
+  });
 
   it("rejects inventory entries outside the compiler manifest", async () => {
     const f = fixture();

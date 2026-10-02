@@ -17,6 +17,11 @@ export type {
 
 export type SessionEntryStatus = NonNullable<SessionEntry["status"]>;
 
+export type SessionEntryStatusSelection = {
+  statuses: readonly SessionEntryStatus[];
+  presenceOnly?: boolean;
+};
+
 export type SessionTranscriptContextVersion = {
   generation: string | null;
   rawSeq: number | null;
@@ -33,13 +38,20 @@ export type CanonicalSessionValidationResult = {
 /** Worker operation facts; no Worker object or plan payload is retained. */
 export type SqliteSessionReclamationDiagnostics = {
   kind?:
+    | "archive-publish-prepare"
+    | "archive-publish-record"
+    | "deletion-plan"
     | "entry"
     | "lifecycle-artifacts"
+    | "lifecycle-projection-plan"
+    | "lifecycle-projection-commit"
+    | "lifecycle-projection-count"
     | "history-eviction"
     | "historical-generation"
     | "maintenance-plan"
     | "maintenance-finalize"
     | "maintenance-statistics"
+    | "maintenance-age"
     | "maintenance-pages"
     | "cold-batch"
     | "cold-maintain"
@@ -78,9 +90,6 @@ export type SqliteSessionArtifactPreparationDiagnostics =
 /** One pruning attempt retains only aggregate stage observations. */
 export type SqliteSessionArchivePruningDiagnostics = {
   trigger: "initial" | "after-eviction" | "final";
-  admissionMs?: number;
-  cachedAdmissions?: number;
-  asyncAdmissions?: number;
   checkpointCalls?: number;
   checkpointIncomplete?: number;
   checkpoint?: SqliteWalHealth;
@@ -107,7 +116,6 @@ export type SqliteSessionArchivePruningDiagnostics = {
 
 export type SqliteSessionWriteDiagnostics = SqliteSessionReclamationDiagnostics & {
   artifactPreparation?: SqliteSessionArtifactPreparationDiagnostics;
-  archivePruning?: SqliteSessionArchivePruningDiagnostics;
   reclamationAdmission?: SqliteSessionReclamationAdmissionDiagnostics;
 };
 

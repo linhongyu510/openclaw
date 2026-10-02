@@ -1,3 +1,4 @@
+import "../../../test-utils/prepare-compiled-subprocesses.js";
 import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +18,47 @@ afterEach(() => {
 });
 
 describe("authenticated request completion", { concurrent: false }, () => {
+  it.each(["return", "throw"])(
+    "holds reconnect capacity through handler settlement (%s)",
+    async (outcome) => {
+      const held = createDeferredCore();
+      const full = createDeferredCore();
+      const starts: string[] = [];
+      vi.resetModules();
+      vi.doMock("./authenticated-request-dispatch.server-methods.runtime.js", () => ({
+        handleGatewayRequest: async ({ req, respond }: GatewayRequestOptions) => {
+          starts.push(req.id);
+          respond(true);
+          if (starts.length === 4) {
+            void nextTurn().then(full.resolve);
+          }
+          await held.promise;
+          if (outcome === "throw") {
+            throw new Error("synthetic preparation failure");
+          }
+        },
+      }));
+      const { createDispatchTestHarness, createOperatorWsClient } =
+        await import("./authenticated-request-dispatch.test-support.js");
+      const harness = createDispatchTestHarness();
+      const client = createOperatorWsClient();
+      const calls = Array.from({ length: 8 }, (_, index) =>
+        harness.dispatcher.dispatch(
+          { type: "req", id: String(index), method: "sessions.subscribe", params: {} },
+          client,
+        ),
+      );
+      try {
+        await full.promise;
+        expect(starts).toEqual(["0", "1", "2", "3"]);
+      } finally {
+        held.resolve();
+        await Promise.all(calls);
+      }
+      expect(starts).toEqual(["0", "1", "2", "3", "4", "5", "6", "7"]);
+    },
+  );
+
   it.for(["lazy import", "start scheduler"] as const)(
     "rejects access revoked during %s before entering the handler",
     async (stage, { signal }) => {
@@ -63,6 +105,7 @@ describe("authenticated request completion", { concurrent: false }, () => {
         signal.removeEventListener("abort", unblock);
       }
       expect(handleGatewayRequest).not.toHaveBeenCalled();
+      expect([...harness.clients.authorityClients]).toEqual([]);
     },
   );
 
@@ -130,6 +173,7 @@ describe("authenticated request completion", { concurrent: false }, () => {
         });
         vi.doMock("../../session-sharing-target-input.js", () => ({
           resolveDirectIncognitoTargets: () => [],
+          resolveDirectSessionTargets: () => [],
         }));
         vi.doMock("../../server-methods/gateway-personal-caller.js", () => ({
           isSyntheticGatewayCaller: () => false,
@@ -168,6 +212,7 @@ describe("authenticated request completion", { concurrent: false }, () => {
         await entered.promise;
         await nextTurn();
         expect.soft(dispatched, `${stage} is still executing`).toBe(false);
+        expect([...harness.clients.authorityClients]).toEqual([client]);
       } finally {
         // Join the handler independently: the broken dispatcher returns before it finishes.
         unblock();
@@ -177,6 +222,7 @@ describe("authenticated request completion", { concurrent: false }, () => {
       }
       expect(selectedRoot).toBe(initialRoot);
       expect(dispatched).toBe(true);
+      expect([...harness.clients.authorityClients]).toEqual([]);
     },
   );
 });

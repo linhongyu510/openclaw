@@ -1,25 +1,26 @@
 import { expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { getActiveGatewayRootWorkCount } from "../../process/gateway-work-admission.js";
+import { tryBeginGatewayIndependentRootWorkAdmission } from "../../process/gateway-work-admission.js";
 import * as stateRead from "../../state/openclaw-state-db-readonly.js";
 import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
+import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
+import { readCronRunHistoryPageForTests } from "../run-history.test-support.js";
 import { setupCronServiceSuite, writeCronStoreSnapshot } from "../service.test-harness.js";
 import * as cronStore from "../store.js";
 import { loadCronStore } from "../store.js";
 import { cronStoreKey } from "../store/key.js";
 import {
-  claimCronRunReceiptInDatabase,
   prepareCronRunReceiptClaim,
   releaseLocalCronRunReceiptOwnership,
 } from "../store/run-receipt-store.js";
 import {
+  claimCronRunReceiptInDatabaseForTest,
   inspectActiveCronRunReceipt,
   makeCronRecoveryJob,
 } from "../store/run-receipt-store.test-support.js";
-import { readCronTaskRunHistoryPage } from "../task-run-history.js";
 import { start, stop } from "./ops-lifecycle.js";
+import { observeCronTimerAdmissions } from "./run-recovery.test-support.js";
 import { createCronServiceState } from "./state.js";
-import { tryCreateCronTaskRunHandle } from "./task-runs.js";
 import { onTimer } from "./timer.test-support.js";
 
 const { logger, makeStorePath } = setupCronServiceSuite({ prefix: "cron-recovery-batch-" });
@@ -35,6 +36,7 @@ async function seedInterruptedBatch() {
   const onEvent = vi.fn();
   const runner = vi.fn(async () => ({ status: "ok" as const }));
   const state = createCronServiceState({
+    scheduler: createTestGatewayScheduler(),
     storePath,
     cronEnabled: true,
     defaultAgentId: "alpha",
@@ -50,19 +52,26 @@ async function seedInterruptedBatch() {
   await writeCronStoreSnapshot({ storePath, jobs });
   for (const job of jobs) {
     const startedAtMs = job.state.runningAtMs!;
-    const prepared = prepareCronRunReceiptClaim({ storePath, job, agentId: "alpha", startedAtMs });
+    const prepared = prepareCronRunReceiptClaim({
+      observed: undefined,
+      storePath,
+      job,
+      agentId: "alpha",
+      startedAtMs,
+    });
     const receipt = runOpenClawStateWriteTransaction(({ db }) =>
-      claimCronRunReceiptInDatabase({ database: db, prepared, resolveAgentId: () => "alpha" }),
+      claimCronRunReceiptInDatabaseForTest({
+        database: db,
+        prepared,
+        resolveAgentId: () => "alpha",
+      }),
     );
     job.state.runningReceiptId = receipt.receiptId;
-    expect(
-      tryCreateCronTaskRunHandle({ state, job, startedAt: startedAtMs, runReceipt: receipt }),
-    ).toBeDefined();
     releaseLocalCronRunReceiptOwnership(receipt);
   }
   await writeCronStoreSnapshot({ storePath, jobs });
   const history = (jobId: string) =>
-    readCronTaskRunHistoryPage({ storeKey: cronStoreKey(storePath), jobId }).entries;
+    readCronRunHistoryPageForTests({ storeKey: cronStoreKey(storePath), jobId }).entries;
   return { storePath, jobs, state, onEvent, runner, history };
 }
 
@@ -82,11 +91,15 @@ it("defers every repair when restart crosses the batch observation", async () =>
       }
       return result;
     });
-  const rootWorkBefore = getActiveGatewayRootWorkCount();
+  const unrelated = tryBeginGatewayIndependentRootWorkAdmission("test:concurrent-request");
+  expect(unrelated).not.toBeNull();
+  const admissions = observeCronTimerAdmissions(state);
   const tick = onTimer(state);
   let restarted: Promise<void> | undefined;
   try {
     await entered.promise;
+    unrelated!.release();
+    await admissions.expectActive();
     const observed = await loadCronStore(storePath);
     const beforeStop = {
       firstRunningAtMs: observed.jobs.find((job) => job.id === "first")?.state.runningAtMs ?? null,
@@ -122,8 +135,10 @@ it("defers every repair when restart crosses the batch observation", async () =>
     expect(runner).not.toHaveBeenCalled();
     expect(state.activeTimerTicks).toBe(0);
     expect(state.queuedRunReservationsByJobId.size).toBe(0);
-    expect(getActiveGatewayRootWorkCount()).toBe(rootWorkBefore);
+
+    await admissions.expectReleased(1);
   } finally {
+    unrelated!.release();
     release.resolve();
     await Promise.allSettled([tick, ...(restarted ? [restarted] : [])]);
     delayed.mockRestore();
@@ -136,7 +151,7 @@ it.each([
   ["startup", start],
 ] as const)(
   "publishes committed interruptions before retiring %s held at its reload",
-  async (_, run) => {
+  async (source, run) => {
     const { storePath, jobs, state, onEvent, runner, history } = await seedInterruptedBatch();
     const entered = createDeferred();
     const release = createDeferred();
@@ -152,11 +167,14 @@ it.each([
         }
         return result;
       });
-    const rootWorkBefore = getActiveGatewayRootWorkCount();
+    const admissions = observeCronTimerAdmissions(state);
     const tick = run(state);
     let restarted: Promise<void> | undefined;
     try {
       await entered.promise;
+      if (source === "timer") {
+        await admissions.expectActive();
+      }
       const committed = await loadCronStore(storePath);
       for (const job of jobs) {
         const stored = committed.jobs.find((entry) => entry.id === job.id);
@@ -204,7 +222,8 @@ it.each([
       expect(state.runAdmission.active).toBe(0);
       expect(state.runAdmission.waiters).toEqual([]);
       expect(state.queuedRunReservationsByJobId.size).toBe(0);
-      expect(getActiveGatewayRootWorkCount()).toBe(rootWorkBefore);
+
+      await admissions.expectReleased(source === "timer" ? 1 : 0);
     } finally {
       release.resolve();
       await Promise.allSettled([tick, ...(restarted ? [restarted] : [])]);

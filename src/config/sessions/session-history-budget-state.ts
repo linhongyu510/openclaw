@@ -1,5 +1,9 @@
 import { sqliteReaderDatabasePathKey } from "../../infra/sqlite-reader-lifecycle.js";
-import { onSqliteWalCheckpoint, type SqliteWalHealth } from "../../infra/sqlite-wal-checkpoint.js";
+import {
+  onSqliteWalCheckpoint,
+  type SqliteWalCheckpointSnapshot,
+  type SqliteWalHealth,
+} from "../../infra/sqlite-wal-checkpoint.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { SessionDiskBudgetSweepResult } from "./disk-budget.types.js";
 import type { ResolvedSessionMaintenanceConfig } from "./store-maintenance.js";
@@ -59,6 +63,12 @@ export type SessionHistoryBudgetKick = {
   force?: boolean;
 };
 
+export type SessionHistoryCheckpointGate = {
+  databasePath: string;
+  afterNs: bigint;
+  completedAtNs: bigint;
+};
+
 type BudgetKickState = {
   budget: SessionHistoryDiskBudgetParams["maintenance"];
   lastCheckAt: number;
@@ -66,21 +76,24 @@ type BudgetKickState = {
   running: boolean;
   pendingForce?: SessionHistoryBudgetKick;
   blockedUntil?: number;
-  checkpointBlocked?: { databasePath: string; checkpoint?: SqliteWalHealth; warned?: boolean };
+  checkpointGate?: SessionHistoryCheckpointGate;
+  checkpointBlocked?: {
+    checkpoint?: SqliteWalCheckpointSnapshot;
+    warned?: boolean;
+  };
 };
 
 export const budgetKickStateByStore = new Map<string, BudgetKickState>();
 
-onSqliteWalCheckpoint(({ databasePath, health }) => {
-  if (health.state !== "complete") {
-    return;
-  }
+onSqliteWalCheckpoint(({ databasePath, health, observedAtNs, lastCompletedAtNs }) => {
+  const completedAtNs = health.state === "complete" ? observedAtNs : (lastCompletedAtNs ?? 0n);
   for (const state of budgetKickStateByStore.values()) {
-    // Worker messages can arrive after a newer parent-side observation.
-    if (
-      state.checkpointBlocked?.databasePath === databasePath &&
-      health.observedAtMs >= (state.checkpointBlocked.checkpoint?.observedAtMs ?? -Infinity)
-    ) {
+    const gate = state.checkpointGate;
+    if (!gate || gate.databasePath !== databasePath || completedAtNs <= gate.completedAtNs) {
+      continue;
+    }
+    gate.completedAtNs = completedAtNs;
+    if (state.checkpointBlocked && completedAtNs >= gate.afterNs) {
       state.checkpointBlocked = undefined;
       state.blockedUntil = undefined;
       state.lastCheckAt = -Infinity;
@@ -92,10 +105,15 @@ onSqliteWalCheckpoint(({ databasePath, health }) => {
 export function deferPhysicalBudgetForCheckpoint(
   params: SessionHistoryDiskBudgetParams,
   databasePath: string,
-  checkpoint: SqliteWalHealth | undefined,
+  checkpoint: SqliteWalCheckpointSnapshot | undefined,
 ): void {
   const state = getBudgetKickState(params.storePath, params.maintenance);
-  state.checkpointBlocked = { databasePath: sqliteReaderDatabasePathKey(databasePath), checkpoint };
+  state.checkpointGate ??= {
+    databasePath: sqliteReaderDatabasePathKey(databasePath),
+    afterNs: checkpoint?.observedAtNs ?? process.hrtime.bigint(),
+    completedAtNs: 0n,
+  };
+  state.checkpointBlocked = { checkpoint };
 }
 
 export function getBudgetKickState(
@@ -146,8 +164,19 @@ export function recordPhysicalBudgetOutcome(
     });
     return;
   }
+  state.checkpointGate = undefined;
   if (result.totalBytesAfter <= result.maxBytes) {
     state.blockedUntil = undefined;
+    if (result.overBudget) {
+      log.info("session history disk budget cleanup completed", {
+        storePath: params.storePath,
+        totalBytesBefore: result.totalBytesBefore,
+        totalBytesAfter: result.totalBytesAfter,
+        removedEntries: result.removedEntries,
+        removedFiles: result.removedFiles,
+        maxBytes: result.maxBytes,
+      });
+    }
     return;
   }
   const alreadyBlocked = state.blockedUntil !== undefined;

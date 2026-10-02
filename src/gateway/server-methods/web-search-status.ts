@@ -28,7 +28,7 @@ import {
   resolveWebSearchProviderId,
 } from "../../web-search/runtime.js";
 import { readPreparedCatalog } from "../server-model-catalog-auth.js";
-import { modelAuthAgentScopeError, resolveModelAuthAgentScope } from "./model-auth-agent-scope.js";
+import { resolveModelAuthAgentScope } from "./model-auth-agent-scope.js";
 import type { GatewayRequestContext } from "./types.js";
 
 type ProviderStatus = WebSearchStatusResult["providers"][number];
@@ -72,7 +72,7 @@ export async function prepareWebSearchStatus(
   const config = context.getRuntimeConfig();
   const scope = resolveModelAuthAgentScope(config, request.agentId);
   if (!scope.ok) {
-    return { error: modelAuthAgentScopeError(scope) };
+    return { error: scope.error };
   }
   // Missing publication is unavailable auth, never permission to reopen storage on a request.
   const authStore = getPreparedRuntimeAuthProfileStoreSnapshot(scope.agentDir) ?? {
@@ -97,7 +97,7 @@ export async function prepareWebSearchStatus(
       const manifest = metadata.byPluginId.get(entry.pluginId);
       const credential =
         manifest && entry.credentialPath
-          ? resolvePluginCredentialDescriptors(config, manifest).find(
+          ? resolvePluginCredentialDescriptors(manifest).find(
               (field) =>
                 JSON.stringify(field.path) ===
                 JSON.stringify(parseConcreteConfigPathTokens(entry.credentialPath)),

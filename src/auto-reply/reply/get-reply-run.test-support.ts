@@ -131,3 +131,12 @@ export function baseParams(
     },
   } as Parameters<typeof runPreparedReply>[0];
 }
+
+export function ownerParams(): Parameters<typeof runPreparedReply>[0] {
+  const params = baseParams();
+  params.command = {
+    ...params.command,
+    senderIsOwner: true,
+  };
+  return params;
+}

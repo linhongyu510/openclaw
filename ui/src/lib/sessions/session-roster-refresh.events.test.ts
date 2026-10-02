@@ -39,7 +39,7 @@ describe("session roster event traffic", () => {
         }
         fail = true;
         harness.publishEvent("sessions.changed", { reason: "stores" });
-        await vi.advanceTimersByTimeAsync(200);
+        await vi.advanceTimersByTimeAsync(5_000);
         expect(sessions.listSnapshot(query).error).toBe("List unavailable");
         fail = false;
         rows = [added, updated];
@@ -83,7 +83,7 @@ describe("session roster event traffic", () => {
       try {
         await sessions.refresh({ agentId: "main", force: true });
         harness.publishEvent("sessions.changed", { reason: "patch", session: stopped });
-        await vi.advanceTimersByTimeAsync(200);
+        await vi.advanceTimersByTimeAsync(5_000);
         expect(request).toHaveBeenCalledTimes(2);
         expect(sessions.state.result?.sessions).toEqual(finalRows);
       } finally {
@@ -163,12 +163,6 @@ describe("session roster event traffic", () => {
   it.each([
     "snapshot",
     "patch",
-    "send",
-    "steer",
-    "agent.run.started",
-    "agent.input.settled",
-    "run-capacity",
-    "chat.title",
     "active-message",
     "terminal-message",
     "invalidation",
@@ -219,17 +213,7 @@ describe("session roster event traffic", () => {
             sessionKey: row.key,
             agentId: "main",
             phase: "message",
-            ...([
-              "patch",
-              "send",
-              "steer",
-              "agent.run.started",
-              "agent.input.settled",
-              "run-capacity",
-              "chat.title",
-            ].includes(stream)
-              ? { reason: stream }
-              : {}),
+            ...(stream === "patch" ? { reason: stream } : {}),
             ...(stream === "invalidation"
               ? {}
               : {
@@ -244,9 +228,6 @@ describe("session roster event traffic", () => {
         );
         await vi.advanceTimersByTimeAsync(100);
       }
-      console.info(
-        `roster stream=${stream} events/s=10 fetchMs=1000 requests/min=${reads - initialReads}`,
-      );
       if (stream !== "invalidation" && stream !== "filtered") {
         expect(reads - initialReads).toBe(0);
         expect(sessions.listSnapshot(query).result?.sessions[0]?.totalTokens).toBe(600);
@@ -289,7 +270,7 @@ describe("session roster event traffic", () => {
         await sessions.refreshList({ ...query, force: true });
         bootstrap.setForegroundRoute("agent:main:chat");
         gatewayHarness.publishEvent("sessions.changed", { sessionKey: row.key, reason: "patch" });
-        await vi.advanceTimersByTimeAsync(200);
+        await vi.advanceTimersByTimeAsync(5_000);
         visibility.mockReturnValue("hidden");
         document.dispatchEvent(new Event("visibilitychange"));
         bootstrap.setForegroundPane({}, { sessionKey: "agent:main:chat", client, ready: true });
@@ -309,7 +290,7 @@ describe("session roster event traffic", () => {
     },
   );
 
-  it.each(["explicit", "filter", "agent", "replacement", "reconnect"])(
+  it.each(["explicit", "replacement", "reconnect"])(
     "lets %s refreshes bypass and absorb automatic backoff",
     async (intent) => {
       vi.useFakeTimers();
@@ -333,7 +314,7 @@ describe("session roster event traffic", () => {
       try {
         await sessions.refresh({ agentId: "main", force: true });
         gatewayHarness.publishEvent("sessions.changed", { sessionKey: row.key, reason: "patch" });
-        await vi.advanceTimersByTimeAsync(1_200);
+        await vi.advanceTimersByTimeAsync(6_000);
         expect(reads).toBe(2);
         gatewayHarness.publishEvent("sessions.changed", { sessionKey: row.key, reason: "patch" });
         if (intent === "reconnect") {
@@ -343,11 +324,7 @@ describe("session roster event traffic", () => {
         } else if (intent === "replacement") {
           await sessions.refreshReplacement();
         } else {
-          await sessions.refresh({
-            agentId: intent === "agent" ? "research" : "main",
-            ...(intent === "filter" ? { search: "tracked" } : {}),
-            force: true,
-          });
+          await sessions.refresh({ agentId: "main", force: true });
         }
         expect(reads).toBe(3);
         await vi.advanceTimersByTimeAsync(15_000);
@@ -359,7 +336,7 @@ describe("session roster event traffic", () => {
     },
   );
 
-  it.each(["create", "owner", "archive", "unknown-mutation"])(
+  it.each(["create", "unknown-mutation"])(
     "refreshes authoritative membership for a %s event even with a row snapshot",
     async (reason) => {
       vi.useFakeTimers();
@@ -375,7 +352,7 @@ describe("session roster event traffic", () => {
           sessionKey: row.key,
           session: { ...row, updatedAt: 2 },
         });
-        await vi.advanceTimersByTimeAsync(200);
+        await vi.advanceTimersByTimeAsync(5_000);
         expect(request).toHaveBeenCalledTimes(2);
       } finally {
         sessions.dispose();

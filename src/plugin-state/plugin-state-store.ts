@@ -1,9 +1,13 @@
 // Plugin state store exposes persisted per-plugin state operations.
 import { toUSVString } from "node:util";
 import type { Result } from "@openclaw/normalization-core/result";
+import type { SessionEntryCurrentCheck } from "../config/sessions/session-entry-current.types.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { validatePluginStateComparison } from "./plugin-state-store.comparison.js";
-import { preparePluginStateJournalValue } from "./plugin-state-store.journal.js";
+import {
+  preparePluginStateJournalValue,
+  type PluginStateSequencedJournalParams,
+} from "./plugin-state-store.journal.js";
 import { isRetainedPluginStateNamespace } from "./plugin-state-store.kernel.js";
 import {
   validatePluginStateKeyRange,
@@ -97,7 +101,6 @@ export {
   pluginStateDeleteEntriesIfUnchanged,
   pluginStateDoctorEntriesInKeyRange,
 } from "./plugin-state-store.sqlite.js";
-export { sweepExpiredPluginStateEntriesInWorker as sweepExpiredPluginStateEntries } from "./plugin-state-worker-client.js";
 
 function createKeyedStoreForPluginId<T>(
   pluginId: string,
@@ -109,7 +112,7 @@ function createKeyedStoreForPluginId<T>(
   const store = createSyncKeyedStore<T>(prepared, assertRetainedActive);
   return {
     ...createAsyncKeyedStore<T>(prepared, assertRetainedActive, assertActive),
-    withCurrent: ({ assertCurrent }) => {
+    withCurrent: ({ assertCurrent, sessionEntryCurrent }) => {
       if (typeof assertCurrent !== "function") {
         throw invalidInput("Plugin state action authority requires assertCurrent.");
       }
@@ -118,7 +121,12 @@ function createKeyedStoreForPluginId<T>(
         assertCurrent();
       };
       assertBoundCurrent();
-      return createAsyncKeyedStore<T>(prepared, assertBoundCurrent);
+      return createAsyncKeyedStore<T>(
+        prepared,
+        assertBoundCurrent,
+        assertBoundCurrent,
+        sessionEntryCurrent,
+      );
     },
     update: async (...args) => store.update(...args),
     deleteIf: async (...args) => store.deleteIf(...args),
@@ -129,12 +137,14 @@ function createAsyncKeyedStore<T>(
   prepared: PreparedKeyedStoreOptions,
   assertActive?: () => void,
   assertRangeActive = assertActive,
+  sessionEntryCurrent?: SessionEntryCurrentCheck,
 ): PluginStateKeyedStore<T, 2> {
   const scope = {
     pluginId: prepared.pluginId,
     namespace: prepared.namespace,
     env: prepared.env,
     assertActive,
+    sessionEntryCurrent,
   };
 
   return {
@@ -207,6 +217,7 @@ function createAsyncKeyedStore<T>(
       await registerPluginStateInWorker({
         ...scope,
         ...entry,
+        assertCurrent: opts?.assertCurrent,
         maxEntries: prepared.maxEntries,
         overflowPolicy: prepared.overflowPolicy,
       });
@@ -263,9 +274,13 @@ function createAsyncKeyedStore<T>(
       // SAFETY: The atomically consumed value has this namespace's caller-selected JSON type.
       return (await consumePluginStateInWorker({ ...scope, key: normalizedKey })) as T | undefined;
     },
-    delete: async (key) => {
+    delete: async (key, opts) => {
       const normalizedKey = validateKey(key, "delete");
-      return await deletePluginStateInWorker({ ...scope, key: normalizedKey });
+      return await deletePluginStateInWorker({
+        ...scope,
+        key: normalizedKey,
+        assertCurrent: opts?.assertCurrent,
+      });
     },
     entries: async () => {
       // SAFETY: Entries come from this namespace and retain the caller's JSON value type.
@@ -485,11 +500,7 @@ export async function registerPluginStateSequencedJournalEntry(params: {
   journalOptions: OpenKeyedStoreOptions;
   /** This owner adds a fixed-width sequence suffix so key order matches append order. */
   journalKeyPrefix: string;
-  journalKeyRange: {
-    keyStartInclusive: string;
-    keyEndExclusive: string;
-    valueKind?: string;
-  };
+  journalKeyRange: PluginStateSequencedJournalParams["journalKeyRange"];
   journalValue: Record<string, unknown>;
 }): Promise<number> {
   if (params.pluginId.startsWith("core:")) {

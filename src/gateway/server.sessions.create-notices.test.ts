@@ -3,20 +3,21 @@ import { expect, test } from "vitest";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import { drainSystemEvents, peekSystemEvents } from "../infra/system-events.js";
 import { listSessionStateEventsSince } from "../sessions/session-state-events.js";
+import { ensureProfileForEmail } from "../state/user-profiles.js";
 import {
   attachGatewayLocalUserIngress,
   prepareGatewayLocalUserIngress,
 } from "./local-user-ingress.js";
 import {
   directSessionReq,
-  setupGatewaySessionsTestHarness,
+  setupGatewaySessionsHandlerTestHarness,
 } from "./test/server-sessions.test-helpers.js";
 
-const { createSessionStoreDir } = setupGatewaySessionsTestHarness();
+const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 
 test("sessions.create stamps trusted operator provenance and records created", async () => {
   const { storePath } = await createSessionStoreDir();
-  const profileId = "profile-session-creator";
+  const profileId = ensureProfileForEmail("session-creator@example.test").id;
   const client = {
     connect: { scopes: ["operator.write"] },
     authenticatedUserProfile: {
@@ -56,7 +57,7 @@ test("sessions.create stamps trusted operator provenance and records created", a
   expect(created.payload?.entry).not.toHaveProperty("createdActor.label");
   const key = expectDefined(created.payload?.key, "created session key");
   expect(loadSessionEntry({ sessionKey: key, storePath })).not.toHaveProperty("createdActor.label");
-  expect(listSessionStateEventsSince(key, "main", 0, 20).events).toContainEqual(
+  expect((await listSessionStateEventsSince(key, "main", 0, 20)).events).toContainEqual(
     expect.objectContaining({
       kind: "created",
       actorType: "human",
