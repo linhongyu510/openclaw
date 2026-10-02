@@ -107,3 +107,45 @@ export function readActiveTranscriptEntryAnchor(params: {
     entryId: params.entryId,
   });
 }
+
+/** Result of an anchor read together with the index state observed in one snapshot. */
+export interface ActiveTranscriptAnchorRead {
+  /** The active anchor, or undefined when the projection is dirty or has no active row. */
+  anchor: TranscriptEntryAnchor | undefined;
+  /**
+   * True when the projection index was transiently dirty (needs reconciliation) at read time,
+   * so the anchor was short-circuited -- as opposed to a clean index that genuinely has no
+   * active row for the cached entry.
+   */
+  indexDirty: boolean;
+}
+
+/**
+ * Reads the active anchor together with the reconcile state against ONE opened database
+ * snapshot. This lets callers distinguish a transiently dirty index (benign duplicate
+ * delivery during the ~0.5-10s reconcile window) from a clean index whose active projection
+ * no longer contains the cached entry (another writer removed/rewrote it).
+ */
+export function readActiveTranscriptEntryAnchorStatus(params: {
+  agentId?: string;
+  sessionId: string;
+  sessionKey: string;
+  storePath?: string;
+  entryId: string;
+}): ActiveTranscriptAnchorRead {
+  const resolved = resolveSqliteTranscriptScope(params);
+  const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
+  // Fail-closed: observe reconcile state first, on the same snapshot used for the anchor join.
+  const indexDirty = sessionTranscriptIndexNeedsReconcile(database.db, resolved.sessionId);
+  if (indexDirty) {
+    return { anchor: undefined, indexDirty: true };
+  }
+  return {
+    anchor: readActiveTranscriptEntryAnchorInTransaction({
+      database,
+      resolved,
+      entryId: params.entryId,
+    }),
+    indexDirty: false,
+  };
+}
