@@ -138,8 +138,12 @@ function observeThroughProducer(
     onContextAccountingEvent: onEvent,
   } as unknown as SubscribeEmbeddedAgentSessionParams;
   const modelState = createEmbeddedModelState(params, silentLog as never);
+  // The admission verdict is produced on `turn_end` (the successful-turn close),
+  // not on the every-message `message_end` fallback, which hard-codes
+  // admitted:false. Feeding only message_end would never exercise the producer's
+  // own isContextOverflow/admitted rule and would silently make the fix inert.
   modelState.captureModelEvent({ type: "message_start", message } as never);
-  modelState.captureModelEvent({ type: "message_end", message } as never);
+  modelState.captureModelEvent({ type: "turn_end", message } as never);
 }
 
 /**
@@ -273,14 +277,16 @@ describe("connected transport -> accounting -> recovery trace", () => {
     const withoutWindow: EmbeddedContextAccountingEvent[] = [];
     observeThroughProducer(message, undefined, (event) => withoutWindow.push(event));
     expect(withoutWindow).toEqual([
-      { kind: "model", contextTokens: expect.any(Number), admitted: true },
+      // turn_end telemetry stays broad (successful:true) while the narrow
+      // admission verdict flips with the window.
+      { kind: "model", contextTokens: expect.any(Number), successful: true, admitted: true },
     ]);
 
     // With the window the production verdict is not admitted.
     const withWindow: EmbeddedContextAccountingEvent[] = [];
     observeThroughProducer(message, contextWindow, (event) => withWindow.push(event));
     expect(withWindow).toEqual([
-      { kind: "model", contextTokens: expect.any(Number), admitted: false },
+      { kind: "model", contextTokens: expect.any(Number), successful: true, admitted: false },
     ]);
   }, 30_000);
 

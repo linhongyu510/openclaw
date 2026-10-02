@@ -242,7 +242,7 @@ describe("subscribeEmbeddedAgentSession model state", () => {
         nowMs += 130_000;
         await runUsageCalls(
           harness,
-          [{ asyncTool: true, stopReason, usage: makeUsage() }],
+          [{ asyncTool: true, stopReason, usage: makeUsage({ input: 5_000, output: 200 }) }],
           (event) => {
             if (event.type === "message_end" && event.message.role === "assistant") {
               messages.push(event.message.stopReason);

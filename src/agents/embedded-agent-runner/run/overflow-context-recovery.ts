@@ -34,6 +34,7 @@ import {
 } from "./compaction-runtime.js";
 import { createRunRecoveryDiagId } from "./helpers.js";
 import {
+  isNonReducingCompaction,
   isNoRealConversationCompactionNoop,
   resetNoRealConversationTokenSnapshot,
 } from "./session-bootstrap.js";
@@ -334,12 +335,7 @@ export async function recoverEmbeddedRunOverflow(
     if (compactResult.compacted) {
       const tokensBefore = compactResult.result?.tokensBefore;
       const tokensAfter = compactResult.result?.tokensAfter;
-      const noReduction =
-        typeof tokensBefore === "number" &&
-        Number.isFinite(tokensBefore) &&
-        typeof tokensAfter === "number" &&
-        Number.isFinite(tokensAfter) &&
-        tokensAfter >= tokensBefore;
+      const noReduction = isNonReducingCompaction(compactResult);
       const compactionOutcome = noReduction
         ? "auto-compaction removed nothing"
         : "auto-compaction succeeded";
