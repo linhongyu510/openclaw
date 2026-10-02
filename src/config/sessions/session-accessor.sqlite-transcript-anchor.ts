@@ -147,10 +147,23 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
   const db = database.db;
   // One nested-safe deferred snapshot (savepoint-aware: it joins an enclosing write
   // transaction via a savepoint instead of throwing "cannot start a transaction within a
-  // transaction"). Within it we read reconcile state AND the canonical active-path join, so a
-  // between-read writer cannot change the verdict.
+  // transaction"). Within it we read reconcile state, the canonical leaf, AND the active-path
+  // join, so a between-read writer cannot change the verdict.
   return runSqliteDeferredTransactionSync(db, () => {
     const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
+    // Authoritative canonical leaf: the projection state's leaf_event_id, NOT dirty active-row
+    // membership. Leaf controls / alternative-parent appends mark the index dirty while leaving
+    // the old active-event rows in place until reconciliation; active-row presence therefore
+    // cannot prove the cached turn is still the canonical current turn.
+    const leafRow = executeSqliteQueryTakeFirstSync(
+      db,
+      getSessionKysely(db)
+        .selectFrom("session_transcript_index_state as state")
+        .select("state.leaf_event_id as leafEventId")
+        .where("state.session_id", "=", resolved.sessionId)
+        .limit(1),
+    );
+    const canonicalLeafEventId = (leafRow?.leafEventId as string | null | undefined) ?? null;
     // Canonical active-path join (identities ⨝ active ⨝ rewrite). This is the authoritative
     // "is the cached entry still the current active turn" check -- NOT the raw identity log,
     // which only proves the event historically existed.
@@ -192,13 +205,16 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
         cachedIdentityExists: Boolean(activeAnchor),
       };
     }
-    // Dirty index: degrade ONLY if the cached entry is still on the canonical active path in
-    // this snapshot. If it was branched away, alternative-parent rewritten, or suffix-removed,
-    // the active join yields no valid row -> reject (fail-closed), never false-ack.
+    // Dirty index: degrade ONLY when this cached entry is the canonical current leaf turn in
+    // this snapshot. A branched-away / alternative-parent rewritten / completed-ancestor turn
+    // keeps old active rows while the leaf moves elsewhere, so active-row membership is not
+    // enough. If the cached entry is not the leaf -> reject (fail-closed), never false-ack.
+    const isCanonicalLeaf =
+      canonicalLeafEventId !== null && canonicalLeafEventId === params.entryId;
     return {
       anchor: undefined,
       indexDirty: true,
-      cachedIdentityExists: Boolean(activeAnchor),
+      cachedIdentityExists: isCanonicalLeaf,
     };
   });
 }
