@@ -56,7 +56,7 @@ it("prepares a missing start timestamp from the bounded transcript header withou
       timestamp: new Date(now - 60_000).toISOString(),
     },
   ]);
-  const observer = observeHostDataSql(state.env);
+  const observer = observeHostDataSql();
   try {
     const prepared = await prepareCronSession({
       cfg: { session: { reset: { mode: "none" } } },
@@ -74,9 +74,14 @@ it("prepares a missing start timestamp from the bounded transcript header withou
   }
 });
 
-it.each(["shared.sqlite", "configured.json"])(
-  "resolves %s ownership in the worker and preserves full rows",
-  async (name) => {
+it.each([
+  ["shared.sqlite", "full"],
+  ["shared.sqlite", "list"],
+  ["configured.json", "full"],
+  ["configured.json", "list"],
+] as const)(
+  "resolves %s ownership in the worker with the %s projection",
+  async (name, projection) => {
     const storePath = state.path(name);
     const sessionKey = "agent:main:cron:custom";
     const entry = {
@@ -84,17 +89,33 @@ it.each(["shared.sqlite", "configured.json"])(
       updatedAt: 1,
       sessionStartedAt: 1,
       skillsSnapshot: { prompt: "complete saved prompt", skills: [] },
+      subagentRecovery: { wedgedAt: 1, wedgedReason: "Synthetic recovery tombstone" },
     };
     replaceSessionEntrySync({ agentId: "main", env: state.env, storePath, sessionKey }, entry);
-    const observer = observeHostDataSql(state.env);
+    const observer = observeHostDataSql();
     try {
       const result = await readSessionEntriesFromStoreInWorker({
         agentId: "main",
         env: state.env,
         storePath,
         sessionKeys: [sessionKey, "agent:main:cron:missing"],
+        projection,
       });
-      expect(result.entries).toEqual([{ sessionKey, entry: expect.objectContaining(entry) }]);
+      expect(result.entries).toEqual([
+        {
+          sessionKey,
+          entry:
+            projection === "full"
+              ? expect.objectContaining(entry)
+              : {
+                  sessionId: entry.sessionId,
+                  updatedAt: entry.updatedAt,
+                  sessionStartedAt: entry.sessionStartedAt,
+                  subagentRecovery: entry.subagentRecovery,
+                  delivery: { kind: "none" },
+                },
+        },
+      ]);
       for (const call of observer.calls) {
         expect(call).not.toHaveBeenCalled();
       }
@@ -146,27 +167,31 @@ it("rejects a noncanonical persisted key instead of repairing it at runtime", as
   ).rejects.toThrow(/doctor --fix/i);
 });
 
-it("rejects a read revoked during dispatch and joins worker close", async () => {
-  const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
-  const sessionKey = "agent:main:cron:closed";
-  writeSessionEntry(database, sessionKey, { sessionId: "closed-session", updatedAt: 1 });
-  let closing: Promise<boolean> | undefined;
-  observed.dispatch = () => {
-    observed.dispatch = undefined;
-    closing = closeOpenClawAgentDatabaseByPathAsync(database.path, "main");
-  };
-  await expect(
-    readSessionEntriesFromStoreInWorker({
-      agentId: "main",
-      env: state.env,
-      storePath: database.path,
-      sessionKeys: [sessionKey],
-    }),
-  ).rejects.toThrow(/revoked/);
-  expect(closing).toBeDefined();
-  await closing;
-  expect(fs.existsSync(database.path)).toBe(true);
-});
+it.each(["full", "list"] as const)(
+  "rejects a %s read revoked during dispatch and joins worker close",
+  async (projection) => {
+    const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+    const sessionKey = "agent:main:cron:closed";
+    writeSessionEntry(database, sessionKey, { sessionId: "closed-session", updatedAt: 1 });
+    let closing: Promise<boolean> | undefined;
+    observed.dispatch = () => {
+      observed.dispatch = undefined;
+      closing = closeOpenClawAgentDatabaseByPathAsync(database.path, "main");
+    };
+    await expect(
+      readSessionEntriesFromStoreInWorker({
+        agentId: "main",
+        env: state.env,
+        storePath: database.path,
+        sessionKeys: [sessionKey],
+        projection,
+      }),
+    ).rejects.toThrow(/revoked/);
+    expect(closing).toBeDefined();
+    await closing;
+    expect(fs.existsSync(database.path)).toBe(true);
+  },
+);
 
 it("keeps the captured source when caller inputs change during dispatch", async () => {
   const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
@@ -191,30 +216,34 @@ it("keeps the captured source when caller inputs change during dispatch", async 
   expect(fs.existsSync(input.storePath)).toBe(false);
 });
 
-it("rejects a configured alias redirected while its physical read is in flight", async () => {
-  const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
-  const replacementRoot = state.path("replacement-root");
-  const replacement = openOpenClawAgentDatabase({
-    agentId: "main",
-    env: state.env,
-    path: path.join(replacementRoot, "agents", "main", "agent", "openclaw-agent.sqlite"),
-  });
-  const sessionKey = "agent:main:cron:alias";
-  writeSessionEntry(database, sessionKey, { sessionId: "original-source", updatedAt: 1 });
-  writeSessionEntry(replacement, sessionKey, { sessionId: "replacement-source", updatedAt: 1 });
-  const alias = state.path("alias");
-  fs.symlinkSync(state.stateDir, alias, "junction");
-  observed.dispatch = () => {
-    observed.dispatch = undefined;
-    fs.unlinkSync(alias);
-    fs.symlinkSync(replacementRoot, alias, "junction");
-  };
-  await expect(
-    readSessionEntriesFromStoreInWorker({
+it.each(["full", "list"] as const)(
+  "rejects a configured alias redirected while its %s read is in flight",
+  async (projection) => {
+    const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+    const replacementRoot = state.path("replacement-root");
+    const replacement = openOpenClawAgentDatabase({
       agentId: "main",
       env: state.env,
-      storePath: path.join(alias, "agents", "main", "agent", "openclaw-agent.sqlite"),
-      sessionKeys: [sessionKey],
-    }),
-  ).rejects.toThrow(/outside captured discovery custody/);
-});
+      path: path.join(replacementRoot, "agents", "main", "agent", "openclaw-agent.sqlite"),
+    });
+    const sessionKey = "agent:main:cron:alias";
+    writeSessionEntry(database, sessionKey, { sessionId: "original-source", updatedAt: 1 });
+    writeSessionEntry(replacement, sessionKey, { sessionId: "replacement-source", updatedAt: 1 });
+    const alias = state.path(`alias-${projection}`);
+    fs.symlinkSync(state.stateDir, alias, "junction");
+    observed.dispatch = () => {
+      observed.dispatch = undefined;
+      fs.unlinkSync(alias);
+      fs.symlinkSync(replacementRoot, alias, "junction");
+    };
+    await expect(
+      readSessionEntriesFromStoreInWorker({
+        agentId: "main",
+        env: state.env,
+        storePath: path.join(alias, "agents", "main", "agent", "openclaw-agent.sqlite"),
+        sessionKeys: [sessionKey],
+        projection,
+      }),
+    ).rejects.toThrow(/outside captured discovery custody/);
+  },
+);

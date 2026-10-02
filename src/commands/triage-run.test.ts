@@ -30,7 +30,7 @@ const mocks = vi.hoisted(() => ({
   prepareUpdateRepairInference: vi.fn(),
   runUpdateRepairTurn: vi.fn(),
 }));
-vi.mock("./doctor-lint.js", () => ({ collectDoctorFindings: mocks.collectDoctorFindings }));
+vi.mock("./doctor-lint-runner.js", () => ({ collectDoctorFindings: mocks.collectDoctorFindings }));
 vi.mock("../infra/update-repair-agent.js", () => ({
   runUpdateRepairLoop: mocks.runUpdateRepairLoop,
 }));
@@ -162,7 +162,7 @@ describe("triage --run", () => {
     });
     finishUpdateRun(run.runId, { status: "failed", reason: "finalize:doctor" });
     if (pendingMigration) {
-      recordDeferredPluginMigrations({
+      await recordDeferredPluginMigrations({
         pending: [
           {
             pluginId: "codex",
@@ -203,7 +203,7 @@ describe("triage --run", () => {
     expect(output).toContain("openclaw update repair");
     expect(output).not.toContain("already resolved");
     if (pendingMigration) {
-      expect(output).toContain('Plugin "codex" state migration is pending');
+      expect(output).toContain('Plugin "codex" data/settings upgrade is unfinished');
     }
     expect(getUpdateRun(run.runId)?.status).toBe("failed");
     expect(await readRestartSentinelReadOnly()).toBeNull();
@@ -656,14 +656,13 @@ describe("triage --run", () => {
           error: "Operator requested installation triage",
           phase: "verifying",
         }),
-        budget: { maxTurns: 1 },
       }),
     );
     expect(mocks.collectDoctorFindings).toHaveBeenCalledOnce();
     expect(mocks.runUtf8CommandWithTimeout).toHaveBeenCalledTimes(2);
     expect(mocks.runUtf8CommandWithTimeout).toHaveBeenCalledWith(
       [
-        process.execPath,
+        process.versions.bun ? "node" : process.execPath,
         path.resolve(import.meta.dirname, "../../dist/index.js"),
         "doctor",
         "--lint",
@@ -792,8 +791,6 @@ describe("triage --run", () => {
   );
 
   it.each([
-    { status: "improved", reason: "turn-budget", code: 1 },
-    { status: "unrepaired", reason: "Validation regressed after repair.", code: 1 },
     { status: "aborted", reason: "cancelled", code: 1 },
     { status: "unrepaired", reason: "per-turn-budget", code: 2 },
     { status: "improved", reason: "wall-clock-budget", code: 2 },

@@ -1,22 +1,30 @@
 import { getEventListeners, once } from "node:events";
 import type { IncomingMessage } from "node:http";
+import { DatabaseSync, StatementSync } from "node:sqlite";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { queryObjects } from "node:v8";
 import {
   createPluginRegistryFixture,
   registerVirtualTestPlugin,
 } from "openclaw/plugin-sdk/plugin-test-contracts";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { observeSqliteReadSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import {
-  ensureProfileForEmail,
-  getUserProfileListItem,
-  linkEmail,
-  setDisplayName,
-  setUserProfileRole,
-} from "../state/user-profiles.js";
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import * as schemaFacts from "../infra/sqlite-schema-facts.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
+import { prepareUserProfileCatalog } from "../state/user-profile-list.js";
+import {
+  ensureCanonicalUserProfileForEmail,
+  linkCanonicalUserProfileEmail,
+  setCanonicalUserProfileRole,
+} from "../state/user-profile-writes.js";
+import { linkEmail, setDisplayName } from "../state/user-profile-writes.worker.js";
+import * as profileSchema from "../state/user-profiles-schema.js";
+import { getUserProfileListItem } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import type { GatewayAuthResult } from "./auth.js";
 import {
@@ -37,10 +45,10 @@ vi.mock("./auth.js", async (importOriginal) => ({
 vi.mock("../infra/host-account-name.js", () => ({
   resolveHostAccountName: async () => "Gateway Person",
 }));
-vi.mock("../state/user-profiles.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../state/user-profiles.js")>();
-  ensureOwner.mockImplementation(actual.ensureGatewayOwnerProfile);
-  return { ...actual, ensureGatewayOwnerProfile: ensureOwner };
+vi.mock("../state/user-profile-writes.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../state/user-profile-writes.js")>();
+  ensureOwner.mockImplementation(actual.ensureCanonicalGatewayOwnerProfile);
+  return { ...actual, ensureCanonicalGatewayOwnerProfile: ensureOwner };
 });
 
 const roles = {
@@ -54,8 +62,14 @@ async function authenticate(
   cfg: OpenClawConfig = {},
   user?: string,
 ) {
+  setRuntimeConfigSnapshot(cfg);
   authorize.mockResolvedValueOnce({ ok: true, method, ...(user ? { user } : {}) });
-  return checkGatewayHttpRequestAuth({ req, auth: { mode: "none", allowTailscale: false }, cfg });
+  return checkGatewayHttpRequestAuth({
+    req,
+    auth: { mode: "none", allowTailscale: false },
+    cfg,
+    getRuntimeConfig: () => cfg,
+  });
 }
 
 async function admitResponse(response: ReturnType<typeof makeMockHttpResponse>, email: string) {
@@ -89,7 +103,7 @@ async function completeResponseCapture(email: string) {
   }
 }
 
-function registerPersonAccessFixture() {
+async function registerPersonAccessFixture() {
   const { config, registry } = createPluginRegistryFixture();
   const cfg: OpenClawConfig = {
     gateway: {
@@ -104,7 +118,9 @@ function registerPersonAccessFixture() {
     },
   };
   const email = "visitor@example.test";
-  const person = ensureProfileForEmail(email);
+  const person = await ensureCanonicalUserProfileForEmail(email);
+  const catalog = await prepareUserProfileCatalog();
+  onTestFinished(catalog.release);
   const access: { grant?: AbortController; inapplicable?: boolean; onAuthorize?: () => void } = {};
   registerVirtualTestPlugin({
     registry,
@@ -136,13 +152,66 @@ function registerPersonAccessFixture() {
 
 describe("HTTP gateway owner profiles", () => {
   beforeEach(() => vi.clearAllMocks());
-  afterEach(() => resetPluginRuntimeStateForTest());
+  afterEach(() => {
+    clearRuntimeConfigSnapshot();
+    resetPluginRuntimeStateForTest();
+  });
+
+  it("reuses admitted state schema across 200 HTTP profile authorizations", async () => {
+    await withOpenClawTestState({ label: "http-profile-schema-admission" }, async () => {
+      const { cfg, email, person, access } = await registerPersonAccessFixture();
+      access.grant = new AbortController();
+      expect((await authenticate("trusted-proxy", cfg, email)).ok).toBe(true);
+      const observation = observeSqliteReadSql(StatementSync.prototype);
+      const facts = vi.spyOn(schemaFacts, "getAdmittedSqliteSchemaFacts");
+      const ensures = vi.spyOn(profileSchema, "ensureUserProfilesSchema");
+      const exec = vi.spyOn(DatabaseSync.prototype, "exec");
+      try {
+        for (let index = 0; index < 200; index += 1) {
+          authorize.mockResolvedValueOnce({ ok: true, method: "trusted-proxy", user: email });
+          const result = await checkGatewayHttpRequestAuth({
+            req,
+            auth: { mode: "none", allowTailscale: false },
+            cfg,
+            getRuntimeConfig: () => cfg,
+          });
+          expect(result).toMatchObject({
+            ok: true,
+            requestAuth: { authenticatedUserProfile: { profileId: person.id } },
+          });
+        }
+        const counts = {
+          schemaFacts: facts.mock.calls.length,
+          ensureCalls: ensures.mock.calls.length,
+          profileSchemaWrites: exec.mock.calls.filter(([sql]) =>
+            /CREATE TABLE IF NOT EXISTS user_profiles/iu.test(sql),
+          ).length,
+          schemaReads: observation.queries.filter((sql) =>
+            /sqlite_schema|sqlite_master|pragma_table_info|PRAGMA user_version/iu.test(sql),
+          ).length,
+          dataVersionReads: observation.queries.filter((sql) => /PRAGMA data_version/iu.test(sql))
+            .length,
+        };
+        console.log("HTTP profile admission counters", counts);
+        expect(counts).toMatchObject({
+          profileSchemaWrites: 0,
+          schemaReads: 0,
+        });
+        expect(counts.dataVersionReads).toBeLessThanOrEqual(1000);
+      } finally {
+        observation.restore();
+        facts.mockRestore();
+        ensures.mockRestore();
+        exec.mockRestore();
+      }
+    });
+  });
 
   it.each(["missing", "disabled", "failed", "unregistered", "inapplicable", "unrelated"] as const)(
     "denies a required %s policy while preserving independent staff and owner access",
     async (availability) => {
       await withOpenClawTestState({ label: "http-required-access-policy" }, async () => {
-        const { cfg, email, person, access, registry } = registerPersonAccessFixture();
+        const { cfg, email, person, access, registry } = await registerPersonAccessFixture();
         access.grant = new AbortController();
         const plugin = registry.plugins.find((entry) => entry.id === "person-access");
         if (!plugin) {
@@ -164,14 +233,14 @@ describe("HTTP gateway owner profiles", () => {
         }
 
         for (const assignment of [null, "reader", "removed-role"]) {
-          setUserProfileRole(person.id, assignment);
+          await setCanonicalUserProfileRole(person.id, assignment);
           invalidateOperatorRolePolicy(person.id);
           expect(await authenticate("trusted-proxy", cfg, email)).toMatchObject({
             ok: false,
             authResult: { reason: "operator_access_denied" },
           });
         }
-        setUserProfileRole(person.id, "staff");
+        await setCanonicalUserProfileRole(person.id, "staff");
         invalidateOperatorRolePolicy(person.id);
         expect(await authenticate("trusted-proxy", cfg, email)).toMatchObject({ ok: true });
         expect(await authenticate("token", cfg)).toMatchObject({ ok: true });
@@ -183,7 +252,7 @@ describe("HTTP gateway owner profiles", () => {
     "enforces registered person access without retiring independent staff authority (%s)",
     async (change) => {
       await withOpenClawTestState({ label: "http-person-access" }, async () => {
-        const { cfg, email, person, access } = registerPersonAccessFixture();
+        const { cfg, email, person, access } = await registerPersonAccessFixture();
         expect((await authenticate("trusted-proxy", cfg, email)).ok).toBe(false);
         access.grant = new AbortController();
         const admitted = await authenticate("trusted-proxy", cfg, email);
@@ -193,21 +262,24 @@ describe("HTTP gateway owner profiles", () => {
         const captured = admitted.requestAuth.operatorAccessAuthority;
         setDisplayName(person.id, "Updated display");
         const staffEmail = "another-verified@example.test";
-        linkEmail(staffEmail, person.id);
+        await linkCanonicalUserProfileEmail(staffEmail, person.id);
         expect(() => captured.assertCurrent()).not.toThrow();
-        setUserProfileRole(person.id, "staff");
+        await setCanonicalUserProfileRole(person.id, "staff");
         invalidateOperatorRolePolicy(person.id);
         const staff = await authenticate("trusted-proxy", cfg, email);
         expect(staff).toMatchObject({ ok: true });
         if (!staff.ok) {
           throw new Error("Expected independent staff admission");
         }
-        expect(staff.requestAuth.operatorAccessAuthority).toBeUndefined();
+        expect(staff.requestAuth.operatorAccessAuthority).toBeNull();
         if (change === "grant ended") {
           access.grant.abort(new Error("Access ended"));
         } else {
-          linkEmail(email, ensureProfileForEmail("replacement@example.test").id);
-          linkEmail(email, person.id);
+          await linkCanonicalUserProfileEmail(
+            email,
+            (await ensureCanonicalUserProfileForEmail("replacement@example.test")).id,
+          );
+          await linkCanonicalUserProfileEmail(email, person.id);
         }
         expect(captured.signal.aborted).toBe(true);
         expect(() => captured.assertCurrent()).toThrow(GatewayOperatorAccessDeniedError);
@@ -223,9 +295,9 @@ describe("HTTP gateway owner profiles", () => {
     "rejects alias retirement during policy authorization (restored: %s)",
     async (restore) => {
       await withOpenClawTestState({ label: "http-reentrant-person-access" }, async () => {
-        const { cfg, email, person, access } = registerPersonAccessFixture();
-        linkEmail("retained@example.test", person.id);
-        const replacement = ensureProfileForEmail("replacement@example.test");
+        const { cfg, email, person, access } = await registerPersonAccessFixture();
+        await linkCanonicalUserProfileEmail("retained@example.test", person.id);
+        const replacement = await ensureCanonicalUserProfileForEmail("replacement@example.test");
         access.grant = new AbortController();
         access.onAuthorize = () => {
           linkEmail(email, replacement.id);
@@ -247,10 +319,10 @@ describe("HTTP gateway owner profiles", () => {
     "collects HTTP captures while a retained signal observes %s retirement",
     async (source) => {
       await withOpenClawTestState({ label: "http-access-retention" }, async () => {
-        const { cfg, email, person, access } = registerPersonAccessFixture();
+        const { cfg, email, person, access } = await registerPersonAccessFixture();
         setRuntimeConfigSnapshot(cfg);
-        linkEmail("retained@example.test", person.id);
-        const replacement = ensureProfileForEmail("replacement@example.test");
+        await linkCanonicalUserProfileEmail("retained@example.test", person.id);
+        const replacement = await ensureCanonicalUserProfileForEmail("replacement@example.test");
         access.grant = new AbortController();
         const retired = await completeResponseCapture(email);
         const signal = await authenticate("trusted-proxy", cfg, email).then((admitted) => {
@@ -273,8 +345,8 @@ describe("HTTP gateway owner profiles", () => {
         if (source === "grant") {
           access.grant.abort(new Error("Access ended"));
         } else {
-          linkEmail(email, replacement.id);
-          linkEmail(email, person.id);
+          await linkCanonicalUserProfileEmail(email, replacement.id);
+          await linkCanonicalUserProfileEmail(email, person.id);
         }
         expect(signal.aborted).toBe(true);
       });
@@ -283,10 +355,10 @@ describe("HTTP gateway owner profiles", () => {
 
   it("binds revocation to an active response and releases completed keep-alive responses", async () => {
     await withOpenClawTestState({ label: "http-response-access" }, async () => {
-      const { cfg, email, person, access } = registerPersonAccessFixture();
+      const { cfg, email, person, access } = await registerPersonAccessFixture();
       setRuntimeConfigSnapshot(cfg);
-      linkEmail("retained@example.test", person.id);
-      const replacement = ensureProfileForEmail("replacement@example.test");
+      await linkCanonicalUserProfileEmail("retained@example.test", person.id);
+      const replacement = await ensureCanonicalUserProfileForEmail("replacement@example.test");
       const streaming = makeMockHttpResponse();
       const completed = makeMockHttpResponse();
       const next = makeMockHttpResponse();
@@ -324,7 +396,7 @@ describe("HTTP gateway owner profiles", () => {
 
         await admitResponse(aliasStreaming, email);
         // The child keeps its source after the parent releases it and its response disconnects.
-        const captured = captureGatewayOperatorRunAuthority({
+        const captured = await captureGatewayOperatorRunAuthority({
           client: {
             connect: {
               minProtocol: 1,
@@ -350,12 +422,12 @@ describe("HTTP gateway owner profiles", () => {
         expect(nextAuthority.signal.aborted).toBe(false);
         expect(captured.authority.signal?.aborted).toBe(false);
         setDisplayName(person.id, "Updated during retained work");
-        linkEmail("added@example.test", person.id);
+        await linkCanonicalUserProfileEmail("added@example.test", person.id);
         expect(aliasStreaming.res.destroyed).toBe(false);
         expect(captured.authority.signal?.aborted).toBe(false);
 
-        linkEmail(email, replacement.id);
-        linkEmail(email, person.id);
+        await linkCanonicalUserProfileEmail(email, replacement.id);
+        await linkCanonicalUserProfileEmail(email, person.id);
         expect(aliasStreaming.res.destroyed).toBe(true);
         expect(captured.authority.signal?.aborted).toBe(true);
         expect(nextAuthority.signal.aborted).toBe(true);

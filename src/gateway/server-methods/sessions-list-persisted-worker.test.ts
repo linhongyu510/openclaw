@@ -1,9 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { notifyPreparedModelRuntimePublication } from "../../agents/prepared-model-runtime.publication-events.js";
-import {
-  clearSubagentRunsReadCacheForTest,
-  persistSubagentRunsToDiskOrThrow,
-} from "../../agents/subagents/registry/subagent-registry-state.js";
+import { persistRegistryFixture } from "../../agents/subagents/registry/subagent-registry-state.fixture.test-support.js";
+import { clearSubagentRunsReadCacheForTest } from "../../agents/subagents/registry/subagent-registry-state.js";
 import type { SubagentRunRecord } from "../../agents/subagents/registry/subagent-registry.types.js";
 import { createEmbeddedCallGateway } from "../../agents/tools/embedded-gateway-stub.js";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
@@ -87,9 +85,7 @@ it.each(["replaced", "made private"])(
           swarmRequesterSessionKey: controller,
           collectorCompletion: { status: "done" },
         });
-        persistSubagentRunsToDiskOrThrow(
-          new Map([child, collector].map((entry) => [entry.runId, entry])),
-        );
+        persistRegistryFixture(new Map([child, collector].map((entry) => [entry.runId, entry])));
         clearSubagentRunsReadCacheForTest();
         const context = requestContext(cfg);
         await initializeSessionReadContext(context);
@@ -121,8 +117,9 @@ it.each(["replaced", "made private"])(
             isWebchatConnect: () => false,
             respond,
           });
-          expect(respond).toHaveBeenCalledTimes(1);
+          // Row workers may yield; the unrelated catalog renewal stays held until cleanup.
           await request;
+          expect(respond).toHaveBeenCalledTimes(1);
           expect(respond.mock.calls[0]?.[0]).toBe(true);
           const result = respond.mock.calls[0]?.[1];
           if (change === "made private") {
@@ -155,7 +152,11 @@ it("lists off-page controller links and deleted-collector totals while a sibling
     { scenario: "minimal", env: { OPENCLAW_TEST_READ_SUBAGENT_RUNS_FROM_SQLITE: "1" } },
     async () => {
       clearSubagentRunsReadCacheForTest();
-      const cfg = { agents: { list: [{ id: "main", default: true }] } };
+      const cfg = {
+        agents: { list: [{ id: "main", default: true }] },
+        // Session reads need the real embedded host, but no bundled plugin runtimes.
+        plugins: { enabled: false },
+      };
       setRuntimeConfigSnapshot(cfg);
       const controller = "agent:main:controller";
       const requester = "agent:main:requester";
@@ -179,9 +180,7 @@ it("lists off-page controller links and deleted-collector totals while a sibling
           { sessionId: key, updatedAt, visibility: "shared", spawnedBy },
         );
       }
-      persistSubagentRunsToDiskOrThrow(
-        new Map([child, collector].map((entry) => [entry.runId, entry])),
-      );
+      persistRegistryFixture(new Map([child, collector].map((entry) => [entry.runId, entry])));
       const key = { pluginId: "session-list-proof", namespace: "mixed-progress", key: "written" };
       const context = requestContext(cfg);
       await initializeSessionReadContext(context);

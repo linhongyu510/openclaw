@@ -29,14 +29,15 @@ import {
   isBrowserOperatorUiClient,
   isOperatorUiClient,
 } from "../../../utils/message-channel.js";
+import { isGatewayAuthPolicyCurrent } from "../../auth-policy.js";
 import { gitHubPublicApi } from "../../github-public-api.js";
+import { resolveIdentityOperatorScopes } from "../../operator-identity-scopes.js";
 import type { OperatorScope } from "../../operator-scopes.js";
-import { normalizeChromeExtensionOrigin } from "../../origin-check.js";
+import { checkGatewayWsBrowserOrigin, normalizeChromeExtensionOrigin } from "../../origin-check.js";
 import { parseGatewayRole } from "../../role-policy.js";
 import { authenticatedProfileUnavailableError } from "../../server-methods/gateway-client-identity.js";
 import { formatForLog } from "../../ws-log.js";
 import { truncateCloseReason } from "../close-reason.js";
-import { checkGatewayWsBrowserOrigin } from "../ws-origin-policy.js";
 import { isNativeAppUiClient } from "./handshake-auth-helpers.js";
 import type {
   AuthenticatedGatewayConnect,
@@ -140,15 +141,7 @@ export function resolveEffectiveConnectionScopes(params: {
   const verifiedIdentity = params.verifiedIdentity;
   let identityScopes: OperatorScope[] = [];
   if (params.role === "operator" && verifiedIdentity) {
-    const exactIdentityScopes = params.identityScopes?.[verifiedIdentity];
-    identityScopes = exactIdentityScopes ?? [];
-    if (exactIdentityScopes === undefined && verifiedIdentity.includes("@")) {
-      const normalizedIdentity = verifiedIdentity.toLowerCase();
-      identityScopes =
-        Object.entries(params.identityScopes ?? {}).find(
-          ([identity]) => identity.includes("@") && identity.toLowerCase() === normalizedIdentity,
-        )?.[1] ?? [];
-    }
+    identityScopes = resolveIdentityOperatorScopes(verifiedIdentity, params.identityScopes);
   }
   const scopes = applyConnectionScopeCap({
     scopes: [...new Set([...params.deviceScopes, ...identityScopes])],
@@ -171,7 +164,7 @@ export function rejectGatewayConnectOrigin(
   reason: string,
 ): void {
   const message =
-    "origin not allowed (open the Control UI from the gateway host or allow it in gateway.controlUi.allowedOrigins)";
+    "origin not allowed (use gateway.publicOrigin with allowedOrigins omitted, or allow this origin in gateway.controlUi.allowedOrigins)";
   context.markHandshakeFailure("origin-mismatch", {
     origin: context.handler.requestOrigin ?? "n/a",
     host: context.handler.requestHost ?? "n/a",
@@ -188,6 +181,15 @@ export function resolveGatewayConnectPolicyFailure(
   context: GatewayConnectPhaseContext,
   state: AuthenticatedGatewayConnect,
 ): { kind: "auth" } | { kind: "origin"; reason: string } | undefined {
+  if (context.browserOrigin) {
+    const originCheck = checkGatewayWsBrowserOrigin(context.browserOrigin, getRuntimeConfig());
+    if (!originCheck.ok) {
+      return { kind: "origin", reason: originCheck.reason };
+    }
+  }
+  if (!isGatewayAuthPolicyCurrent(state.authPolicy)) {
+    return { kind: "auth" };
+  }
   if (
     state.sessionUsesSharedGatewayAuth &&
     context.handler.getRequiredSharedGatewaySessionGeneration &&
@@ -195,12 +197,6 @@ export function resolveGatewayConnectPolicyFailure(
       context.handler.getRequiredSharedGatewaySessionGeneration()
   ) {
     return { kind: "auth" };
-  }
-  if (context.browserOrigin) {
-    const originCheck = checkGatewayWsBrowserOrigin(context.browserOrigin, getRuntimeConfig());
-    if (!originCheck.ok) {
-      return { kind: "origin", reason: originCheck.reason };
-    }
   }
   return undefined;
 }

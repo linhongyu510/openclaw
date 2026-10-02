@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
-import { channel } from "node:diagnostics_channel";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { afterEach, expect, it, vi } from "vitest";
 import { getNodeSqliteKysely, iterateSqliteQuerySync } from "../../infra/kysely-sync.js";
 import { openNodeSqliteDatabase } from "../../infra/node-sqlite.js";
-import { withSqliteReaderOwner } from "../../infra/sqlite-reader-lifecycle.js";
-import { publishSqliteWalCheckpointHealth } from "../../infra/sqlite-wal-checkpoint.js";
+import {
+  sqliteReaderDatabasePathKey,
+  withSqliteReaderOwner,
+} from "../../infra/sqlite-reader-lifecycle.js";
+import {
+  onSqliteWalCheckpoint,
+  publishSqliteWalCheckpointObservation,
+  type SqliteWalCheckpointSnapshot,
+} from "../../infra/sqlite-wal-checkpoint.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   openOpenClawAgentDatabase,
@@ -20,6 +27,8 @@ import {
   drainSessionDiskBudgetWorkers,
   measureSessionPhysicalDiskUsage,
 } from "./disk-budget-runtime.js";
+import type { SqliteSessionArchivePruningDiagnostics } from "./session-accessor.sqlite-contract.js";
+import * as archivePruningDiagnostics from "./session-history-archive-pruning-diagnostics.js";
 import {
   enforceSqliteSessionHistoryDiskBudget,
   inspectSqliteSessionHistoryDiskBudget,
@@ -28,13 +37,14 @@ import {
 import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
 
 const warn = vi.hoisted(() => vi.fn());
+const info = vi.hoisted(() => vi.fn());
 vi.mock("../../logging/subsystem.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../logging/subsystem.js")>();
   return {
     ...actual,
     createSubsystemLogger: (name: string) => {
       const logger = actual.createSubsystemLogger(name);
-      return name === "sessions/history-eviction" ? { ...logger, warn } : logger;
+      return name === "sessions/history-eviction" ? { ...logger, warn, info } : logger;
     },
   };
 });
@@ -47,6 +57,134 @@ afterEach(async () => {
   await state?.cleanup();
 });
 
+it.each(["checkpointed", "newer-frames", "deleted-rows", "recovery-during-handoff"] as const)(
+  "prunes archives after checkpoint recovery: %s",
+  async (kind) => {
+    const newerFrames = kind !== "checkpointed";
+    const canonical = kind === "deleted-rows";
+    state = await createOpenClawTestState({
+      prefix: "wal-budget-checkpointed-",
+      layout: "state-only",
+      scenario: "minimal",
+    });
+    const options = { agentId: "main", env: state.env };
+    const database = openOpenClawAgentDatabase(options);
+    ensureSessionTranscriptArchiveSchema(database.db);
+    database.db.exec("PRAGMA wal_autocheckpoint=0");
+    fs.mkdirSync(state.sessionsDir(), { recursive: true });
+    const storePath = path.join(state.sessionsDir(), "sessions.json");
+    const reader = openNodeSqliteDatabase(database.path, { readOnly: true });
+    const write = database.db.prepare(
+      "INSERT OR REPLACE INTO cache_entries(scope,key,blob,updated_at) VALUES ('wal-proof','traffic',?,?)",
+    );
+    let pendingRecovery: (() => void) | undefined;
+    const observePruning = archivePruningDiagnostics.observeSessionArchivePruning;
+    vi.spyOn(archivePruningDiagnostics, "observeSessionArchivePruning").mockImplementation(
+      async <T>(...args: Parameters<typeof observePruning<T>>) => {
+        const result = await observePruning(...args);
+        if (args[0].checkpointIncomplete && pendingRecovery) {
+          const recover = pendingRecovery;
+          pendingRecovery = undefined;
+          recover();
+        }
+        return result;
+      },
+    );
+    // Settle schema and initial allocation before measuring steady-state traffic.
+    write.run(Buffer.from("committed-init"), -1);
+    expect(database.walMaintenance.checkpoint()).toBe(true);
+    warn.mockClear();
+    info.mockClear();
+    try {
+      for (let tick = 0; tick < 3; tick++) {
+        if (reader.isTransaction) {
+          reader.exec("ROLLBACK");
+        }
+        write.run(Buffer.from(`committed-${tick}`), tick);
+        reader.exec("BEGIN");
+        reader.prepare("SELECT blob FROM cache_entries WHERE scope='wal-proof'").get();
+        const file = path.join(
+          state.sessionsDir(),
+          `traffic-${tick}.jsonl.deleted.2020-01-01T00-00-00.000Z`,
+        );
+        fs.writeFileSync(file, Buffer.alloc(256 * 1024, tick));
+        if (canonical) {
+          database.db
+            .prepare(`INSERT INTO session_transcript_archives
+            (session_id,generation,session_key,reason,encoding,archive_blob,archive_sha256,archive_name,created_at,published_at)
+            VALUES (?, 'generation', ?, 'deleted', 'identity', X'00', ?, ?, 1, 1)`)
+            .run(
+              `archive-${tick}`,
+              `agent:main:archive-${tick}`,
+              "0".repeat(64),
+              path.basename(file),
+            );
+        }
+        const before = await measureSessionPhysicalDiskUsage(storePath);
+        const enforce = () =>
+          enforceSqliteSessionHistoryDiskBudget({
+            ...options,
+            storePath,
+            mode: "enforce",
+            maintenance: {
+              maxDiskBytes: before.totalBytes - 128 * 1024,
+              highWaterBytes: before.totalBytes - 128 * 1024,
+            },
+          });
+        if (newerFrames) {
+          write.run(Buffer.from(`pending-${tick}`), tick);
+          const recover = () => {
+            reader.exec("ROLLBACK");
+            expect(database.walMaintenance.checkpoint()).toBe(true);
+            reader.exec("BEGIN");
+            reader.prepare("SELECT blob FROM cache_entries WHERE scope='wal-proof'").get();
+            write.run(Buffer.from(`newer-${tick}`), tick);
+          };
+          if (kind === "recovery-during-handoff") {
+            pendingRecovery = recover;
+          }
+          await expect(enforce()).resolves.toMatchObject({
+            deferredReason: "checkpoint-incomplete",
+            removedFiles: 0,
+            freedBytes: 0,
+          });
+          expect(fs.existsSync(file)).toBe(true);
+          if (kind === "recovery-during-handoff") {
+            expect(pendingRecovery).toBeUndefined();
+          } else {
+            recover();
+          }
+        }
+        const result = await enforce();
+        expect(result?.deferredReason).toBe(canonical ? "checkpoint-incomplete" : undefined);
+        expect(result?.removedFiles).toBe(1);
+        if (canonical) {
+          await expect(enforce()).resolves.toMatchObject({
+            deferredReason: "checkpoint-incomplete",
+            removedFiles: 0,
+          });
+        } else {
+          expect(result?.freedBytes).toBeGreaterThanOrEqual(256 * 1024);
+        }
+        expect(fs.existsSync(file)).toBe(false);
+        expect(
+          reader.prepare("SELECT blob FROM cache_entries WHERE scope='wal-proof'").get()?.blob,
+        ).toEqual(new Uint8Array(Buffer.from(`${newerFrames ? "pending" : "committed"}-${tick}`)));
+      }
+      if (!canonical) {
+        expect(warn).toHaveBeenCalledTimes(newerFrames ? 3 : 0);
+        expect(info).toHaveBeenCalledTimes(3);
+        expect(info).toHaveBeenLastCalledWith(
+          "session history disk budget cleanup completed",
+          expect.objectContaining({ removedFiles: 1, removedEntries: 0 }),
+        );
+      }
+    } finally {
+      reader.close();
+    }
+  },
+);
+
 it.each(["transaction", "iterator"] as const)(
   "defers WAL-only pressure without deleting archives, names the %s, and resumes after checkpoint recovery",
   async (kind) => {
@@ -57,6 +195,7 @@ it.each(["transaction", "iterator"] as const)(
     });
     const options = { agentId: "main", env: state.env };
     const database = openOpenClawAgentDatabase(options);
+    const databasePathKey = sqliteReaderDatabasePathKey(database.path);
     ensureSessionTranscriptArchiveSchema(database.db);
     database.db.exec("PRAGMA wal_autocheckpoint=0");
     const sessions = state.sessionsDir();
@@ -72,8 +211,18 @@ it.each(["transaction", "iterator"] as const)(
       fs.writeFileSync(path.join(sessions, name), bytes);
       return name;
     });
-    expect(database.walMaintenance.checkpoint()).toBe(true);
-    const previouslyCompleted = database.walMaintenance.health;
+    const initialCheckpoints: SqliteWalCheckpointSnapshot[] = [];
+    const stopObserving = onSqliteWalCheckpoint(({ databasePath, health, observedAtNs }) => {
+      if (databasePath === databasePathKey) {
+        initialCheckpoints.push({ health, observedAtNs });
+      }
+    });
+    try {
+      expect(database.walMaintenance.checkpoint()).toBe(true);
+    } finally {
+      stopObserving();
+    }
+    const previouslyCompleted = initialCheckpoints.at(-1);
     assert(previouslyCompleted);
     const initial = await measureSessionPhysicalDiskUsage(storePath);
     const maintenance = resolveMaintenanceConfigFromInput({
@@ -122,19 +271,18 @@ it.each(["transaction", "iterator"] as const)(
         reader.exec("ROLLBACK");
       }
     };
-    const diagnostics: unknown[] = [];
-    const writes = channel("openclaw.session.write");
-    const observe = (message: unknown) => {
-      if (
-        message &&
-        typeof message === "object" &&
-        "operation" in message &&
-        message.operation === "session.history.archive-prune"
-      ) {
-        diagnostics.push(message);
-      }
-    };
-    writes.subscribe(observe);
+    const diagnostics: SqliteSessionArchivePruningDiagnostics[] = [];
+    const observePruning = archivePruningDiagnostics.observeSessionArchivePruning;
+    vi.spyOn(archivePruningDiagnostics, "observeSessionArchivePruning").mockImplementation(
+      async <T>(...args: Parameters<typeof observePruning<T>>) => {
+        const [facts, run] = args;
+        try {
+          return await observePruning(facts, run);
+        } finally {
+          diagnostics.push(structuredClone(facts));
+        }
+      },
+    );
     warn.mockClear();
     try {
       const write = database.db.prepare(
@@ -168,20 +316,22 @@ it.each(["transaction", "iterator"] as const)(
       });
       expect(diagnostics).toEqual([
         expect.objectContaining({
-          archivePruning: expect.objectContaining({
-            completed: false,
-            checkpointCalls: 1,
-            checkpointIncomplete: 1,
-            walBytesBefore: before.databaseWalBytes,
-            walBytesAfter: before.databaseWalBytes,
-          }),
+          completed: false,
+          checkpointCalls: 2,
+          checkpointIncomplete: 1,
+          walBytesBefore: before.databaseWalBytes,
+          walBytesAfter: before.databaseWalBytes,
         }),
       ]);
       assert(blocked?.checkpoint);
-      // A delayed worker fact must not clear a newer incomplete observation.
-      publishSqliteWalCheckpointHealth(database.path, {
+      // A delayed worker fact remains older even when its wall clock was ahead.
+      publishSqliteWalCheckpointObservation(database.path, {
         ...previouslyCompleted,
-        observedAtMs: blocked.checkpoint.observedAtMs - 1,
+        health: {
+          ...previouslyCompleted.health,
+          observedAtMs: blocked.checkpoint.observedAtMs + 3600_000,
+          lastCompletedAtMs: blocked.checkpoint.observedAtMs + 3600_000,
+        },
       });
       for (let hour = 1; hour <= 3; hour++) {
         kickSessionHistoryDiskBudgetMaintenance({
@@ -223,16 +373,52 @@ it.each(["transaction", "iterator"] as const)(
       release();
       // Release alone is not an observed successful checkpoint.
       await expect(enforce()).resolves.toMatchObject({ deferredReason: "checkpoint-incomplete" });
-      expect(database.walMaintenance.checkpoint()).toBe(true);
+      const checkpointClock = vi
+        .spyOn(Date, "now")
+        .mockReturnValue(blocked.checkpoint.observedAtMs - 1);
+      try {
+        expect(database.walMaintenance.checkpoint()).toBe(true);
+      } finally {
+        checkpointClock.mockRestore();
+      }
       expect(fs.statSync(`${database.path}-wal`).size).toBe(0);
       const recovered = await enforce();
-      expect(recovered?.deferredReason).toBeUndefined();
+      const lastPruning = diagnostics.at(-1);
+      expect(
+        recovered?.deferredReason,
+        recovered?.deferredReason === undefined
+          ? undefined
+          : JSON.stringify(
+              {
+                blockedCheckpoint: blocked.checkpoint,
+                hostCheckpoint: database.walMaintenance.health,
+                now: Date.now(),
+                realClock: performance.timeOrigin + performance.now(),
+                dateNowMocked: vi.isMockFunction(Date.now),
+                recovered,
+                diagnosticsCount: diagnostics.length,
+                lastArchivePruning: {
+                  completed: lastPruning?.completed,
+                  checkpointCalls: lastPruning?.checkpointCalls,
+                  checkpointIncomplete: lastPruning?.checkpointIncomplete,
+                  checkpoint: lastPruning?.checkpoint,
+                  walBytesBefore: lastPruning?.walBytesBefore,
+                  walBytesAfter: lastPruning?.walBytesAfter,
+                },
+              },
+              // Checkpoint errors can contain paths; retain only the recorded health facts.
+              (key, value) => (key === "error" ? undefined : value),
+            ),
+      ).toBeUndefined();
       expect(recovered?.totalBytesAfter).toBeLessThanOrEqual(maintenance.highWaterBytes!);
       expect(diagnostics.at(-1)).toMatchObject({
-        archivePruning: { completed: true, checkpointIncomplete: 0 },
+        completed: true,
+        checkpointIncomplete: 0,
       });
+      expect(() =>
+        JSON.stringify({ blocked, recovered, diagnostics, health: database.walMaintenance.health }),
+      ).not.toThrow();
     } finally {
-      writes.unsubscribe(observe);
       release();
       reader.close();
     }

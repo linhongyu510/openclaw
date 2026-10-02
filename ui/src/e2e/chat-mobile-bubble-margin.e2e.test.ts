@@ -8,6 +8,7 @@ import {
   marginCases,
   marginScenario,
   measureMargin,
+  resizeMarginViewport,
 } from "./chat-mobile-bubble-margin.test-support.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
@@ -18,7 +19,7 @@ const suite = createControlUiE2eSuite({
 
 suite.define(() => {
   it.each(marginCases)(
-    "preserves $id gutters at 390 and 430 px in both themes and restores desktop geometry",
+    "preserves $id layout at 390 and 430 px in both themes and restores desktop geometry",
     async (testCase) => {
       await suite.withPage(
         { viewport: { width: 1440, height: 1200 }, colorScheme: "light", reducedMotion: "reduce" },
@@ -78,8 +79,37 @@ suite.define(() => {
             // Each width starts from the verified desktop geometry in the same fixture.
             for (const width of [390, 430]) {
               const label = `${testCase.id} at ${width} px in ${theme}`;
-              await page.setViewportSize({ width, height: 1200 });
-              if (!("excluded" in testCase)) {
+              await resizeMarginViewport(page, width);
+              if (testCase.selector === ".chat-session-activity") {
+                const activity = page.locator(".chat-thread .chat-session-activity");
+                const summary = activity.locator("summary");
+                await expectBrowser(summary, label).toBeVisible();
+                await expectBrowser(activity.locator(".chat-bubble"), label).toHaveCount(0);
+                const collapsed = await measureMargin(page, testCase);
+                expect(collapsed.closed, `${label} collapsed left edge`).toBeCloseTo(0, 0);
+                expect(collapsed.open, `${label} collapsed right edge`).toBeCloseTo(0, 0);
+                await summary.click();
+                await expectBrowser(activity.locator(".chat-bubble"), label).toBeVisible();
+                await expectBrowser(
+                  activity.locator(".chat-message-disclosure__toggle"),
+                  `${label} originals need no second disclosure`,
+                ).toHaveCount(0);
+                const expanded = await measureMargin(page, testCase);
+                expect(expanded.closed, `${label} expanded left edge`).toBeCloseTo(0, 0);
+                expect(expanded.open, `${label} expanded right edge`).toBeCloseTo(0, 0);
+                expect(expanded.height, `${label} reveals original content`).toBeGreaterThan(
+                  collapsed.height,
+                );
+                expect(expanded.overflow, `${label} no horizontal overflow`).toBe(0);
+                for (const media of expanded.media.filter((item) => item.width > 0)) {
+                  expect(
+                    Math.min(media.left, media.right),
+                    `${label} media stays inside the activity`,
+                  ).toBeGreaterThanOrEqual(-1);
+                }
+                await summary.click();
+                await expectBrowser(activity.locator(".chat-bubble"), label).toHaveCount(0);
+              } else if (!("excluded" in testCase)) {
                 await expect
                   .poll(
                     async () => {
@@ -113,9 +143,7 @@ suite.define(() => {
                   ).toBeGreaterThanOrEqual(-1);
                 }
                 const toggle = page.locator(".chat-message-disclosure__toggle");
-                if (testCase.id === "forwarded-short") {
-                  await expectBrowser(toggle, label).toBeHidden();
-                } else if (await toggle.count()) {
+                if (await toggle.count()) {
                   await toggle.first().click();
                   const expanded = await measureMargin(page, testCase);
                   expect(expanded.open, `${label} expanded`).toBeGreaterThanOrEqual(
@@ -124,7 +152,7 @@ suite.define(() => {
                   await toggle.first().click();
                 }
               }
-              await page.setViewportSize({ width: 1440, height: 1200 });
+              await resizeMarginViewport(page, 1440);
               await expect
                 .poll(
                   async () => {

@@ -4,10 +4,12 @@ import {
   formatUpdateActivationTimeoutGuidance,
   isVerifiedUpdateRollback,
   UPDATE_ACTIVATION_TIMEOUT_REASON,
+  UPDATE_FOREIGN_DESTINATION_REASON,
   UPDATE_INSTALL_SKIP_GUIDANCE,
 } from "../shared/update-outcome.js";
 import { formatDurationPrecise } from "./format-time/format-duration.ts";
 import type { RestartSentinelPayload } from "./restart-sentinel-store.js";
+import { UPDATE_DESTINATION_RECOVERY } from "./update-destination-failure.js";
 import { formatUpdateDoctorConfigWriteRefusal } from "./update-doctor-config.js";
 import {
   formatUpdateFailureFact,
@@ -24,7 +26,26 @@ import type { UpdateRunResult } from "./update-runner-types.js";
 import { formatUpdateSnapshotCapacity } from "./update-snapshot-capacity.js";
 
 export type UpdateRunReport = { headline: string; lines: string[]; markdown: string };
-export type UpdateRunNoticeKind = "ack" | "parking" | "activating" | "verifying" | "finished";
+
+const IN_PROGRESS_REPORT_PREFIX = "⬆️ OpenClaw update in progress: ";
+const FAILURE_RECOVERY_HINTS: Readonly<Record<string, string>> = {
+  "preflight-insufficient-space":
+    "Free space on the preflight staging and package-manager store filesystems, then rerun the update.",
+  "pnpm-corepack-missing":
+    "This pnpm checkout could not auto-enable pnpm because corepack is missing. Install pnpm manually or install Node with corepack available, then rerun the update command.",
+  "pnpm-corepack-enable-failed":
+    "Run corepack enable manually or install pnpm manually, then rerun the update command.",
+  "pnpm-npm-bootstrap-failed":
+    "This pnpm checkout could not bootstrap pnpm from npm automatically. Install pnpm manually, then rerun the update command.",
+  "preferred-manager-unavailable":
+    "Install the checkout's declared package manager manually, then rerun the update command.",
+};
+
+/** Recognizes pending projections written by this renderer, including shipped reports. */
+export function isUpdateRunReportInProgress(markdown: string): boolean {
+  return markdown.startsWith(IN_PROGRESS_REPORT_PREFIX);
+}
+
 type ReportInput = Pick<
   UpdateRunRecord,
   | "status"
@@ -37,7 +58,8 @@ type ReportInput = Pick<
   | "verification"
   | "repair"
   | "downtimeMs"
->;
+> &
+  Partial<Pick<UpdateRunRecord, "target">>;
 const PHASES = new Set<string>(UPDATE_RUN_PHASES);
 
 type UpdateRunIdentity =
@@ -134,40 +156,14 @@ export function formatUpdateRunRecovery(
     : `not serving (${code})`;
 }
 
-/** The four conversation milestones share the run's recorded versions and final report. */
-export function renderUpdateRunNotice(
-  run: UpdateRunRecord,
-  kind: UpdateRunNoticeKind,
-  options: { currentHealth?: UpdateRunReportHealth } = {},
-): string | null {
-  if (kind === "finished") {
-    return run.status === "running" ? null : renderUpdateRunReport(run, options).markdown;
-  }
-  // Managed parking precedes updater staging; its notice must not advance the ledger phase.
-  const noticePhase = kind === "ack" || kind === "parking" ? "requested" : kind;
-  if (run.status !== "running" || run.phase !== noticePhase) {
-    return null;
-  }
-  const from = run.before.version ? bounded(run.before.version, 120) : undefined;
-  const target = run.after.version ?? run.target.version;
-  const to = target ? bounded(target, 120) : undefined;
-  if (kind === "ack") {
-    return `⬆️ Updating OpenClaw ${from ?? "the current version"} → ${to ?? "the latest release"}. The gateway stays available while the update is validated; you'll get a message here when it finishes.`;
-  }
-  if (kind === "activating" || kind === "parking") {
-    return `⏳ Restarting the gateway now${from && to ? ` (v${from} → v${to})` : ""}…`;
-  }
-  const running = run.verification.runningVersion
-    ? bounded(run.verification.runningVersion, 120)
-    : to;
-  return `🔁 Back${running ? ` on v${running}` : ""}, verifying…`;
-}
-
 function bounded(text: string, limit: number): string {
   return text.length <= limit ? text : `${sliceUtf16Safe(text, 0, limit - 1)}…`;
 }
 
 function recoveryHints(run: ReportInput, nextAction?: string): string[] {
+  if (run.target?.installationMethod === "ocm") {
+    return nextAction ? [] : run.origin.nextAction ? [run.origin.nextAction] : [];
+  }
   if (run.status === "running") {
     return ["Check progress with openclaw update status."];
   }
@@ -180,28 +176,14 @@ function recoveryHints(run: ReportInput, nextAction?: string): string[] {
   if (run.reason === UPDATE_ACTIVATION_TIMEOUT_REASON) {
     return nextAction ? [] : [formatUpdateActivationTimeoutGuidance()];
   }
-  const hints: string[] = [];
-  if (run.reason === "preflight-insufficient-space") {
-    hints.push(
-      "Free space on the preflight staging and package-manager store filesystems, then rerun the update.",
-    );
-  } else if (run.reason === "pnpm-corepack-missing") {
-    hints.push(
-      "This pnpm checkout could not auto-enable pnpm because corepack is missing. Install pnpm manually or install Node with corepack available, then rerun the update command.",
-    );
-  } else if (run.reason === "pnpm-corepack-enable-failed") {
-    hints.push(
-      "Run corepack enable manually or install pnpm manually, then rerun the update command.",
-    );
-  } else if (run.reason === "pnpm-npm-bootstrap-failed") {
-    hints.push(
-      "This pnpm checkout could not bootstrap pnpm from npm automatically. Install pnpm manually, then rerun the update command.",
-    );
-  } else if (run.reason === "preferred-manager-unavailable") {
-    hints.push(
-      "Install the checkout's declared package manager manually, then rerun the update command.",
-    );
+  if (run.reason === UPDATE_FOREIGN_DESTINATION_REASON) {
+    return nextAction ? [] : [`Next step: ${UPDATE_DESTINATION_RECOVERY}`];
   }
+  const hint =
+    run.reason && Object.hasOwn(FAILURE_RECOVERY_HINTS, run.reason)
+      ? FAILURE_RECOVERY_HINTS[run.reason]
+      : undefined;
+  const hints = hint ? [hint] : [];
   if (!nextAction) {
     hints.push("Run openclaw triage to diagnose and repair the failed update.");
   }
@@ -221,7 +203,10 @@ export function renderUpdateRunReport(
   const reconciled = isAcknowledgedAbandonedUpdateRun(run);
   const currentHealth: UpdateRunReportHealth | undefined =
     opts.currentHealth ??
-    (run.status !== "running" && opts.nextAction === undefined && run.origin.nextAction
+    (run.target?.installationMethod !== "ocm" &&
+    run.status !== "running" &&
+    opts.nextAction === undefined &&
+    run.origin.nextAction
       ? { kind: "unavailable" }
       : undefined);
   // Git updates can change commits without changing the package version.
@@ -238,6 +223,12 @@ export function renderUpdateRunReport(
     !currentHealth && run.verification.serviceRunning === true
       ? run.verification.runningVersion
       : undefined;
+  // These producer codes also cover unreadable runtimes and failed capability probes.
+  // They do not establish that Node is old or that upgrading it will repair the update.
+  const runtimeCheckFailed =
+    run.status === "failed" &&
+    (run.reason === "node-runtime-preflight" ||
+      run.reason === "preflight-node-runtime-incompatible");
   let headline: string;
   switch (run.status) {
     case "succeeded":
@@ -250,7 +241,9 @@ export function renderUpdateRunReport(
         ? "ℹ️ OpenClaw abandoned update reconciled."
         : run.reason === LEGACY_UPDATE_RUN_EXPIRED_REASON
           ? `ℹ️ OpenClaw update abandoned: ${reason}.`
-          : `⚠️ OpenClaw update failed: ${reason}.${running ? ` The gateway is running ${running}.` : ""}`;
+          : runtimeCheckFailed
+            ? "⚠️ OpenClaw could not complete the update. A required system check failed."
+            : `⚠️ OpenClaw update failed: ${reason}.`;
       break;
     case "skipped":
       headline =
@@ -264,17 +257,48 @@ export function renderUpdateRunReport(
       headline = `↩️ OpenClaw update rolled back to ${after ?? running ?? before ?? "the previous version"}: ${reason}.`;
       break;
     case "running":
-      headline = `⬆️ OpenClaw update in progress: ${run.phase}.`;
+      headline = `${IN_PROGRESS_REPORT_PREFIX}${run.target?.installationMethod === "ocm" ? "managed by OCM" : run.phase}.`;
       break;
   }
   headline = bounded(headline, 500);
   const lines: string[] = [];
+  if (currentHealth && !run.origin.nextAction && !opts.nextAction) {
+    lines.push(formatUpdateRunCurrentHealth(currentHealth));
+  }
   if (opts.mode && opts.mode !== "unknown") {
     lines.push(`Update mode: ${opts.mode}`);
   }
+  const admission = run.origin.admission;
+  if (admission) {
+    const candidateVersion = admission.candidateVersion
+      ? ` (${bounded(admission.candidateVersion, 120)})`
+      : "";
+    lines.push(`Admission: ${admission.owner}${candidateVersion}.`);
+    if (admission.checks?.length) {
+      lines.push(
+        `Admission checks: ${admission.checks.map((check) => `${bounded(check.name, 120)}: ${check.status}`).join(", ")}.`,
+      );
+    }
+    if (admission.fallbackReason) {
+      lines.push(`Admission fallback: ${bounded(admission.fallbackReason, 500)}`);
+    }
+  }
   for (const step of run.steps) {
+    if (run.status === "running" && step.status === "in_progress" && step.detail) {
+      lines.push(
+        `Waiting: ${step.step}${step.startedAtMs !== undefined ? ` (started ${new Date(step.startedAtMs).toISOString()})` : ""} — ${step.detail}`,
+      );
+    }
     if (step.snapshotCapacity) {
       lines.push(formatUpdateSnapshotCapacity(step.snapshotCapacity));
+    }
+    if (
+      step.detail &&
+      (step.step.startsWith("diagnostic:database snapshot") ||
+        step.step.startsWith("diagnostic:database migration writes") ||
+        step.step.startsWith("diagnostic:database rollback"))
+    ) {
+      lines.push(step.detail);
     }
     if (step.configWriteRefusal) {
       lines.push(formatUpdateDoctorConfigWriteRefusal(step.configWriteRefusal));
@@ -307,45 +331,49 @@ export function renderUpdateRunReport(
   for (const step of selectUpdateFailureReportSteps(
     run.steps.filter((item) => item.status === "failed"),
   )) {
-    lines.push(bounded(`Failed: ${step.step}${step.detail ? ` — ${step.detail}` : ""}`, 300));
-    lines.push(...(step.failureFacts ?? []).slice(0, 5).map(formatUpdateFailureFact));
+    const failure = `Failed: ${step.step}${step.detail ? ` — ${step.detail}` : ""}`;
+    lines.push(bounded(failure, 300));
+    lines.push(
+      ...(step.failureFacts ?? []).slice(0, 5).map((fact) =>
+        formatUpdateFailureFact({
+          ...fact,
+          message:
+            failure.length <= 300 && fact.message && step.detail?.includes(fact.message)
+              ? undefined
+              : fact.message,
+        }),
+      ),
+    );
   }
-  for (const message of updateRunWarningMessages(run.steps).slice(-3)) {
+  for (const message of updateRunWarningMessages(run.steps, 3)) {
     lines.push(`Warning: ${bounded(message, 500)}`);
   }
-  const verification: string[] = [];
   const facts = run.verification;
   const observation = run.steps.findLast((step) => step.step === "gateway recovery verification");
   const recovery = observation && formatUpdateRunRecovery(facts, observation);
   if (recovery) {
-    lines.push(`Recovery: ${recovery}.`);
+    lines.push(`Recorded recovery: ${recovery}.`);
   }
-  if (facts.booted) {
-    verification.push("gateway booted");
-  }
-  if (facts.serviceRunning !== undefined) {
-    verification.push(facts.serviceRunning ? "service running" : "service stopped");
-  }
-  const identity = formatUpdateRunIdentity(facts, run.after);
-  if (identity) {
-    verification.push(identity);
-  }
-  if (facts.channelsReady !== undefined) {
-    verification.push(facts.channelsReady ? "channels ready" : "channels not ready");
-  }
-  if (facts.readyz !== undefined) {
-    verification.push(facts.readyz ? "HTTP ready" : "HTTP not ready");
-  }
-  if (facts.pluginErrors?.length) {
-    verification.push(`${facts.pluginErrors.length} plugin activation error(s)`);
-  }
+  const verification = [
+    facts.booted ? "gateway booted" : undefined,
+    facts.serviceRunning === undefined
+      ? undefined
+      : facts.serviceRunning
+        ? `service running${facts.runningVersion ? ` (${bounded(facts.runningVersion, 120)})` : ""}`
+        : "service stopped",
+    formatUpdateRunIdentity(facts, run.after),
+    facts.channelsReady === undefined
+      ? undefined
+      : facts.channelsReady
+        ? "channels ready"
+        : "channels not ready",
+    facts.readyz === undefined ? undefined : facts.readyz ? "HTTP ready" : "HTTP not ready",
+    facts.pluginErrors?.length
+      ? `${facts.pluginErrors.length} plugin activation error(s)`
+      : undefined,
+  ].filter(Boolean);
   if (verification.length) {
-    lines.push(
-      `${currentHealth ? "Recorded verification" : "Verification"}: ${verification.join("; ")}.`,
-    );
-  }
-  if (currentHealth && !run.origin.nextAction && !opts.nextAction) {
-    lines.push(formatUpdateRunCurrentHealth(currentHealth));
+    lines.push(`Recorded verification: ${verification.join("; ")}.`);
   }
   for (const attempt of run.repair.slice(-3)) {
     lines.push(
@@ -391,7 +419,9 @@ export function renderUpdateRunReport(
   const hints = reconciled
     ? []
     : run.status === "running"
-      ? recoveryHints(run)
+      ? opts.nextAction
+        ? [opts.nextAction]
+        : recoveryHints(run)
       : repairHint
         ? [repairHint, ...(nextAction ? [nextAction] : [])]
         : [
@@ -406,8 +436,24 @@ export function renderUpdateRunReport(
               ].filter((line): line is string => Boolean(line)),
             ),
           ];
-  lines.push(...hints);
   const next = hints.at(-1);
+  if (runtimeCheckFailed) {
+    // Keep the owner's selected action ahead of the diagnostic dump, including
+    // historical-advice qualifications. Neither this layout nor truncation selects recovery.
+    const details = [
+      "Details:",
+      `Reason code: ${reason}`,
+      ...lines,
+      ...hints.filter((line) => line !== next),
+    ];
+    const lead = [headline, ...(next ? [bounded(next, 1100)] : []), ""].join("\n");
+    return {
+      headline,
+      lines: [...(next ? [next, ""] : []), ...details],
+      markdown: `${lead}\n${bounded(details.join("\n"), 1500 - lead.length - 1)}`,
+    };
+  }
+  lines.push(...hints);
   const body = [headline, ...lines.filter((line) => line !== next)].join("\n");
   const suffix = next ? `\n${bounded(next, 1100)}` : "";
   return { headline, lines, markdown: `${bounded(body, 1500 - suffix.length)}${suffix}` };

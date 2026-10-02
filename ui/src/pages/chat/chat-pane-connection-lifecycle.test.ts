@@ -2,9 +2,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 /* @vitest-environment jsdom */
 /* @vitest-environment-options {"url":"http://chat-pane-connection-lifecycle.test/"} */
+import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import type { SessionCapability } from "../../lib/sessions/index.ts";
+import { sessionsResult } from "../../lib/sessions/session-capability.test-support.ts";
+import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
+import { sessionMutationGatewayHello } from "../../test-helpers/gateway-methods.ts";
+import type { ChatHistoryResult } from "./chat-history-snapshot.ts";
+import { chatHistoryRequests } from "./chat-history-state.ts";
+import { applyChatAgentsList } from "./chat-history.ts";
+import { makeRequestMock } from "./chat-host.test-support.ts";
 import { ChatPaneBase } from "./chat-pane-base.ts";
 import {
   createSessionCapabilityFixture,
@@ -14,6 +22,8 @@ import {
 import type { ChatPageHost } from "./chat-state-host.ts";
 import { applySelectedChatAgent } from "./chat-state-refresh.ts";
 import * as chatThread from "./components/chat-thread-interactions.ts";
+import type { AfterCommitEffect } from "./render-lifecycle.ts";
+import { handleAbortChat, replayPendingChatAbort } from "./run-lifecycle.ts";
 import { scheduleChatScroll } from "./scroll.ts";
 
 afterEach(() => {
@@ -23,6 +33,28 @@ afterEach(() => {
   window.localStorage.removeItem("openclaw:skip-rewind-confirm");
   vi.unstubAllGlobals();
 });
+
+function createReconnectRequest(startup: ChatHistoryResult | Promise<ChatHistoryResult>) {
+  return makeRequestMock({
+    "chat.startup": startup,
+    "agents.list": {
+      defaultId: "main",
+      mainKey: "main",
+      scope: "per-sender",
+      agents: [{ id: "main" }],
+    },
+    "chat.metadata": { commands: [] },
+    "models.list": { models: [] },
+    "models.authStatus": { ts: 1, providers: [] },
+    "sessions.branches.list": { branches: [] },
+    "sessions.subscribe": { subscribed: true },
+    "sessions.list": sessionsResult([], 0),
+    "sessions.messages.subscribe": (params: { key: string }) => ({ key: params.key }),
+    "question.list": { questions: [] },
+    "taskSuggestions.list": { suggestions: [] },
+    "sessions.companion.state": { exchanges: [] },
+  });
+}
 
 describe("chat pane connection lifecycle", () => {
   it("notifies the owning shell after a pane leaves its DOM subtree", async () => {
@@ -133,7 +165,7 @@ describe("chat pane connection lifecycle", () => {
     state.realtimeTalkStatus = "listening";
     state.realtimeTalkDetail = "live";
     state.realtimeTalkInputLevel.set(0.7);
-    state.realtimeTalkConversation = [
+    state.realtimeTalkConversationState.entries = [
       { id: "utterance", role: "user", text: "stale", isStreaming: true },
     ];
     state.realtimeTalkVideoStream = {} as MediaStream;
@@ -153,7 +185,7 @@ describe("chat pane connection lifecycle", () => {
     expect(state.realtimeTalkStatus).toBe("idle");
     expect(state.realtimeTalkDetail).toBeNull();
     expect(state.realtimeTalkInputLevel.value).toBe(0);
-    expect(state.realtimeTalkConversation).toEqual([]);
+    expect(state.realtimeTalkConversationState.entries).toEqual([]);
     expect(state.realtimeTalkVideoStream).toBeNull();
     expect(state.realtimeTalkCameraDevices).toEqual([]);
     expect(state.realtimeTalkVideoCapable).toBe(false);
@@ -162,11 +194,20 @@ describe("chat pane connection lifecycle", () => {
   });
 
   it("advances session ownership once per same-client connection transition", async () => {
-    const client = { request: vi.fn(async () => ({})) } as unknown as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client,
-      sessions: createSessionCapabilityFixture(),
+    const request = createReconnectRequest({
+      messages: [],
+      sessionId: "current-session",
+      sessionInfo: {
+        key: "agent:main:current",
+        sessionId: "current-session",
+        kind: "direct",
+        updatedAt: 1,
+      },
     });
+    const client = createTestGatewayClient(request);
+    const { pane, state } = createTestChatPane({ client });
+    state.loadAssistantIdentity = vi.fn(async () => undefined);
+    const deferHydration = vi.spyOn(pane, "deferSessionHydrationUntilTranscript");
     const initialGeneration = pane.connectionGeneration;
     const snapshot = { ...pane.context.gateway.snapshot, client };
 
@@ -184,12 +225,14 @@ describe("chat pane connection lifecycle", () => {
     expect(state.connectionEpoch).toBe(initialGeneration + 1);
     expect(state.chatLoading).toBe(true);
 
-    pane.connectedClient = client;
+    expect(pane.connectedClient).toBeNull();
     pane.applyGatewaySnapshot({ ...snapshot, phase: "connected" });
 
     expect(pane.connectionGeneration).toBe(initialGeneration + 2);
     expect(state.connectionEpoch).toBe(initialGeneration + 2);
-    await vi.waitFor(() => expect(state.chatLoading).toBe(false));
+    expect(deferHydration).toHaveBeenCalledOnce();
+    await expect(deferHydration.mock.calls[0]![1]).resolves.toBe(true);
+    expect(state.chatLoading).toBe(false);
 
     state.chatLoading = true;
     pane.applyGatewaySnapshot({ ...snapshot, phase: "connected" });
@@ -312,35 +355,162 @@ describe("chat pane connection lifecycle", () => {
     },
   );
 
-  it("refreshes the transcript before secondary hydration after a same-client reconnect", () => {
-    const request = vi.fn(() => new Promise<never>(() => {}));
-    const client = {
-      request,
-    } as unknown as GatewayBrowserClient;
+  it("refreshes the transcript before secondary hydration after a same-client reconnect", async () => {
+    const transcript = createDeferred<{
+      messages: [];
+      sessionId: string;
+      sessionInfo: { key: string; sessionId: string; kind: "direct"; updatedAt: number };
+    }>();
+    const request = createReconnectRequest(transcript.promise);
+    const client = createTestGatewayClient(request);
     const { pane, state } = createTestChatPane({ client });
+    state.loadAssistantIdentity = vi.fn(async () => undefined);
     const deferHydration = vi.spyOn(pane, "deferSessionHydrationUntilTranscript");
-    state.connected = false;
-    pane.connectedClient = client;
-
-    pane.applyGatewaySnapshot({
-      ...pane.context.gateway.snapshot,
-      client,
-      phase: "connected",
+    const branches = vi.spyOn(state.sessions, "listBranches");
+    const commitEffects: AfterCommitEffect[] = [];
+    state.renderLifecycle.afterCommit = (effect) => {
+      commitEffects.push(effect);
+      return () => undefined;
+    };
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
     });
+    const snapshot = { ...pane.context.gateway.snapshot, client };
 
+    pane.applyGatewaySnapshot({ ...snapshot, phase: "reconnecting", hello: null });
+    expect(state.connected).toBe(false);
+    expect(pane.connectedClient).toBeNull();
+    pane.applyGatewaySnapshot({ ...snapshot, phase: "connected" });
+    pane.applyGatewaySnapshot({ ...snapshot, phase: "connected" });
+
+    await expect(chatHistoryRequests(state).subscriptionReady).resolves.toBe(true);
+    expect(request.mock.calls.filter(([method]) => method === "chat.startup")).toHaveLength(1);
     expect(request).toHaveBeenCalledWith(
       "chat.startup",
       expect.objectContaining({ limit: 80, maxBytes: 256 * 1024, sessionKey: state.sessionKey }),
-      { signal: expect.any(AbortSignal) },
+      { signal: expect.any(AbortSignal), timeoutMs: 30_000 },
     );
-    expect(deferHydration).toHaveBeenCalledWith(state.sessionKey, expect.any(Promise));
+    expect(deferHydration).toHaveBeenCalledExactlyOnceWith(state.sessionKey, expect.any(Promise));
+    expect(branches).not.toHaveBeenCalled();
+    expect(commitEffects).toEqual([]);
+
+    transcript.resolve({
+      messages: [],
+      sessionId: "reconnected-session",
+      sessionInfo: {
+        key: state.sessionKey,
+        sessionId: "reconnected-session",
+        kind: "direct",
+        updatedAt: 1,
+      },
+    });
+    await expect(deferHydration.mock.calls[0]![1]).resolves.toBe(true);
+    expect(branches).not.toHaveBeenCalled();
+    expect(commitEffects.length).toBeGreaterThan(0);
+    for (const effect of commitEffects) {
+      effect(() => undefined);
+    }
+    expect(branches).toHaveBeenCalledOnce();
+    await branches.mock.results[0]!.value;
+    expect(request.mock.calls.filter(([method]) => method === "chat.startup")).toHaveLength(1);
   });
+
+  it.each(
+    (["online", "queued"] as const).flatMap((mode) =>
+      (["no-active-run", "failure"] as const).flatMap((outcome) =>
+        (["default agent", "main key"] as const).map((change) => ({ mode, outcome, change })),
+      ),
+    ),
+  )(
+    "retires a $mode Stop's $outcome presentation after agents.list changes the $change",
+    async ({ mode, outcome, change }) => {
+      const response = createDeferred<unknown>();
+      const request = vi.fn(() => response.promise);
+      const client = createTestGatewayClient(request);
+      const { state } = createTestChatPane({
+        client,
+        sessions: createSessionCapabilityFixture(),
+      });
+      const refreshCurrentChat = vi.fn(async () => {});
+      state.refreshCurrentChat = refreshCurrentChat;
+      state.sessionKey = "main";
+      state.chatRunId = "original-run";
+      state.assistantAgentId = "main";
+      state.hello = {
+        ...sessionMutationGatewayHello(),
+        snapshot: {
+          sessionDefaults: {
+            defaultAgentId: "main",
+            mainKey: "main",
+            mainSessionKey: "agent:main:main",
+          },
+        },
+      };
+      let stopping: Promise<void | boolean> | undefined;
+      try {
+        if (mode === "queued") {
+          state.connected = false;
+          await handleAbortChat(state, { preserveDraft: true });
+          expect(request).not.toHaveBeenCalled();
+          expect(state.pendingAbort?.runId).toBe("original-run");
+          state.connected = true;
+        } else {
+          stopping = handleAbortChat(state, { preserveDraft: true });
+        }
+        // The normal same-client producer publishes current roster defaults after Hello.
+        applyChatAgentsList(
+          state,
+          {
+            defaultId: change === "default agent" ? "work" : "main",
+            mainKey: change === "main key" ? "home" : "main",
+            scope: "per-sender",
+            agents: [
+              { id: "main", kind: "agent" },
+              { id: "work", kind: "agent" },
+            ],
+          },
+          client,
+        );
+        expect(state.sessionKey).toBe("main");
+        expect(state.chatRunId).toBe("original-run");
+        state.chatError = "Replacement scope warning";
+        state.lastError = state.chatError;
+        if (mode === "queued") {
+          stopping = replayPendingChatAbort(state);
+        }
+        expect(request).toHaveBeenCalledExactlyOnceWith("chat.abort", {
+          sessionKey: "main",
+          runId: "original-run",
+        });
+        if (outcome === "failure") {
+          response.reject(new Error("Previous Stop acknowledgement failed"));
+        } else {
+          response.resolve({ ok: true, aborted: false, runIds: [] });
+        }
+        await stopping;
+        expect(refreshCurrentChat).not.toHaveBeenCalled();
+        expect(state.chatError).toBe("Replacement scope warning");
+        expect(state.lastError).toBe(state.chatError);
+        expect(state.chatRunId).toBe("original-run");
+        expect(request).toHaveBeenCalledOnce();
+        if (mode === "queued") {
+          expect(state.pendingAbort).toBeNull();
+          await expect(replayPendingChatAbort(state)).resolves.toBe(false);
+          expect(request).toHaveBeenCalledOnce();
+        }
+      } finally {
+        response.resolve({ aborted: true });
+        await stopping;
+      }
+    },
+  );
 
   it("replays a pending exact-run stop when the gateway reconnects", async () => {
     const request = vi.fn((method: string) =>
       method === "chat.abort" ? Promise.resolve({ aborted: true }) : new Promise<never>(() => {}),
     );
-    const client = { request } as unknown as GatewayBrowserClient;
+    const client = createTestGatewayClient(request);
     const { pane, state } = createTestChatPane({ client });
     const sessionKey = "agent:main";
     pane.context = {
@@ -364,7 +534,9 @@ describe("chat pane connection lifecycle", () => {
     };
 
     pane.applyGatewaySnapshot({ ...snapshot, phase: "reconnecting", hello: null });
-    state.pendingAbort = { sourceClient: client, runId: "run-main", sessionKey };
+    state.sessionKey = sessionKey;
+    state.chatRunId = "run-main";
+    await handleAbortChat(state, { preserveDraft: true });
 
     pane.applyGatewaySnapshot({
       ...snapshot,
@@ -372,7 +544,11 @@ describe("chat pane connection lifecycle", () => {
       hello: {
         type: "hello-ok",
         protocol: 4,
-        auth: { role: "operator", scopes: ["operator.write"] },
+        auth: {
+          role: "operator",
+          scopes: ["operator.write"],
+          recoveryScope: "test-recovery-scope",
+        },
         features: { methods: ["chat.abort"] },
       },
     });

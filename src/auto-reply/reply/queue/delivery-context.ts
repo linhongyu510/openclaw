@@ -3,6 +3,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { readToolAllowlistIntersection } from "../../../agents/tool-policy.js";
 import { normalizeChatType } from "../../../channels/chat-type.js";
 import { combineChannelAdmissionEvidence } from "../../../channels/message-access/admission-evidence.js";
+import { combineGatewayLocalUserIngress } from "../../../gateway/local-user-ingress.js";
 import { channelRouteDedupeKey } from "../../../plugin-sdk/channel-route.js";
 import { resolveGlobalSingleton } from "../../../shared/global-singleton.js";
 import { normalizeMessageChannel } from "../../../utils/message-channel.js";
@@ -62,7 +63,7 @@ function resolveTurnAdoptionLifecycleDeliveryKey(
 // Fields like authProfileId, elevatedLevel, ownerNumbers, and config are
 // intentionally excluded because they are session-level or not consulted in
 // per-message authorization checks.
-function resolveFollowupAuthorizationKey(run: FollowupRun): string {
+export function resolveFollowupAuthorizationKey(run: FollowupRun): string {
   const execution = run.run;
   return JSON.stringify([
     resolveReplyOperatorAuthorityKey(run.operatorAuthority),
@@ -181,12 +182,15 @@ export function resolveFollowupReplyAnchor(run: FollowupRun): string | undefined
 
 type FollowupRuntimeMetadata = Pick<
   FollowupRun,
+  | "sourceTurnId"
   | "operatorAuthority"
+  | "personalBootstrapEligible"
   | "currentInboundEventKind"
   | "currentInboundAudio"
   | "currentInboundContext"
   | "explicitSkillSelections"
   | "channelAdmissionEvidence"
+  | "gatewayLocalUserIngress"
   | "toolsAllow"
   | "disableTools"
   | "abortSignal"
@@ -259,7 +263,11 @@ export function collectRuntimeMetadata(
     ).values(),
   ];
   return {
+    sourceTurnId: authoritySource?.sourceTurnId,
     operatorAuthority: authoritySource?.operatorAuthority,
+    ...(items.length > 0 && items.every((item) => item.personalBootstrapEligible === true)
+      ? { personalBootstrapEligible: true }
+      : {}),
     currentInboundEventKind: currentTurnSource?.currentInboundEventKind,
     currentInboundAudio: currentTurnSource?.currentInboundAudio,
     currentInboundContext: collectCurrentInboundContext(items),
@@ -267,6 +275,9 @@ export function collectRuntimeMetadata(
       explicitSkillSelections.length > 0 ? explicitSkillSelections : undefined,
     channelAdmissionEvidence: combineChannelAdmissionEvidence(
       items.map((item) => item.channelAdmissionEvidence),
+    ),
+    gatewayLocalUserIngress: combineGatewayLocalUserIngress(
+      items.map((item) => item.gatewayLocalUserIngress),
     ),
     toolsAllow: authoritySource?.toolsAllow,
     disableTools: authoritySource?.disableTools,
@@ -276,5 +287,54 @@ export function collectRuntimeMetadata(
     turnAdoptionLifecycle: items.length === 1 ? items[0]?.turnAdoptionLifecycle : undefined,
     replyOperationRunStates: items.flatMap((item) => item.replyOperationRunStates ?? []),
     queuedFollowupReplyDisposition: items.at(-1)?.queuedFollowupReplyDisposition,
+  };
+}
+
+export function resolveOverflowSummaryInboundEventKind(
+  sources: FollowupRun[],
+): "room_event" | undefined {
+  return sources.length > 0 &&
+    sources.every((source) => source.currentInboundEventKind === "room_event")
+    ? "room_event"
+    : undefined;
+}
+
+export function createOverflowSummaryRetrySource(source: FollowupRun): FollowupRun {
+  return {
+    prompt: source.prompt,
+    sourceTurnId: source.sourceTurnId,
+    admissionSessionId: source.admissionSessionId,
+    operatorAuthority: source.operatorAuthority,
+    personalBootstrapEligible: source.personalBootstrapEligible,
+    queueAbortSignal: source.queueAbortSignal,
+    transcriptPrompt: source.transcriptPrompt,
+    userTurnTranscriptRecorder: source.userTurnTranscriptRecorder,
+    explicitSkillSelections: source.explicitSkillSelections,
+    toolsAllow: source.toolsAllow,
+    disableTools: source.disableTools,
+    images: source.images,
+    imageOrder: source.imageOrder,
+    media: source.media,
+    channelAdmissionEvidence: source.channelAdmissionEvidence,
+    gatewayLocalUserIngress: source.gatewayLocalUserIngress,
+    messageId: source.messageId,
+    summaryLine: source.summaryLine,
+    enqueuedAt: source.enqueuedAt,
+    originatingChannel: source.originatingChannel,
+    originatingTo: source.originatingTo,
+    originatingAccountId: source.originatingAccountId,
+    originatingThreadId: source.originatingThreadId,
+    originatingChatId: source.originatingChatId,
+    originatingReplyToId: source.originatingReplyToId,
+    originatingReplyToMode: source.originatingReplyToMode,
+    originatingChatType: source.originatingChatType,
+    abortSignal: source.abortSignal,
+    turnAdoptionLifecycle: source.turnAdoptionLifecycle,
+    replyOperationRunStates: source.replyOperationRunStates,
+    queuedFollowupReplyDisposition: source.queuedFollowupReplyDisposition,
+    ...(source.currentInboundEventKind === "room_event"
+      ? { currentInboundEventKind: "room_event" }
+      : {}),
+    run: source.run,
   };
 }

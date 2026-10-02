@@ -4,9 +4,9 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalString,
   readStringValue,
+  resolvePrimaryStringValue,
 } from "@openclaw/normalization-core/string-coerce";
 import { formatCliCommand } from "../cli/command-format.js";
-import { getRetainedLegacyDefaultAgentId } from "../config/legacy.default-agent-owner-state.js";
 import { hasExplicitModelPolicyAllow } from "../config/model-policy-allowlist-migration.js";
 import { resolveStateDir } from "../config/paths.js";
 import type {
@@ -104,6 +104,41 @@ export type ResolvedAgentConfig = {
   tools?: AgentEntry["tools"];
 };
 
+/** ACP primaries select the harness; explicit fallback lists still configure native calls. */
+export function resolveAgentModelConfigForRuntime(
+  agent: Pick<ResolvedAgentConfig, "model" | "runtime"> | undefined,
+  runtime: "native" | "acp" = "native",
+): ResolvedAgentConfig["model"] {
+  const model = agent?.model;
+  if (runtime === "acp" || agent?.runtime?.type !== "acp") {
+    return model;
+  }
+  return model && typeof model === "object" && Array.isArray(model.fallbacks)
+    ? { fallbacks: model.fallbacks }
+    : undefined;
+}
+
+/** Native overrides exclude ACP harness primaries without changing authored configuration. */
+export function resolveAgentNativeModelPrimary(
+  cfg: OpenClawConfig,
+  agentId: string,
+): string | undefined {
+  return resolvePrimaryStringValue(
+    resolveAgentModelConfigForRuntime(resolveAgentConfig(cfg, agentId)),
+  );
+}
+
+/** Native requests inherit the raw default, including its configured auth-profile suffix. */
+export function resolveNativeModelPrimary(
+  cfg: OpenClawConfig,
+  agentId: string,
+): string | undefined {
+  return (
+    resolveAgentNativeModelPrimary(cfg, agentId) ??
+    resolvePrimaryStringValue(cfg.agents?.defaults?.model)
+  );
+}
+
 /** Strip null bytes from paths to prevent ENOTDIR errors. */
 function stripNullBytes(s: string): string {
   return s.replaceAll("\0", "");
@@ -121,10 +156,7 @@ type AgentRosterFactsBatch = {
 };
 
 let activeAgentRosterFactsBatch: AgentRosterFactsBatch | undefined;
-const immutableAgentRosterFacts = new WeakMap<
-  OpenClawConfig,
-  { legacyOwner: string | undefined; facts: AgentRosterFacts }
->();
+const immutableAgentRosterFacts = new WeakMap<OpenClawConfig, AgentRosterFacts>();
 
 /**
  * Runs a read-only callback with batch-scoped roster memoization.
@@ -151,14 +183,12 @@ function readAgentRosterFacts(cfg: OpenClawConfig): AgentRosterFacts | undefined
   if (!isDeeplyFrozenPlainData(cfg)) {
     return undefined;
   }
-  // Migration provenance lives outside the immutable config and can still change.
-  const legacyOwner = getRetainedLegacyDefaultAgentId(cfg);
   let cached = immutableAgentRosterFacts.get(cfg);
-  if (!cached || cached.legacyOwner !== legacyOwner) {
-    cached = { legacyOwner, facts: {} };
+  if (!cached) {
+    cached = {};
     immutableAgentRosterFacts.set(cfg, cached);
   }
-  return cached.facts;
+  return cached;
 }
 
 /** Converts either supported roster representation into the canonical keyed shape. */
