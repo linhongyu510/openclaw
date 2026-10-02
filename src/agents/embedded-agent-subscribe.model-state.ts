@@ -192,14 +192,13 @@ export function createEmbeddedModelState(
               // counters, and main renews the budget on any completed turn.
               // The only false-positive this guards against is silent overflow,
               // which `isContextOverflow` excludes on its own.
-              admitted:
-                (message.stopReason === "stop" ||
-                  message.stopReason === "toolUse" ||
-                  message.stopReason === "length") &&
-                !isContextOverflow(
-                  message,
-                  params.contextWindowTokens ?? params.session.model?.contextWindow,
-                ),
+              // turn_end only reaches here for stop/toolUse (the gate above);
+              // a `length` truncated reply emits no successful accounting event,
+              // matching main--it is not treated as budget-renewing progress.
+              admitted: !isContextOverflow(
+                message,
+                params.contextWindowTokens ?? params.session.model?.contextWindow,
+              ),
             });
           }
           return;

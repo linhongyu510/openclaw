@@ -594,4 +594,30 @@ describe("subscribeEmbeddedAgentSession model state", () => {
     snapshot.usage.input = 500;
     expect(subscription.getCurrentAttemptAssistant()?.usage.input).toBe(0);
   });
+
+  it("admits a completed stop with zero/absent usage when not overflowing (Rev 8 compat)", async () => {
+    // A provider/proxy can finish a non-refusal stop without reporting counters.
+    // main renews the budget on any completed turn; silent overflow is the only
+    // thing excluded, via isContextOverflow--not via nonzero usage.
+    const onContextAccountingEvent = vi.fn();
+    const harness = createSubscribedSessionHarness({
+      runId: "run-zero-usage-compat",
+      lifecycleGeneration: agentEvents.getAgentEventLifecycleGeneration(),
+      onContextAccountingEvent,
+    });
+    await runUsageCalls(
+      harness,
+      // Pure-zero usage snapshot: no input/output, no contextUsage.
+      [{ usage: makeUsage() }],
+      () => {},
+    );
+    const observed = onContextAccountingEvent.mock.calls.map(([e]) => ({
+      successful: e.successful,
+      admitted: e.admitted,
+    }));
+    expect(observed).toEqual([
+      { successful: false, admitted: false },
+      { successful: true, admitted: true },
+    ]);
+  });
 });
