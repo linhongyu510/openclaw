@@ -197,7 +197,7 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     expect(dedup.anchor).toBeUndefined();
   });
 
-  it("F: dirty index but cached turn's identity row is gone still rejects (no false-ack)", async () => {
+  it("F: dirty index but cached turn removed from the durable log still rejects (no false-ack)", async () => {
     const dir = tempDirs.make("openclaw-anchor-3state-f-");
     const scope = {
       agentId: "main",
@@ -211,20 +211,24 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     const m1 = SessionManager.open(scope, dir);
     const appendedId = m1.appendMessage(user);
 
-    // Simulate another writer that both leaves the projection dirty AND physically removes
-    // the cached turn's authoritative identity row (what a suffix remove does). Degrading on
-    // "dirty" alone would false-acknowledge a non-existent turn; it must reject instead.
+    // Simulate another writer that physically removes the cached turn's durable event row (a
+    // suffix remove deletes transcript_events, which cascades transcript_event_identities) but
+    // crashes before rebuilding the projection, leaving it dirty. Degrading on "dirty" alone
+    // would false-acknowledge a turn that is no longer even in the durable tree; the canonical
+    // visible-path revalidation must reject instead.
     const database = openOpenClawAgentDatabase({
       agentId: scope.agentId,
       path: resolveSessionTranscriptDatabasePath({ ...scope, storePath: scope.storePath }),
     });
+    const kSeq = database.db
+      .prepare("SELECT seq FROM transcript_event_identities WHERE session_id = ? AND event_id = ?")
+      .get(scope.sessionId, appendedId) as { seq: number } | undefined;
+    expect(kSeq).toBeTruthy();
     database.db
-      .prepare("DELETE FROM transcript_event_identities WHERE session_id = ? AND event_id = ?")
-      .run(scope.sessionId, appendedId);
+      .prepare("DELETE FROM transcript_events WHERE session_id = ? AND seq = ?")
+      .run(scope.sessionId, kSeq!.seq);
     database.db
-      .prepare(
-        "UPDATE session_transcript_index_state SET needs_rebuild = 1, leaf_event_id = 'some-other-turn' WHERE session_id = ?",
-      )
+      .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
       .run(scope.sessionId);
 
     expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
@@ -246,25 +250,44 @@ describe("SessionManager anchor dedup three-state boundary", () => {
     const m1 = SessionManager.open(scope, dir);
     const appendedId = m1.appendMessage(user);
 
-    // Production stale-row mechanism: a branch switch / alternative-parent append moves the
-    // durable tail off the cached user's parent chain (and marks the index dirty). The cached
-    // identity row may still exist, but a recursive walk from the current tail no longer reaches
-    // it. Degrading would false-ack a displaced user; the durable chain walk must reject.
+    // A second manager on the SAME session advances the durable tail past K (assistant A2) and
+    // then writes a real leaf-control branch switch back to "existing-assistant". K's identity
+    // history is NOT deleted; it is simply displaced onto a branch the canonical leaf no longer
+    // selects. The leaf-control write marks the projection dirty (it never forward-indexes
+    // through a branch change).
+    const m2 = SessionManager.open(scope, dir);
+    m2.appendMessage(assistantMessage("late"));
+    m2.appendLeafControl({ targetId: "existing-assistant", appendParentId: "existing-assistant" });
+
     const database = openOpenClawAgentDatabase({
       agentId: scope.agentId,
       path: resolveSessionTranscriptDatabasePath({ ...scope, storePath: scope.storePath }),
     });
-    database.db
-      .prepare("DELETE FROM transcript_event_identities WHERE session_id = ? AND event_id = ?")
-      .run(scope.sessionId, appendedId);
-    database.db
-      .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
-      .run(scope.sessionId);
+    // Non-vacuity proof: the OLD handwritten heuristic (walk the raw transcript_event_identities
+    // parent chain from max seq) still reaches K -- the tail leaf-control's raw parent is A2,
+    // whose parent is K -- so it would have wrongly degraded (false-ack). The new canonical
+    // visible-path owner does not.
+    const oldHeuristic = database.db
+      .prepare(
+        `WITH RECURSIVE chain AS (
+           SELECT event_id, parent_id FROM (
+             SELECT event_id, parent_id, seq FROM transcript_event_identities
+               WHERE session_id = ? ORDER BY seq DESC LIMIT 1
+           )
+           UNION ALL
+           SELECT i.event_id, i.parent_id FROM transcript_event_identities i
+             JOIN chain c ON i.event_id = c.parent_id WHERE i.session_id = ?
+         )
+         SELECT COUNT(*) AS hit FROM chain WHERE event_id = ?`,
+      )
+      .get(scope.sessionId, scope.sessionId, appendedId) as { hit: number };
+    expect(oldHeuristic.hit).toBe(1);
 
+    // m1 never reloaded; its cache still names K as the current turn. The canonical active
+    // branch now excludes K, so replaying the duplicate must reject, not degrade.
     expect(() => m1.appendMessageWithTranscriptAnchor(user)).toThrowError(
       /Session transcript anchor was not returned/,
     );
-    void appendedId;
   });
 
   it("H: duplicate delivery inside an enclosing write transaction reaches the replay", async () => {
@@ -283,19 +306,24 @@ describe("SessionManager anchor dedup three-state boundary", () => {
 
     // Pass the fixture's agent + store path so the OUTER transaction opens the SAME database file
     // m1 reads (without it, runOpenClawAgentWriteTransaction opens the default agent db and the
-    // replay never hits a nested transaction on the fixture handle). Assert the dedup actually
-    // replayed; reject any thrown error.
+    // replay never hits a nested transaction on the fixture handle).
     const fixtureDbOptions = {
       agentId: scope.agentId,
       path: resolveSessionTranscriptDatabasePath(scope),
     };
     let replay: ReturnType<SessionManager["appendMessageWithTranscriptAnchor"]> | undefined;
-    expect(() =>
-      runOpenClawAgentWriteTransaction((database) => {
-        expect(database.path).toBe(fixtureDbOptions.path);
-        replay = m1.appendMessageWithTranscriptAnchor(user);
-      }, fixtureDbOptions),
-    ).not.toThrow();
+    runOpenClawAgentWriteTransaction((database) => {
+      expect(database.path).toBe(fixtureDbOptions.path);
+      // The outer write tx holds the SAME pooled handle the anchor read reuses. Prove the nested
+      // transaction is real: a raw BEGIN on this handle must fail precisely -- exactly what the
+      // old unconditional-BEGIN anchor read would have thrown. The savepoint-aware
+      // runSqliteDeferredTransactionSync instead nests via SAVEPOINT and lets the replay through.
+      expect(database.db.isTransaction).toBe(true);
+      expect(() => database.db.exec("BEGIN")).toThrow(
+        /cannot start a transaction within a transaction/,
+      );
+      replay = m1.appendMessageWithTranscriptAnchor(user);
+    }, fixtureDbOptions);
     expect(replay?.appended).toBe(false);
   });
 });

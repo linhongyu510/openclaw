@@ -10,6 +10,7 @@ import {
   toDatabaseOptions,
   type ResolvedTranscriptScope,
 } from "./session-accessor.sqlite-scope.js";
+import { isTranscriptEntryOnActivePathInTransaction } from "./session-accessor.sqlite-transcript-parent.js";
 import { sessionTranscriptIndexNeedsReconcile } from "./session-transcript-index.js";
 import type { TranscriptEntryAnchor } from "./transcript-entry-anchor.js";
 import { readMessageIdempotencyKey } from "./transcript-message-identity.js";
@@ -120,20 +121,23 @@ export interface ActiveTranscriptAnchorRead {
    */
   indexDirty: boolean;
   /**
-   * True only when indexDirty is set AND the cached entry still has a row in the
-   * authoritative `transcript_event_identities` log. A suffix remove physically deletes
-   * those rows, so during a dirty projection we revalidate against this log instead of
-   * blanket-degrading: a cached turn another writer deleted must not be false-acked.
+   * True only when indexDirty is set AND the cached entry is still on the canonical visible
+   * active branch resolved from the durable event tree (the same owner the projection rebuild
+   * uses). A branch switch, alternative-parent rewrite, or suffix remove moves/deletes the turn
+   * off that path, so during a dirty projection we revalidate against the durable tree instead
+   * of walking the raw parent chain or trusting the stale watermark -- a displaced turn must not
+   * be false-acked.
    */
   cachedIdentityExists: boolean;
 }
 
 /**
  * Reads the active anchor together with the reconcile state against ONE opened database
- * snapshot (a single deferred read transaction on a fresh connection). This distinguishes a
- * transiently dirty index (benign duplicate during the reconcile window) from a clean index
- * whose active projection lacks the cached entry, and -- while dirty -- revalidates the cached
- * turn against the authoritative identity log so a deleted turn still rejects.
+ * snapshot (a single deferred, savepoint-aware transaction). This distinguishes a transiently
+ * dirty index (benign duplicate during the reconcile window) from a clean index whose active
+ * projection lacks the cached entry, and -- while dirty -- revalidates the cached turn against
+ * the canonical visible active path resolved from the durable event tree (the same owner the
+ * projection rebuild uses), so a branched-away / rewritten / deleted turn still rejects.
  */
 export function readActiveTranscriptEntryAnchorStatus(params: {
   agentId?: string;
@@ -147,80 +151,38 @@ export function readActiveTranscriptEntryAnchorStatus(params: {
   const db = database.db;
   // One nested-safe deferred snapshot (savepoint-aware: it joins an enclosing write
   // transaction via a savepoint instead of throwing "cannot start a transaction within a
-  // transaction"). Within it we read reconcile state, the canonical leaf, AND the active-path
-  // join, so a between-read writer cannot change the verdict.
+  // transaction"). Within it we read reconcile state AND (when clean) the canonical active
+  // anchor through the same owner, so a between-read writer cannot change the verdict.
   return runSqliteDeferredTransactionSync(db, () => {
     const indexDirty = sessionTranscriptIndexNeedsReconcile(db, resolved.sessionId);
-    // Authoritative canonical-turn check, independent of the dirty projection. The index
-    // watermark's leaf_event_id is NOT trustworthy while dirty: markSessionTranscriptIndexDirty
-    // preserves the previous leaf, and branch switches / alternative-parent appends move the real
-    // tail in the durable event log without advancing it. Walk the durable
-    // transcript_event_identities parent chain from the current tail (max seq) up to the root; the
-    // cached entry is still the canonical current turn iff it is an ancestor-or-self of that tail.
-    const chainRow = db
-      .prepare(
-        `WITH RECURSIVE chain AS (
-           SELECT event_id, parent_id FROM (
-             SELECT event_id, parent_id, seq FROM transcript_event_identities
-               WHERE session_id = ? ORDER BY seq DESC LIMIT 1
-           )
-           UNION ALL
-           SELECT i.event_id, i.parent_id FROM transcript_event_identities i
-             JOIN chain c ON i.event_id = c.parent_id WHERE i.session_id = ?
-         )
-         SELECT COUNT(*) AS hit FROM chain WHERE event_id = ?`,
-      )
-      .get(resolved.sessionId, resolved.sessionId, params.entryId) as { hit: number };
-    // Canonical active-path join (identities ⨝ active ⨝ rewrite). This is the authoritative
-    // "is the cached entry still the current active turn" check -- NOT the raw identity log,
-    // which only proves the event historically existed.
-    const row = executeSqliteQueryTakeFirstSync(
-      db,
-      getSessionKysely(db)
-        .selectFrom("transcript_event_identities as identity")
-        .innerJoin("session_transcript_active_events as active", (join) =>
-          join
-            .onRef("active.session_id", "=", "identity.session_id")
-            .onRef("active.event_seq", "=", "identity.seq"),
-        )
-        .innerJoin("transcript_rewrite_watermarks as rewrite", (join) =>
-          join.onRef("rewrite.session_id", "=", "identity.session_id"),
-        )
-        .select([
-          "identity.seq",
-          "identity.parent_id",
-          "identity.message_idempotency_key",
-          "active.message_position",
-          "rewrite.generation",
-        ])
-        .where("identity.session_id", "=", resolved.sessionId)
-        .where("identity.event_id", "=", params.entryId)
-        .limit(1),
-    );
-    const activeAnchor = createTranscriptEntryAnchor({
-      database,
-      resolved,
-      entryId: params.entryId,
-      row,
-    });
     if (!indexDirty) {
-      // Clean index: return the anchor when the cached turn is active; otherwise it is a
+      // Clean index: reuse the single canonical anchor-join owner (identities ⨝ active ⨝
+      // rewrite). The cached turn is active iff it has an active row; otherwise it is a
       // clean-missing/stale turn -> reject.
-      return {
-        anchor: activeAnchor,
-        indexDirty: false,
-        cachedIdentityExists: Boolean(activeAnchor),
-      };
+      const anchor = readActiveTranscriptEntryAnchorInTransaction({
+        database,
+        resolved,
+        entryId: params.entryId,
+      });
+      return { anchor, indexDirty: false, cachedIdentityExists: Boolean(anchor) };
     }
-    // Dirty index: degrade ONLY when this cached entry is still on the durable canonical
-    // parent chain (ancestor-or-self of the current tail) in this snapshot. A branched-away /
-    // alternative-parent rewritten / deleted turn is off that chain -> reject (fail-closed), never
-    // false-ack.
-    const isCanonicalOnChain = (chainRow?.hit ?? 0) > 0;
+    // Dirty index: the materialized active projection may be stale (a leaf-control /
+    // branch-switch / alternative-parent write preserves the old watermark and skips forward
+    // indexing). Do NOT trust the dirty projection and do NOT walk the raw parent chain from
+    // the tail -- that chain can keep reaching a displaced turn after a branch switch.
+    // Revalidate the cached turn through the SAME canonical visible-path owner the projection
+    // rebuild and parent-fork resolver use (scan the durable event tree and select the leaf's
+    // visible branch), inside this snapshot. Degrade only when the cached entry is still on
+    // that canonical active path; a branched-away / rewritten / deleted turn is off it -> reject
+    // (fail-closed), never false-ack.
     return {
       anchor: undefined,
       indexDirty: true,
-      cachedIdentityExists: isCanonicalOnChain,
+      cachedIdentityExists: isTranscriptEntryOnActivePathInTransaction(
+        database,
+        resolved.sessionId,
+        params.entryId,
+      ),
     };
   });
 }
