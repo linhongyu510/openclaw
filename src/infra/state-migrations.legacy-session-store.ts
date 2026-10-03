@@ -3,8 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { normalizePersistedSessionEntryShape } from "../commands/doctor/shared/session-entry-shape.js";
+import {
+  migrateLegacySessionEntryState,
+  normalizePersistedSessionEntryShape,
+} from "../commands/doctor/shared/session-entry-shape.js";
 import { normalizeRestartRecoveryEntryFields } from "../config/sessions/restart-recovery-state.js";
+import { hasLegacySessionProviderState } from "../config/sessions/session-entry-state-format.js";
 import {
   ensureSessionStorePromptBlobsForPersistence,
   hydrateSessionStoreSkillPromptRefs,
@@ -58,22 +62,18 @@ import { writeTextAtomic } from "./json-files.js";
 import { readSessionStoreJson5 } from "./state-migrations.fs.js";
 
 type LegacySessionStoreLoadOptions = {
-  skipCache?: boolean;
   maintenanceConfig?: ResolvedSessionMaintenanceConfig;
   runMaintenance?: boolean;
-  clone?: boolean;
   hydrateSkillPromptRefs?: boolean;
 };
 
 export type LegacySessionStoreSaveOptions = {
   skipMaintenance?: boolean;
-  takeCacheOwnership?: boolean;
   activeSessionKey?: string;
   onWarn?: (warning: SessionMaintenanceWarning) => void | Promise<void>;
   onMaintenanceApplied?: (report: SessionMaintenanceApplyReport) => void | Promise<void>;
   maintenanceOverride?: Partial<ResolvedSessionMaintenanceConfig>;
   maintenanceConfig?: ResolvedSessionMaintenanceConfig;
-  singleEntryPersistence?: { sessionKey: string; entry: SessionEntry };
   requireWriteSuccess?: boolean;
 };
 
@@ -194,19 +194,6 @@ function normalizeLegacyPluginState(
   return next;
 }
 
-function normalizePluginExtensions(entry: SessionEntry): SessionEntry {
-  return normalizeLegacyPluginState(entry, "pluginExtensions", (value) =>
-    isPluginJsonValue(value) ? value : undefined,
-  );
-}
-
-function normalizePluginExtensionSlotKeys(entry: SessionEntry): SessionEntry {
-  return normalizeLegacyPluginState(entry, "pluginExtensionSlotKeys", (value) => {
-    const slotKey = normalizeSessionEntrySlotKey(value);
-    return slotKey.ok ? slotKey.key : undefined;
-  });
-}
-
 function normalizeLegacySessionStore(store: Record<string, SessionEntry>): void {
   for (const [key, entry] of Object.entries(store)) {
     assertSupportedSessionStoreEntry(entry);
@@ -223,17 +210,19 @@ function normalizeLegacySessionStore(store: Record<string, SessionEntry>): void 
     if (modelSelectionLocked && runtimeFields !== shaped) {
       throw new Error(`Invalid model-selection-locked session entry: ${key}`);
     }
-    store[key] = stripRuntimeOnlySessionSkillsFields(
-      normalizePluginExtensionSlotKeys(
-        normalizePluginExtensions(
-          normalizeRestartRecoveryFields(
-            normalizeLegacySessionEntryDelivery(
-              migrateLegacySessionCreator(modelSelectionLocked ? shaped : runtimeFields),
-            ),
-          ),
-        ),
+    let normalized = normalizeRestartRecoveryFields(
+      normalizeLegacySessionEntryDelivery(
+        migrateLegacySessionCreator(modelSelectionLocked ? shaped : runtimeFields),
       ),
     );
+    normalized = normalizeLegacyPluginState(normalized, "pluginExtensions", (value) =>
+      isPluginJsonValue(value) ? value : undefined,
+    );
+    normalized = normalizeLegacyPluginState(normalized, "pluginExtensionSlotKeys", (value) => {
+      const slotKey = normalizeSessionEntrySlotKey(value);
+      return slotKey.ok ? slotKey.key : undefined;
+    });
+    store[key] = stripRuntimeOnlySessionSkillsFields(normalized);
   }
   const harnessError = resolveAgentHarnessSessionStoreError(store);
   if (harnessError) {
@@ -475,7 +464,16 @@ function mergeExternalOverInternal(
 }
 
 /** Canonicalizes file-era delivery fields before doctor imports a row into SQLite. */
-export function normalizeLegacySessionEntryDelivery(entry: SessionEntry): SessionEntry {
+export function normalizeLegacySessionEntryDelivery(entry: SessionEntry): SessionEntry;
+export function normalizeLegacySessionEntryDelivery(
+  entry: Record<string, unknown>,
+): Record<string, unknown>;
+export function normalizeLegacySessionEntryDelivery(value: SessionEntry | Record<string, unknown>) {
+  assertSupportedSessionStoreEntry(value);
+  const entry =
+    isRecord(value) && hasLegacySessionProviderState(value)
+      ? migrateLegacySessionEntryState(value)
+      : value;
   const legacy = entry as LegacySessionDeliveryEntry;
   const hasLegacyFields = LEGACY_SESSION_DELIVERY_KEYS.some((key) => key in legacy);
   if (isCanonicalSessionDeliveryState(entry.delivery) && !hasLegacyFields) {

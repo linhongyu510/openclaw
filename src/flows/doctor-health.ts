@@ -19,6 +19,7 @@ import { resolveConfigPath, resolveStateDir } from "../config/paths.js";
 import { isTruthyEnvValue } from "../infra/env.js";
 import type { AgentDatabaseMigrationTarget } from "../infra/state-migrations.media-persistence-targets.js";
 import { formatUpdateDoctorConfigChange } from "../infra/update-doctor-config.js";
+import { retainUpdateDoctorProcesses } from "../infra/update-doctor-process-custody.js";
 import {
   captureUpdateDoctorConfigWrites,
   DoctorMaintenanceRefusalError,
@@ -33,9 +34,11 @@ import {
 } from "../infra/update-doctor-result.js";
 import { formatUpdateFailureFact } from "../infra/update-failure-facts-format.js";
 import { createUpdateFailureFact } from "../infra/update-failure-facts.js";
+import { resolveUpdateRehearsalRoot } from "../infra/update-rehearsal-paths.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { withPluginLoadDiagnostics } from "../plugins/load-diagnostics.js";
 import type { PluginDiagnostic } from "../plugins/manifest-types.js";
+import { withCommandProcessScope } from "../process/exec-spawn.js";
 import { withDeferredDebugProxyCapture } from "../proxy-capture/runtime-deferral.js";
 import { createNonExitingRuntime, type RuntimeEnv } from "../runtime.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
@@ -63,50 +66,56 @@ export async function runDoctorHealthFlow(
   writeAuthority?: UpdateDoctorWriteAuthority,
   databasePreflight?: DoctorDatabasePreflight,
 ) {
-  return withDeferredDebugProxyCapture(async (resumeCapture) => {
-    let preparedPreflight = databasePreflight;
-    if (process.env.OPENCLAW_UPDATE_IN_PROGRESS === "1" && !writeAuthority?.postCoreSchemaRepair) {
-      const { guardUpdateDoctorSchemaUpgrade, rehearseDeferredUpdateDoctorSchema } =
-        await import("../commands/doctor-update-schema-guard.js");
-      preparedPreflight =
-        (await guardUpdateDoctorSchemaUpgrade({
+  using custody = await retainUpdateDoctorProcesses(
+    writeAuthority?.assertCurrent,
+    writeAuthority?.commandAuthority,
+  );
+  const run = () =>
+    withDeferredDebugProxyCapture(async (resumeCapture) => {
+      let preparedPreflight = databasePreflight;
+      const preCaptureRehearsalRoot =
+        !writeAuthority?.postCoreSchemaRepair && (options.repair === true || options.yes === true)
+          ? resolveUpdateRehearsalRoot(process.env)
+          : undefined;
+      if (
+        process.env.OPENCLAW_UPDATE_IN_PROGRESS === "1" &&
+        !writeAuthority?.postCoreSchemaRepair
+      ) {
+        const { guardUpdateDoctorSchemaUpgrade, rehearseDeferredUpdateDoctorSchema } =
+          await import("../commands/doctor-update-schema-guard.js");
+        const guarded = await guardUpdateDoctorSchemaUpgrade({
           schemas: preparedPreflight,
           runtime,
           json: options.json,
-        })) ?? preparedPreflight;
-      if (preparedPreflight?.updateSchemaRehearsal) {
-        await rehearseDeferredUpdateDoctorSchema(preparedPreflight, runtime);
-        return;
+          statePublicationOnly: preCaptureRehearsalRoot !== undefined,
+        });
+        if (!preCaptureRehearsalRoot) {
+          preparedPreflight = guarded ?? preparedPreflight;
+        }
+        if (!preCaptureRehearsalRoot && preparedPreflight?.updateSchemaRehearsal) {
+          await rehearseDeferredUpdateDoctorSchema(preparedPreflight, runtime);
+          return;
+        }
       }
-    }
-    const resultPath = process.env[UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV]?.trim();
-    return withPluginLoadDiagnostics((diagnostics) =>
-      resultPath
-        ? captureUpdateDoctorConfigWrites(
-            resolveConfigPath(),
-            (capture) =>
-              runDoctorHealthFlowWithResult(
-                runtime,
-                options,
-                preparedPreflight,
-                diagnostics,
-                { resultPath, capture },
-                writeAuthority,
-                resumeCapture,
-              ),
-            writeAuthority,
-          )
-        : runDoctorHealthFlowWithResult(
+      const resultPath = process.env[UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV]?.trim();
+      return withPluginLoadDiagnostics((diagnostics) => {
+        const runDoctor = (capture?: DoctorConfigCapture) =>
+          runDoctorHealthFlowWithResult(
             runtime,
             options,
             preparedPreflight,
             diagnostics,
-            undefined,
+            resultPath && capture ? { resultPath, capture } : undefined,
             writeAuthority,
             resumeCapture,
-          ),
-    );
-  });
+            preCaptureRehearsalRoot,
+          );
+        return resultPath
+          ? captureUpdateDoctorConfigWrites(resolveConfigPath(), runDoctor, writeAuthority)
+          : runDoctor();
+      });
+    });
+  return await (custody ? withCommandProcessScope(run, undefined, custody) : run());
 }
 
 async function runDoctorHealthFlowWithResult(
@@ -117,6 +126,7 @@ async function runDoctorHealthFlowWithResult(
   updateResult?: { resultPath: string; capture: DoctorConfigCapture },
   writeAuthority?: UpdateDoctorWriteAuthority,
   resumeCapture?: () => void,
+  preCaptureRehearsalRoot?: string,
 ) {
   const effectiveRuntime = runtime ?? (await import("../runtime.js")).defaultRuntime;
   const repairRuntime: RuntimeEnv = {
@@ -194,7 +204,10 @@ async function runDoctorHealthFlowWithResult(
       // Keep an accepted signal during preparation ahead of service custody.
       await waitForCliSignalExit();
     }
-    const { beginDoctorMaintenance } = await import("../commands/doctor-maintenance.js");
+    const [{ beginDoctorMaintenance }, { createDoctorOriginalCaptureHook }] = await Promise.all([
+      import("../commands/doctor-maintenance.js"),
+      import("../commands/doctor-original-capture-admission.js"),
+    ]);
     maintenance = await measureGatewayBootstrapStep("doctor.maintenance.begin", () =>
       beginDoctorMaintenance({
         options,
@@ -202,27 +215,13 @@ async function runDoctorHealthFlowWithResult(
         runtime: repairRuntime,
         assertCurrent: writeAuthority?.assertCurrent,
         databaseGenerations: writeAuthority?.databaseGenerations,
-        beforeStateMutation: async ({ env, signal }) => {
-          const [{ preserveDoctorOriginalState }, { getOpenClawDatabaseMaintenanceScope }] =
-            await Promise.all([
-              import("../commands/doctor-original-capture.js"),
-              import("../state/openclaw-state-db-async-lifecycle.js"),
-            ]);
-          const scope = getOpenClawDatabaseMaintenanceScope();
-          if (!scope) {
-            throw new Error("Original state capture requires Doctor's admitted maintenance scope.");
-          }
-          await measureGatewayBootstrapStep("doctor.maintenance.preserve-original-state", () =>
-            preserveDoctorOriginalState({
-              root,
-              env,
-              runtime: repairRuntime,
-              signal,
-              assertCurrent: () => scope.assertOwnerCurrent(),
-              writeAuthority,
-            }),
-          );
-        },
+        beforeStateMutation: createDoctorOriginalCaptureHook({
+          root,
+          runtime: repairRuntime,
+          writeAuthority,
+          rehearsalRoot: preCaptureRehearsalRoot,
+          json: options.json,
+        }),
       }),
     );
     const runChecks = async () => {

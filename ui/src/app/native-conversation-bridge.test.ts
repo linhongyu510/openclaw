@@ -188,6 +188,61 @@ describe("native conversation contract", () => {
     });
   });
 
+  it.each(["current", "superseded", "detached", "retired"] as const)(
+    "waits for rendered session actions without opening a stale menu (%s)",
+    async (owner) => {
+      const f = fixture(["session-actions-v1"]);
+      const page = document.createElement("openclaw-chat-page");
+      const pane = document.createElement("openclaw-chat-pane");
+      pane.sessionKey = f.data.sessionKey;
+      pane.classList.add("chat-pane-cache__pane--active");
+      page.append(pane);
+      document.body.append(page);
+      const results = () => f.messages.filter((message) => message.type === "command-result");
+      f.command("open-session-actions", {
+        agentId: f.data.agentId,
+        sessionKey: f.data.sessionKey,
+      });
+      await flush();
+      await vi.dynamicImportSettled();
+      await flush();
+      expect(results()).toEqual([]);
+
+      if (owner === "superseded") {
+        f.data.sessionKey = "agent:main:other";
+        f.changed();
+        // The pane cache retains the prior session's pane and moves only its class.
+        pane.classList.remove("chat-pane-cache__pane--active");
+      } else if (owner === "detached") {
+        pane.remove();
+      } else if (owner === "retired") {
+        f.bridge.dispose();
+      }
+      await flush();
+      // A retired pane settles the command now, not at the response deadline.
+      expect(results()).toMatchObject(
+        owner === "superseded" || owner === "detached"
+          ? [{ requestId: "request-1", ok: false, error: "unavailable" }]
+          : [],
+      );
+      const menu = document.createElement("openclaw-chat-header-session-menu");
+      const dropdown = document.createElement("wa-dropdown");
+      dropdown.open = false;
+      menu.append(dropdown);
+      pane.append(menu);
+      await flush();
+      expect(dropdown.open).toBe(owner === "current");
+      if (owner === "current") {
+        expect(results()).toEqual([]);
+        dropdown.dispatchEvent(new Event("wa-after-show"));
+        await flush();
+        expect(results()).toMatchObject([{ requestId: "request-1", ok: true }]);
+      } else {
+        expect(results()).toHaveLength(owner === "retired" ? 0 : 1);
+      }
+    },
+  );
+
   it("requires the conversation capability and a callable handler", () => {
     const f = fixture();
     f.bridge.dispose();

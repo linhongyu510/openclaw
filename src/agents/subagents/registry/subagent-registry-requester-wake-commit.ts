@@ -5,7 +5,7 @@ import type {
   PendingRequesterSettleWakeCommit,
   SubagentLifecycleWakeContext,
 } from "./subagent-registry-lifecycle-context.js";
-import { maskLifecycleIdentifier } from "./subagent-registry-lifecycle-delivery.js";
+import { maskLifecycleIdentifier } from "./subagent-registry-lifecycle-log.js";
 import {
   assertSubagentRegistryWriteSourceCurrent,
   mutateSubagentRuns,
@@ -190,8 +190,8 @@ export function commitRequesterInitialTransfer(
   let prepared = false;
   let promoted = false;
   let released = !params.release;
-  const currentEntries = () =>
-    entries.map((entry) => {
+  const currentEntries = (selected = entries) =>
+    selected.map((entry) => {
       const current = context.options.runs.get(entry.runId);
       return current && isSameSubagentRunOwner(current, entry) ? current : entry;
     });
@@ -249,8 +249,8 @@ export function commitRequesterInitialTransfer(
         (entry) =>
           context.pendingRequesterSettleWakeCommits.get(getSubagentRunRuntimeKey(entry)) !==
             pending ||
-          !isRequesterCompletionCohortCurrent(entry, entries, (key, matches) =>
-            context.options.getLatestRunForChildSession(key, matches),
+          !isRequesterCompletionCohortCurrent(entry, (key, matches, childAgentId) =>
+            context.options.getLatestRunForChildSession(key, matches, childAgentId),
           ),
       )
     ) {
@@ -339,12 +339,7 @@ export function commitRequesterInitialTransfer(
             if (releasing) {
               released = true;
             }
-            adoptPublished(
-              value.drafts.map((entry) => {
-                const current = context.options.runs.get(entry.runId);
-                return current && isSameSubagentRunOwner(current, entry) ? current : entry;
-              }),
-            );
+            adoptPublished(currentEntries(value.drafts));
           },
         },
       );
@@ -352,12 +347,7 @@ export function commitRequesterInitialTransfer(
         if (releasing) {
           released = true;
         }
-        adoptPublished(
-          result.drafts.map((entry) => {
-            const current = context.options.runs.get(entry.runId);
-            return current && isSameSubagentRunOwner(current, entry) ? current : entry;
-          }),
-        );
+        adoptPublished(currentEntries(result.drafts));
       }
       writeFailure = undefined;
     } catch (error) {
@@ -594,8 +584,8 @@ export function commitRequesterWake(
         !isDeepStrictEqual(captureRequesterSettleRunIdentity(live), owner.identity) ||
         !isDeepStrictEqual(live.killIntent, owner.killIntent) ||
         !isDeepStrictEqual(live.killReconciliation, owner.killReconciliation) ||
-        !isRequesterCompletionCohortCurrent(live, pending.entries, (key, matches) =>
-          context.options.getLatestRunForChildSession(key, matches),
+        !isRequesterCompletionCohortCurrent(live, (key, matches, childAgentId) =>
+          context.options.getLatestRunForChildSession(key, matches, childAgentId),
         )
       ) {
         return false;

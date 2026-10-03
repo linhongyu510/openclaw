@@ -2,6 +2,7 @@ import type { SessionTranscriptInitializationPublication } from "../config/sessi
 import type { SessionEntryReplacementCommit } from "../config/sessions/session-accessor.sqlite-replacement-types.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { deferSqliteWorkerCommitReceipt } from "../infra/sqlite-worker-operation-admission.js";
+import type { AgentDatabaseMaintenanceOperations } from "./openclaw-agent-execution-maintenance.js";
 import type { AgentWorkerOperationContext } from "./openclaw-agent-operation-context.js";
 import type { WorkerOperationHandlers, WorkerOperations } from "./worker-operation-registry.js";
 
@@ -130,6 +131,27 @@ export async function loadAgentEntryReadOperations() {
   } satisfies Handlers;
 }
 
+export async function loadAgentEntryPatchOperations() {
+  const kernel = await import("../config/sessions/session-entry-patch.worker.js");
+  return {
+    "session.entry.patch.prepare": (
+      input: Parameters<typeof kernel.readSessionEntryPatchSnapshot>[1],
+      { open },
+    ) => kernel.readSessionEntryPatchSnapshot(open(), input),
+    "session.entry.patch.commit": kernel.commitSessionEntryPatch,
+  } satisfies Handlers;
+}
+
+export async function loadAgentCompoundOperations() {
+  const turn = await import("../config/sessions/session-turn.worker.js");
+  const predicates = await import("../config/sessions/session-turn-predicate.js");
+  await predicates.prepareSessionTurnPredicates();
+  return {
+    "session.turn.prepare": turn.prepareSessionTurn,
+    "session.turn.commit": turn.commitSessionTurn,
+  } satisfies Handlers;
+}
+
 export async function loadAgentTrajectoryOperations() {
   const kernel = await import("../trajectory/runtime-store.sqlite.js");
   return {
@@ -216,7 +238,21 @@ export async function loadAgentReactionOperations() {
 
 export async function loadAgentPendingInputOperations() {
   const kernel = await import("../config/sessions/session-pending-input-withdrawal.worker.js");
+  const history = await import("../config/sessions/session-pending-input-history-reconcile.js");
   return {
+    "session.pendingInputs.interruptHistory": (
+      input: Parameters<typeof history.interruptPendingInputHistoryInDatabase>[2],
+      { open, options, admit },
+    ) => {
+      const database = open();
+      return history.interruptPendingInputHistoryInDatabase(
+        database,
+        options,
+        input,
+        admit,
+        (receipt) => deferSqliteWorkerCommitReceipt(database.db, receipt),
+      );
+    },
     "session.pendingInputs.withdraw": (
       input: Parameters<typeof kernel.discardSessionPendingInputInWorker>[2],
       { open, options, admit },
@@ -240,7 +276,11 @@ export async function loadAgentArchivePruningOperations() {
       { open, options, admit },
     ) => kernel.removeLegacySessionArchiveInDatabase(open(), options, input.filePath, admit),
     "session.archivePruning.reclaimPages": (input: { maxPages?: number }, { open, admit }) =>
-      kernel.reclaimSessionArchivePagesInWorker(open(), input.maxPages, admit),
+      open().walMaintenance.reclaimFreePages({
+        maxPages: input.maxPages,
+        beforeMutation: () => admit("transaction"),
+        onCommit: () => admit("commit"),
+      }),
   } satisfies Handlers;
 }
 
@@ -272,10 +312,50 @@ export async function loadConversationDeliveryOperations() {
   } satisfies Handlers;
 }
 
+export async function loadUsageCacheOperations() {
+  const kernel = await import("../infra/session-cost-usage-cache.kernel.js");
+  return {
+    "usageCache.writeRollup": (
+      input: Parameters<typeof kernel.writeSessionCostUsageRollupInDatabase>[1],
+      { writeTransaction, admit },
+    ) =>
+      writeTransaction("session-cost-usage.rollup.write", "Usage cache", ({ db }) => {
+        const result = kernel.writeSessionCostUsageRollupInDatabase(db, input);
+        admit("commit");
+        return result;
+      }),
+    "usageCache.prune": (
+      input: Parameters<typeof kernel.pruneSessionCostUsageRollupsInDatabase>[1],
+      { writeTransaction, admit },
+    ) =>
+      writeTransaction("session-cost-usage.rollup.prune", "Usage cache", ({ db }) => {
+        kernel.pruneSessionCostUsageRollupsInDatabase(db, input);
+        admit("commit");
+      }),
+    "usageCache.acquireLock": (
+      input: Parameters<typeof kernel.acquireSessionCostUsageRefreshLockInDatabase>[1],
+      { writeTransaction, admit },
+    ) =>
+      writeTransaction("session-cost-usage.refresh-lock.acquire", "Usage cache", ({ db }) => {
+        const result = kernel.acquireSessionCostUsageRefreshLockInDatabase(db, input);
+        admit("commit");
+        return result;
+      }),
+    "usageCache.releaseLock": (input: string, { writeTransaction, admit }) =>
+      writeTransaction("session-cost-usage.refresh-lock.delete", "Usage cache", ({ db }) => {
+        kernel.deleteSessionCostUsageRefreshLockInDatabase(db, input);
+        admit("commit");
+      }),
+  } satisfies Handlers;
+}
+
 export type RegisteredAgentWorkerOperations = WorkerOperations<
-  Awaited<ReturnType<typeof loadAgentTranscriptOperations>> &
+  Awaited<ReturnType<typeof loadUsageCacheOperations>> &
+    Awaited<ReturnType<typeof loadAgentTranscriptOperations>> &
     Awaited<ReturnType<typeof loadAgentReplacementOperations>> &
     Awaited<ReturnType<typeof loadAgentEntryReadOperations>> &
+    Awaited<ReturnType<typeof loadAgentEntryPatchOperations>> &
+    Awaited<ReturnType<typeof loadAgentCompoundOperations>> &
     Awaited<ReturnType<typeof loadAgentRestartRecoveryOperations>> &
     Awaited<ReturnType<typeof loadAgentTrajectoryOperations>> &
     Awaited<ReturnType<typeof loadAgentArchiveOperations>> &
@@ -285,4 +365,5 @@ export type RegisteredAgentWorkerOperations = WorkerOperations<
     Awaited<ReturnType<typeof loadAgentPendingInputOperations>> &
     Awaited<ReturnType<typeof loadAgentArchivePruningOperations>> &
     Awaited<ReturnType<typeof loadConversationDeliveryOperations>>
->;
+> &
+  AgentDatabaseMaintenanceOperations;

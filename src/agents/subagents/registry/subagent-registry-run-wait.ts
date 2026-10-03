@@ -1,3 +1,4 @@
+import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { getRuntimeConfig } from "../../../config/config.js";
 import { runWithoutOwnedSessionTranscriptWrites } from "../../../config/sessions/transcript-write-context.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
@@ -71,10 +72,7 @@ function resolveCompletionAfterHardRunDeadline(params: {
   if (deadlineMs === undefined) {
     return undefined;
   }
-  const observedEndedAt =
-    typeof params.observedEndedAt === "number" && Number.isFinite(params.observedEndedAt)
-      ? params.observedEndedAt
-      : params.now;
+  const observedEndedAt = asFiniteNumber(params.observedEndedAt) ?? params.now;
   return observedEndedAt > deadlineMs ? deadlineMs : undefined;
 }
 
@@ -164,7 +162,10 @@ export async function preserveSubagentRunForRestart(params: {
 
 export type SubagentManagerOptions = {
   runs: Map<string, SubagentRunRecord>;
-  getRunsForChildSession: (childSessionKey: string) => Iterable<SubagentRunRecord>;
+  getRunsForChildSession: (
+    childSessionKey: string,
+    childAgentId?: string,
+  ) => Iterable<SubagentRunRecord>;
   resumedRuns: Set<object>;
   acquireTerminalCompletionLock: (runId: string) => Promise<() => void>;
   callGateway: typeof callGateway;
@@ -189,19 +190,15 @@ export type SubagentManagerOptions = {
 export class SubagentWaitManager {
   constructor(protected readonly options: SubagentManagerOptions) {}
 
-  protected shouldDeleteAttachments(entry: SubagentRunRecord): boolean {
-    return entry.cleanup === "delete" || !entry.retainAttachmentsOnKeep;
-  }
-
   protected currentRunOwnsSession(entry: SubagentRunRecord): boolean {
     const current = this.options.runs.get(entry.runId);
     return (
       current !== undefined &&
       isSameSubagentRunOwner(current, entry) &&
       current.killReconciliation?.supersededAt === undefined &&
-      !Array.from(this.options.getRunsForChildSession(current.childSessionKey)).some(
-        (candidate) => compareSubagentRunGeneration(candidate, current) > 0,
-      )
+      !Array.from(
+        this.options.getRunsForChildSession(current.childSessionKey, current.childAgentId),
+      ).some((candidate) => compareSubagentRunGeneration(candidate, current) > 0)
     );
   }
 
@@ -385,13 +382,12 @@ export class SubagentWaitManager {
         return;
       }
       const observedStartedAt =
-        typeof wait.startedAt === "number" && Number.isFinite(wait.startedAt)
-          ? wait.startedAt
-          : await this.options.resolveSubagentSessionStartedAt({
-              childSessionKey: entry.childSessionKey,
-              notBeforeMs: entry.execution.startedAt ?? entry.createdAt,
-              assertCurrent,
-            });
+        asFiniteNumber(wait.startedAt) ??
+        (await this.options.resolveSubagentSessionStartedAt({
+          childSessionKey: entry.childSessionKey,
+          notBeforeMs: entry.execution.startedAt ?? entry.createdAt,
+          assertCurrent,
+        }));
       entry = currentEntry();
       const completeAsRunTimeout = (endedAt?: number, startedAt?: number) =>
         complete({

@@ -9,6 +9,7 @@ import {
   prepareOpenClawStateReadSource,
 } from "../../../state/openclaw-state-worker-context.js";
 import type { OpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.types.js";
+import { matchesSubagentChildSessionOwner } from "./subagent-child-owner-match.js";
 import {
   projectSubagentRunForMaintenance,
   projectSubagentRunForSessionList,
@@ -17,7 +18,6 @@ import { getSubagentRunsForChildSession, subagentRuns } from "./subagent-registr
 import { publishSubagentRunChanges } from "./subagent-registry-publication.js";
 import {
   assertSubagentReadContext,
-  captureSubagentFactsAdmission,
   consumeFreshSubagentRuns,
   getSessionListLookup,
   getSubagentRunsSnapshot,
@@ -53,20 +53,17 @@ import { collectSubagentSessionReadKeys } from "./subagent-session-read-scope.js
 
 const persistedSubagentRunsReadCache: SubagentRunsCache<SubagentRunRecord> = {
   state: {},
-  captureAdmission: captureSubagentFactsAdmission,
   load: loadSubagentRegistryFromSqlite,
   copy: (entry) => copySubagentRunRuntimeOwner(entry, structuredClone(entry)),
   project: (entry) => entry,
 };
 const persistedSubagentSessionListRunsReadCache: SubagentRunsCache<SubagentRunReadRecord> = {
   state: {},
-  captureAdmission: captureSubagentFactsAdmission,
   copy: projectSubagentRunForSessionList,
   project: projectSubagentRunForSessionList,
 };
 const persistedSubagentMaintenanceRunsReadCache: SubagentRunsCache<SubagentRunMaintenanceRecord> = {
   state: {},
-  captureAdmission: captureSubagentFactsAdmission,
   load: () => loadSubagentMaintenanceRunsFromSqlite(),
   copy: (entry) => copySubagentRunRuntimeOwner(entry, projectSubagentRunForMaintenance(entry)),
   // Maintenance consumes live rows synchronously into keys; only published facts need copies.
@@ -501,6 +498,7 @@ export function getSubagentRunsSnapshotForController(
 export function getSubagentRunsSnapshotForChildSession(
   inMemoryRuns: Map<string, SubagentRunRecord>,
   childSessionKey: string,
+  childAgentId?: string,
 ): Map<string, SubagentRunRecord> {
   const key = childSessionKey.trim();
   if (!key) {
@@ -509,6 +507,6 @@ export function getSubagentRunsSnapshotForChildSession(
   return getSubagentRunsSnapshot(inMemoryRuns, persistedSubagentRunsReadCache, {
     selectCached: (lookup) => lookup.selectChildren(new Set([key])),
     load: () => loadSubagentRunsForChildSessionFromSqlite(key),
-    matches: (entry) => entry.childSessionKey === key,
+    matches: (entry) => matchesSubagentChildSessionOwner(entry, key, childAgentId),
   });
 }

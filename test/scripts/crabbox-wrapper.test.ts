@@ -2567,16 +2567,19 @@ describe("scripts/crabbox-wrapper", () => {
     expect(foreign.stdout).toBe("");
     if (args[0] === "warmup") {
       const preload = path.join(home, "withdraw-receipt.cjs");
+      const withdrawalWitness = path.join(home, "receipt-withdrawal.json");
       writeFileSync(
         preload,
         `
 const fs = require("node:fs");
-const write = process.stderr.write;
-process.stderr.write = function (chunk, ...rest) {
-  if (String(chunk).includes('"event":"testbox-admission"')) {
-    setImmediate(() => fs.rmSync(${JSON.stringify(receiptPath)}));
+const error = console.error;
+console.error = function (...args) {
+  if (args.some((arg) => String(arg).includes('"event":"testbox-admission"'))) {
+    // Complete withdrawal before the wrapper can revalidate its admitted lease.
+    fs.rmSync(${JSON.stringify(receiptPath)});
+    fs.writeFileSync(${JSON.stringify(withdrawalWitness)}, JSON.stringify({ receiptExists: fs.existsSync(${JSON.stringify(receiptPath)}) }));
   }
-  return write.call(this, chunk, ...rest);
+  return error.apply(this, args);
 };
 `,
       );
@@ -2584,6 +2587,7 @@ process.stderr.write = function (chunk, ...rest) {
         ["run", "--provider", "blacksmith-testbox", "--id", id, "--", "true"],
         { env, nodePreload: preload },
       );
+      expect(JSON.parse(readFileSync(withdrawalWitness, "utf8"))).toEqual({ receiptExists: false });
       expect(withdrawn.status).not.toBe(0);
       expect(withdrawn.stderr).toContain("no allocation receipt");
       expect(withdrawn.stdout).toBe("");
@@ -3949,19 +3953,9 @@ esac
     );
   });
 
-  it("rejects changed-gate revision expressions that cannot be recreated remotely", () => {
+  it.each(["origin/main~1", "abc123"])("rejects a non-recreatable changed-gate base %s", (base) => {
     const result = runDefaultWrapper(
-      [
-        "run",
-        "--provider",
-        "aws",
-        "--",
-        "corepack",
-        "pnpm",
-        "check:changed",
-        "--base",
-        "origin/main~1",
-      ],
+      ["run", "--provider", "aws", "--", "corepack", "pnpm", "check:changed", "--base", base],
       {
         gitResponses: {
           [GIT_CONFIG_SPARSE_KEY]: { stdout: "true\n" },
@@ -3972,8 +3966,47 @@ esac
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
-      "remote changed-gate sync requires an exact origin/<branch> base; received: origin/main~1",
+      `remote changed-gate sync requires an exact origin/<branch> or full commit SHA base; received: ${base}`,
     );
+  });
+
+  it.each(["check", "run check"])(
+    "preserves the captured base through nested pnpm %s",
+    (command) => {
+      const base = "b".repeat(40);
+      const { remoteCommand } = runSuccessfulDefaultWrapper(
+        [
+          "run",
+          "--provider",
+          "blacksmith-testbox",
+          "--",
+          "env",
+          "CI=1",
+          "/bin/bash",
+          "-c",
+          `corepack pnpm build && corepack pnpm ${command} --base ${base} && corepack pnpm test`,
+        ],
+        {
+          gitResponses: { [`merge-base\u0000${base}\u0000HEAD`]: { stdout: base + "\n" } },
+        },
+      );
+      expect(remoteCommand).toContain(`"baseSha":"${base}"`);
+      expect(remoteCommand).toContain(`pnpm ${command} --base ${base}`);
+      expect(remoteCommand).not.toContain("OPENCLAW_CHANGED_LANES_RAW_SYNC=1");
+    },
+  );
+
+  it("refuses a literal check base outside the candidate ancestry", () => {
+    const base = "b".repeat(40);
+    const result = runDefaultWrapper(
+      ["run", "--provider", "blacksmith-testbox", "--", "pnpm", "check", "--base", base],
+      {
+        gitResponses: { [`merge-base\u0000${base}\u0000HEAD`]: { stdout: "a".repeat(40) + "\n" } },
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("explicit changed-gate commit must be an ancestor of HEAD");
+    expect(result.stdout).toBe("");
   });
 
   it("rejects compound changed gates with incompatible bases", () => {
@@ -4320,6 +4353,7 @@ process.on("exit", () => {
     ["aws", false, "arbitrary"],
     ["blacksmith-testbox", true, "transport"],
     ["blacksmith-testbox", false, "transport"],
+    ["blacksmith-testbox", false, "captured-base"],
     ["blacksmith-testbox", false, "graph"],
     ["blacksmith-testbox", false, "frozen"],
     ["blacksmith-testbox", false, "lifecycle"],
@@ -4444,6 +4478,17 @@ process.on("exit", () => {
         path.join(origin, "scripts/check-changed.mjs"),
         path.join(origin, "scripts/source-fixture.mjs"),
       );
+      if (scenario === "captured-base") {
+        writeFileSync(
+          path.join(origin, "scripts/check.mts"),
+          [
+            'import { execFileSync } from "node:child_process";',
+            'const base = process.argv[process.argv.indexOf("--base") + 1];',
+            'const changed = execFileSync("git", ["diff", "--name-only", base, "HEAD"], { encoding: "utf8" }).trim().split("\\n");',
+            "process.stdout.write(JSON.stringify({ base, changed }));",
+          ].join("\n"),
+        );
+      }
       git(origin, ["add", "-A"]);
       git(origin, ["commit", "-qm", "base"]);
       const base = git(origin, ["rev-parse", "HEAD"]);
@@ -4641,6 +4686,31 @@ process.on("exit", () => {
         }
         return { receiver, result };
       };
+      if (scenario === "captured-base") {
+        const sharedBase = git(producer, ["rev-parse", base + "^"]);
+        git(producer, ["update-ref", "refs/remotes/origin/main", sharedBase]);
+        writeFileSync(path.join(producer, "owner.txt"), "candidate change\n");
+        git(producer, ["add", "owner.txt"]);
+        git(producer, ["commit", "-qm", "candidate change"]);
+        const candidate = runSender("direct", [
+          "run",
+          "--provider",
+          provider,
+          "--",
+          "node",
+          "scripts/check.mts",
+          "--base",
+          base,
+        ]);
+        const imported = receive("captured-base", candidate.remoteCommand, candidate.bundle);
+        expect(imported.result.status, failureDetail(imported.result)).toBe(0);
+        expect(JSON.parse(imported.result.stdout)).toEqual({ base, changed: ["owner.txt"] });
+        expect(git(imported.receiver, ["rev-parse", "origin/main"])).toBe(base);
+        expect(git(imported.receiver, ["rev-parse", "HEAD^"])).toBe(base);
+        expect(git(producer, ["rev-parse", "origin/main"])).toBe(sharedBase);
+        expect(git(producer, ["diff", "--name-only", sharedBase, "HEAD"])).toContain("mode.sh");
+        return;
+      }
       if (scenario !== "transport" && scenario !== "arbitrary") {
         const installOwner = ".github/actions/setup-node-env/install-dependencies.sh";
         const ownerPath = path.join(repoRoot, installOwner);

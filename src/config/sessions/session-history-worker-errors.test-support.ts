@@ -13,6 +13,7 @@ type Request = {
   taskId: number;
   interactive?: boolean;
   nativeSections: SharedArrayBuffer;
+  deletedAgentDatabaseFences: [string, string][];
 };
 type Resource = { close: () => Promise<void>; agentId?: string; revoke: () => void };
 type QuarantineDatabase = {
@@ -127,7 +128,6 @@ vi.mock("../../state/openclaw-agent-db-resources.js", () => ({
   },
 }));
 vi.mock("../../state/openclaw-agent-db-readonly-scope.js", () => ({
-  closeOpenClawAgentDatabaseReadOnlyCandidates: vi.fn(),
   OpenClawAgentDatabaseReadOnlyScope: class {
     hasRetainedConnection = true;
     run(_database: unknown, operation: () => unknown) {
@@ -158,7 +158,7 @@ vi.mock("./disk-budget-runtime.js", () => ({
 vi.mock("./session-transcript-hydration.worker.js", () => ({
   streamSessionTranscriptHydration: observed.hydrate,
 }));
-vi.mock("./session-accessor.sqlite-entry.js", () => ({
+vi.mock("./session-accessor.sqlite-exact-read.js", () => ({
   loadSessionEntryReadOnlyInScope: () => observed.read(),
 }));
 vi.mock("./session-sharing-store.js", () => ({

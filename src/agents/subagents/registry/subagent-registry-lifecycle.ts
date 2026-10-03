@@ -185,14 +185,14 @@ export class SubagentLifecycleController {
   };
 
   newerGenerationOwnsSession(entry: SubagentRunRecord): boolean {
-    const published = getCurrentSubagentRunOwner(this.options.runs, entry);
-    const current = published && isSameSubagentRunOwner(published, entry) ? published : entry;
+    const current = getCurrentSubagentRunOwner(this.options.runs, entry) ?? entry;
     if (current.killReconciliation?.supersededAt !== undefined) {
       return true;
     }
     const latest = this.options.getLatestRunForChildSession(
       current.childSessionKey,
       (candidate) => candidate.runId !== current.runId,
+      current.childAgentId,
     );
     return latest !== null && compareSubagentRunGeneration(latest, current) > 0;
   }
@@ -214,6 +214,7 @@ export class SubagentLifecycleController {
         this.options.runs.get(entry.runId) ?? getCurrentSubagentRunOwner(this.options.runs, entry);
       return (
         (current !== undefined && !isSameSubagentRunOwner(current, entry)) ||
+        this.newerGenerationOwnsSession(entry) ||
         shouldSuppressSubagentRecoverySessionEffects(current ?? entry)
       );
     };
@@ -230,6 +231,7 @@ export class SubagentLifecycleController {
       this.options.runs.get(entry.runId) ?? getCurrentSubagentRunOwner(this.options.runs, entry);
     if (
       (current !== undefined && !isSameSubagentRunOwner(current, entry)) ||
+      this.newerGenerationOwnsSession(entry) ||
       shouldSuppressSubagentRecoverySessionEffects(current ?? entry)
     ) {
       return false;
@@ -366,8 +368,7 @@ export class SubagentLifecycleController {
     return (
       current !== undefined &&
       current.pauseReason !== "sessions_yield" &&
-      this.isCleanupGeneration(entry, generation) &&
-      !this.newerGenerationOwnsSession(current)
+      this.isCleanupGeneration(entry, generation)
     );
   };
   isCleanupAttemptCurrent = (
@@ -377,15 +378,16 @@ export class SubagentLifecycleController {
   ): boolean =>
     getCurrentSubagentRunOwner(this.options.runs, entry)?.cleanupHandled === true &&
     this.isCleanupGenerationCurrent(runId, entry, generation);
-  isEndedHookOwnerCurrent = (_runId: string, entry: SubagentRunRecord): boolean => {
+  isCleanupOwnerCurrent = (_runId: string, entry: SubagentRunRecord): boolean => {
     const current =
       this.options.runs.get(entry.runId) ?? getCurrentSubagentRunOwner(this.options.runs, entry);
     return (
       (current === undefined || isSameSubagentRunOwner(current, entry)) &&
-      (current ?? entry).pauseReason !== "sessions_yield" &&
-      !this.newerGenerationOwnsSession(entry)
+      (current ?? entry).pauseReason !== "sessions_yield"
     );
   };
+  isEndedHookOwnerCurrent = (runId: string, entry: SubagentRunRecord): boolean =>
+    this.isCleanupOwnerCurrent(runId, entry) && !this.newerGenerationOwnsSession(entry);
 
   bumpTerminalGeneration(entry: SubagentRunRecord, bindingChanged = false): number {
     const identity = this.trackRun(entry);
@@ -406,7 +408,6 @@ export class SubagentLifecycleController {
     const current = getCurrentSubagentRunOwner(this.options.runs, entry);
     return (
       current !== undefined &&
-      isSameSubagentRunOwner(current, entry) &&
       current.pauseReason !== "sessions_yield" &&
       this.terminalGenerations.get(getSubagentRunRuntimeKey(entry)) === generation &&
       isDeepStrictEqual(
@@ -522,15 +523,19 @@ export class SubagentLifecycleController {
         lastError: getDeliveryLastError(entry) ?? null,
       };
     }
-    Object.assign(delivery, { status: "discarded", queueId: undefined, nextAttemptAt: undefined });
-    delivery.payload = undefined;
-    Object.assign(delivery, { createdAt: undefined, lastAttemptAt: undefined });
     Object.assign(delivery, {
+      status: "discarded",
+      queueId: undefined,
+      nextAttemptAt: undefined,
+      payload: undefined,
+      createdAt: undefined,
+      lastAttemptAt: undefined,
       attemptCount: undefined,
       lastError: undefined,
       announcedAt: undefined,
+      suspendedAt: undefined,
+      suspendedReason: undefined,
     });
-    Object.assign(delivery, { suspendedAt: undefined, suspendedReason: undefined });
     Object.assign(entry, { wakeOnDescendantSettle: undefined, cleanupHandled: true });
     const completion = ensureCompletionState(entry);
     Object.assign(completion, { fallbackResultText: undefined, fallbackCapturedAt: undefined });
