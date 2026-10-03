@@ -183,9 +183,15 @@ async function summarizeWithFallback(params: CompactionSummaryParams): Promise<s
     return await summarizeChunks(params);
   } catch (err) {
     lastError = err;
+    // In single-pass, only a genuine context overflow may be re-issued (as bounded
+    // chunks by the caller). Caller cancellation and a terminal transport timeout
+    // must stay terminal: falling through to the oversized-message fallback would
+    // fire a second provider batch after the whole request already timed out.
     if (
       params.signal.aborted ||
-      (params.singlePass && isContextOverflowError(formatErrorMessage(lastError)))
+      (params.singlePass &&
+        (isContextOverflowError(formatErrorMessage(lastError)) ||
+          (!isAbortError(lastError) && isTimeoutError(lastError))))
     ) {
       throw lastError;
     }

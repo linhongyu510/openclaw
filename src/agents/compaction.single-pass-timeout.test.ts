@@ -226,4 +226,84 @@ describe("compaction single-pass recovery boundary over real HTTP", () => {
       });
     }
   }, 30_000);
+
+  it("does not re-send the small tail when a mixed-size single-pass request times out", async () => {
+    const requests: Array<{ path: string; body: string }> = [];
+
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        requests.push({
+          path: request.url ?? "",
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            error: {
+              message: "The operation was aborted due to timeout",
+              type: "timeout_error",
+              code: "loopback_compaction_timeout",
+            },
+          }),
+        );
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        resolve();
+      });
+    });
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Compaction loopback server did not expose a TCP port");
+      }
+
+      const bigBody = "Oversized turn payload. ".repeat(15_000);
+      const messages: AgentMessage[] = [
+        makeUserMessage(bigBody, 1),
+        ...Array.from({ length: 4 }, (_, index) =>
+          makeUserMessage(
+            `Small follow-up turn ${index}: recorded opaque identifier 5cf86ba9 for later follow-up.`,
+            index + 2,
+          ),
+        ),
+      ];
+      const reserveTokens = 2_000;
+      const maxChunkTokens = 4_000;
+      const model = loopbackModel(address.port);
+
+      const { singlePassInputTokens, completionAllowanceTokens } =
+        resolveSummarizationRequestBudget({ messages, model, reserveTokens });
+      expect(singlePassInputTokens * SAFETY_MARGIN + completionAllowanceTokens).toBeLessThanOrEqual(
+        200_000,
+      );
+      expect(singlePassInputTokens).toBeGreaterThan(83_000);
+
+      const result = summarizeInStages({
+        messages,
+        model,
+        apiKey: "loopback-test-key", // pragma: allowlist secret
+        signal: new AbortController().signal,
+        reserveTokens,
+        maxChunkTokens,
+        contextWindow: 200_000,
+        parts: 4,
+      });
+
+      await expect(result).rejects.toThrow(/timeout/i);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.path).toBe("/v1/chat/completions");
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  }, 30_000);
 });
