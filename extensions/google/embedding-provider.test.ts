@@ -779,7 +779,9 @@ describe("Gemini embedding provider", () => {
         res.end(JSON.stringify(orderedBatchEmbeddings(offset, size)));
       });
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", resolve);
+    });
     const address = server.address();
     if (typeof address === "string" || address === null) {
       throw new Error("expected a TCP address");
@@ -805,9 +807,9 @@ describe("Gemini embedding provider", () => {
       expect(embeddings).toHaveLength(250);
       expect(embeddings).toEqual(Array.from({ length: 250 }, (_, index) => axisVector(256, index)));
     } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      );
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
     }
   });
 
