@@ -717,8 +717,6 @@ const config = {
     "src/agents/harness/context-engine-turn-outbox.ts": ["exports"],
     // Runtime reason values are exported now so protocol schemas can derive from one tuple later.
     "src/agents/failover/signal.ts": ["exports"],
-    // Focused compaction retry tests consume this explicit predicate seam; production uses it in-module.
-    "src/agents/compaction.ts": ["exports"],
     "src/context-engine/registry.ts": ["exports", "types"],
     "src/plugins/interactive-registry.ts": ["exports"],
     "src/plugins/memory-state.ts": ["exports", "types"],

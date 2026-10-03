@@ -318,19 +318,22 @@ export async function summarizeInStages(
     try {
       return await summarizeWithFallback({ ...params, singlePass });
     } catch (err) {
+      // A verified whole-request fit may only be re-issued as bounded chunks when the
+      // provider rejected the *input size* (context overflow). Caller cancellation and
+      // terminal transport timeouts stay terminal, matching the chunk retry policy
+      // (`shouldRetryCompactionChunkError`: "transport timeouts are terminal"); falling
+      // back to chunked work after a stalled request would only fire a second batch and
+      // prolong compaction instead of terminating the attempt.
       if (
         !singlePass ||
         params.signal.aborted ||
-        (!isTimeoutError(err) && !isContextOverflowError(formatErrorMessage(err)))
+        !isContextOverflowError(formatErrorMessage(err))
       ) {
         throw err;
       }
-      log.warn(
-        "single-pass summarization exceeded the provider request budget; retrying in chunks",
-        {
-          err,
-        },
-      );
+      log.warn("single-pass summarization hit a context overflow; retrying in chunks", {
+        err,
+      });
       return await summarizeWithFallback({ ...params, singlePass: false });
     }
   }
