@@ -9,6 +9,7 @@ import {
   visibleCurrentAssistantStreamTail,
 } from "./stream-reconciliation.ts";
 import {
+  pruneHistoryReplacedStreamSegments,
   prunePersistedAssistantStreamSegments,
   prunePersistedToolStreamMessages,
 } from "./stream-segment-pruning.ts";
@@ -277,16 +278,13 @@ describe("stream reconciliation", () => {
     expect(state.toolStreamOrder).toEqual([]);
   });
 
-  it("retains the cumulative baseline after discarding an earlier displayed prefix", () => {
+  it("retains the cumulative baseline after history replaces an earlier displayed prefix", () => {
     const state = makeIdleStreamState({
       chatStreamSegments: [
         {
           text: "Before steer.",
           ts: 1,
           runId: "active-run",
-          // Equivalent to the private prune seam's output: the replaced earlier
-          // prefix is retained only as a persisted baseline, not rendered live.
-          persisted: true as const,
         },
         {
           text: "Before steer. After steer.",
@@ -295,6 +293,12 @@ describe("stream reconciliation", () => {
         },
       ],
     });
+
+    pruneHistoryReplacedStreamSegments(
+      [{ role: "assistant", content: "Before steer.", timestamp: 1 }],
+      state,
+      visibleStreamOptions,
+    );
 
     expect(visibleAssistantStreamParts(state, visibleStreamOptions)).toMatchObject([
       { text: "After steer." },
