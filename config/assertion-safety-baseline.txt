@@ -699,7 +699,6 @@ extensions/qa-lab/src/evidence-gallery.ts	2
 extensions/qa-lab/src/fixture-utils.ts	4
 extensions/qa-lab/src/gateway-child-artifacts.ts	1
 extensions/qa-lab/src/gateway-process-boundary.ts	1
-extensions/qa-lab/src/harness-parity.ts	1
 extensions/qa-lab/src/harness-runtime.ts	2
 extensions/qa-lab/src/lab-server-capture.ts	1
 extensions/qa-lab/src/lab-server.ts	2
@@ -756,7 +755,7 @@ extensions/qa-lab/src/providers/mock-openai/mock-openai-directives.ts	3
 extensions/qa-lab/src/providers/mock-openai/mock-openai-events.ts	1
 extensions/qa-lab/src/providers/mock-openai/mock-openai-input.ts	6
 extensions/qa-lab/src/providers/mock-openai/mock-openai-responses-websocket.ts	1
-extensions/qa-lab/src/providers/mock-openai/server.ts	6
+extensions/qa-lab/src/providers/mock-openai/server.ts	4
 extensions/qa-lab/src/qa-transport.ts	1
 extensions/qa-lab/src/run-config.ts	1
 extensions/qa-lab/src/runtime-parity.ts	1
@@ -1264,7 +1263,7 @@ src/agents/compaction-planning.ts	1
 src/agents/compaction-planning.worker.ts	1
 src/agents/compaction-real-conversation.ts	4
 src/agents/compaction-usage.ts	1
-src/agents/compaction.ts	4
+src/agents/compaction.ts	3
 src/agents/content-blocks.ts	1
 src/agents/context-cache.ts	1
 src/agents/context-runtime-state.ts	1
@@ -1272,9 +1271,9 @@ src/agents/cron-creator-authority-context.ts	1
 src/agents/custom-api-registry.ts	2
 src/agents/delegation-capability.ts	1
 src/agents/embedded-agent-helpers/bootstrap.ts	2
-src/agents/embedded-agent-helpers/images.ts	7
+src/agents/embedded-agent-helpers/images.ts	6
 src/agents/embedded-agent-helpers/openai.ts	17
-src/agents/embedded-agent-helpers/turns.ts	15
+src/agents/embedded-agent-helpers/turns.ts	14
 src/agents/embedded-agent-live-edit-diff.ts	3
 src/agents/embedded-agent-messaging-extraction.ts	1
 src/agents/embedded-agent-messaging.ts	1
@@ -1346,11 +1345,11 @@ src/agents/embedded-agent-runner/tool-result-context-guard.ts	8
 src/agents/embedded-agent-runner/tool-result-truncation.ts	12
 src/agents/embedded-agent-runner/tool-schema-runtime.ts	1
 src/agents/embedded-agent-runner/transcript-rewrite.ts	1
-src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.ts	2
+src/agents/embedded-agent-subscribe.handlers.messages.lifecycle.ts	1
 src/agents/embedded-agent-subscribe.handlers.messages.stream.ts	3
-src/agents/embedded-agent-subscribe.handlers.messages.update.ts	5
+src/agents/embedded-agent-subscribe.handlers.messages.update.ts	3
 src/agents/embedded-agent-subscribe.handlers.tools.completion.ts	1
-src/agents/embedded-agent-subscribe.handlers.tools.results.ts	2
+src/agents/embedded-agent-subscribe.handlers.tools.results.ts	1
 src/agents/embedded-agent-subscribe.handlers.tools.start.ts	6
 src/agents/embedded-agent-subscribe.tool-text-diagnostics.ts	6
 src/agents/embedded-agent-tool-media.ts	5
@@ -1680,12 +1679,11 @@ src/claws/update-capability-changes.ts	7
 src/claws/workspace.ts	2
 src/cli/acp-cli.ts	7
 src/cli/attach-cli.ts	3
-src/cli/capability-cli/audio.ts	3
 src/cli/capability-cli/embedding.ts	2
 src/cli/capability-cli/image.ts	10
 src/cli/capability-cli/model.ts	4
 src/cli/capability-cli/tts.ts	6
-src/cli/capability-cli/video.ts	6
+src/cli/capability-cli/video.ts	5
 src/cli/capability-cli/web.ts	5
 src/cli/channel-auth.ts	4
 src/cli/channels-cli.ts	5
@@ -1737,7 +1735,7 @@ src/cli/program/register.configure.ts	1
 src/cli/program/register.migrate.ts	7
 src/cli/program/register.onboard.ts	27
 src/cli/program/register.setup.ts	2
-src/cli/program/register.status-health-sessions.ts	18
+src/cli/program/register.status-health-sessions.ts	9
 src/cli/run-main.ts	1
 src/cli/secrets-cli.ts	2
 src/cli/secrets-store-cli.ts	1
@@ -1799,7 +1797,6 @@ src/commands/doctor-state-integrity.ts	1
 src/commands/doctor-telegram-general-topic-conversations.ts	2
 src/commands/doctor-tools-md-migration.ts	5
 src/commands/doctor-workspace.ts	4
-src/commands/doctor/cron/index.ts	3
 src/commands/doctor/cron/legacy-quarantine-migration.ts	1
 src/commands/doctor/cron/legacy-repair.ts	4
 src/commands/doctor/cron/store-migration.ts	2
@@ -1820,7 +1817,7 @@ src/commands/doctor/shared/legacy-config-migrations.runtime.models.codex.ts	4
 src/commands/doctor/shared/legacy-config-migrations.runtime.models.refs.ts	1
 src/commands/doctor/shared/legacy-config-state-migration-input.ts	2
 src/commands/doctor/shared/legacy-talk-config-normalizer.ts	1
-src/commands/doctor/shared/open-policy-allowfrom.ts	2
+src/commands/doctor/shared/open-policy-allowfrom.ts	1
 src/commands/doctor/shared/plugin-tool-allowlist-warnings.ts	1
 src/commands/doctor/shared/stale-agent-model-ref-repair.ts	2
 src/commands/doctor/shared/stale-auth-order-store.ts	2
@@ -1958,7 +1955,7 @@ src/cron/store/delivery-codec.ts	2
 src/cron/store/row-codec.ts	3
 src/daemon/arg-split.ts	2
 src/daemon/launchd-install.ts	4
-src/daemon/launchd-lifecycle.ts	4
+src/daemon/launchd-lifecycle.ts	3
 src/daemon/launchd-service-files.ts	1
 src/daemon/launchd-stop.ts	2
 src/daemon/schtasks-control.ts	5
@@ -2180,7 +2177,6 @@ src/infra/exec-host.ts	3
 src/infra/fetch-headers.ts	3
 src/infra/fetch.ts	5
 src/infra/file-lock-manager.ts	1
-src/infra/file-lock-sync.ts	1
 src/infra/fs-safe-remove.ts	4
 src/infra/gateway-lock.ts	2
 src/infra/gateway-processes.ts	1
@@ -2210,7 +2206,6 @@ src/infra/outbound/agent-delivery.ts	2
 src/infra/outbound/deliver-channel.ts	3
 src/infra/outbound/deliver-payload.ts	1
 src/infra/outbound/deliver-prepare.ts	1
-src/infra/outbound/delivery-queue-media-spool.ts	2
 src/infra/outbound/delivery-queue-storage.ts	3
 src/infra/outbound/format.ts	1
 src/infra/outbound/message-account-selection.ts	1
@@ -2490,7 +2485,7 @@ src/plugins/plugin-package-update.ts	1
 src/plugins/plugin-peer-link.ts	2
 src/plugins/plugin-sdk-native-resolver.ts	1
 src/plugins/prepared-message-tool-catalog.ts	1
-src/plugins/provider-auth-choice-helpers.ts	8
+src/plugins/provider-auth-choice-helpers.ts	5
 src/plugins/provider-catalog-result.ts	7
 src/plugins/provider-discovery.runtime.ts	2
 src/plugins/provider-discovery.ts	1
@@ -2763,7 +2758,7 @@ ui/src/components/lobster-dex.ts	2
 ui/src/components/login-gate.ts	2
 ui/src/components/markdown-assistant-transcript.ts	1
 ui/src/components/markdown-code-blocks.ts	1
-ui/src/components/markdown-parser.ts	2
+ui/src/components/markdown-parser.ts	1
 ui/src/components/mcp-app-theme.ts	1
 ui/src/components/mcp-app-view.ts	5
 ui/src/components/mcp-server-form.ts	1
@@ -2796,8 +2791,8 @@ ui/src/lib/chat/outbox-store-codec.ts	1
 ui/src/lib/chat/outbox-store.ts	1
 ui/src/lib/chat/tool-call-patch.ts	1
 ui/src/lib/chat/tool-cards.ts	2
-ui/src/lib/config-form-utils.ts	3
-ui/src/lib/config/config-draft-model.ts	3
+ui/src/lib/config-form-utils.ts	1
+ui/src/lib/config/config-draft-model.ts	2
 ui/src/lib/keyboard-shortcuts.ts	1
 ui/src/lib/nodes/index.ts	2
 ui/src/lib/nodes/inventory.ts	1

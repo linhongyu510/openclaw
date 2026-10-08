@@ -95,3 +95,16 @@ Summarize the prefix to provide context for the retained suffix:
 - [Information needed to understand the retained recent work]
 
 Be concise. Focus on what's needed to understand the kept suffix.`;
+
+export function createSummarizationContext(promptText: string) {
+  return {
+    systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+    messages: [
+      {
+        role: "user" as const,
+        content: [{ type: "text" as const, text: promptText }],
+        timestamp: Date.now(),
+      },
+    ],
+  };
+}

@@ -173,10 +173,8 @@ async function summarizeWithFallback(params: CompactionSummaryParams): Promise<s
 
   let partialSummaryFallback: string | undefined;
   let lastError: unknown;
-  try {
-    return await summarizeChunks(params);
-  } catch (err) {
-    lastError = err;
+  const recordFailure = (error: unknown, label: string, suffix?: string) => {
+    lastError = error;
     // In single-pass, only a genuine context overflow may be re-issued (as bounded
     // chunks by the caller). Caller cancellation and a terminal transport timeout
     // must stay terminal: falling through to the oversized-message fallback would
@@ -189,8 +187,16 @@ async function summarizeWithFallback(params: CompactionSummaryParams): Promise<s
     ) {
       throw lastError;
     }
-    log.warn(`Full summarization failed: ${formatErrorMessage(lastError)}`);
-    partialSummaryFallback = (lastError as PartialSummaryError).partialSummary;
+    log.warn(`${label}: ${formatErrorMessage(lastError)}`);
+    const partial = (lastError as PartialSummaryError).partialSummary;
+    if (suffix === undefined || partial) {
+      partialSummaryFallback = suffix === undefined ? partial : partial + suffix;
+    }
+  };
+  try {
+    return await summarizeChunks(params);
+  } catch (err) {
+    recordFailure(err, "Full summarization failed");
   }
 
   const { smallMessages, oversizedNotes } = await buildOversizedFallbackPlanWithWorker({
@@ -210,18 +216,8 @@ async function summarizeWithFallback(params: CompactionSummaryParams): Promise<s
       });
       return partialSummary + oversizedSuffix;
     } catch (partialError) {
-      lastError = partialError;
-      if (params.signal.aborted) {
-        throw lastError;
-      }
-      log.warn(`Partial summarization also failed: ${formatErrorMessage(lastError)}`);
-      // Prefer the oversized retry's partial summary over the full attempt's,
-      // since it covers the non-oversized transcript. Append oversized notes
-      // so the model knows large content was filtered.
-      const retryPartial = (lastError as PartialSummaryError).partialSummary;
-      if (retryPartial) {
-        partialSummaryFallback = retryPartial + oversizedSuffix;
-      }
+      // Prefer the retry's partial summary and retain its oversized-message notes.
+      recordFailure(partialError, "Partial summarization also failed", oversizedSuffix);
     }
   }
 

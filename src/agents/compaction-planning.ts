@@ -78,8 +78,7 @@ function estimateCompactionPlanningTokens(message: AgentMessage): number {
 }
 
 export function projectCompactionMessagesForPlanning(messages: AgentMessage[]): AgentMessage[] {
-  const safe = sanitizeCompactionMessages(messages);
-  return projectCompactionPlanningMessages(safe);
+  return projectCompactionPlanningMessages(sanitizeCompactionMessages(messages));
 }
 
 /**
@@ -155,7 +154,7 @@ function normalizeCompactionParts(parts: number, messageCount: number): number {
   if (!Number.isFinite(parts) || parts <= 1) {
     return 1;
   }
-  return Math.min(Math.max(1, Math.floor(parts)), Math.max(1, messageCount));
+  return Math.min(Math.floor(parts), Math.max(1, messageCount));
 }
 
 function forEachCompactionMessageGroup(
@@ -393,10 +392,8 @@ function pruneHistoryForContextShare(params: {
     // Dropping a call owner also drops orphaned results; providers reject replay without the pair.
     const retained = splitPlan.chunks.slice(1).flat();
     const repairReport = repairToolUseResultPairing(retained);
-    const repairedDropped = repairReport.discarded;
-
     droppedChunks += 1;
-    allDroppedMessages.push(...dropped, ...repairedDropped);
+    allDroppedMessages.push(...dropped, ...repairReport.discarded);
     keptMessages = repairReport.messages;
   }
 
