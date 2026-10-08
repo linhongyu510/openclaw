@@ -113,7 +113,7 @@ export async function runEmbeddedAttemptSettledPhase(
     toolResultPromptProjectionState,
     transport: { effectivePromptCacheRetention },
   } = sessionRuntime;
-  const { nestedToolActivities } = toolBase;
+  const { nestedToolActivityState } = toolBase;
   const promptState: EmbeddedAttemptPromptState = {
     contextBudgetStatus: undefined,
     preflightRecovery: undefined,
@@ -146,6 +146,13 @@ export async function runEmbeddedAttemptSettledPhase(
       state.terminal,
       error !== null && error !== undefined ? { error, source: source ?? "prompt" } : null,
     );
+  };
+  const markTimedOutDuringCompaction = () => {
+    state.terminal = mergeAgentRunAttemptTerminal(state.terminal, {
+      kind: "timeout",
+      phase: "compaction",
+      source: "observation",
+    });
   };
 
   try {
@@ -243,19 +250,13 @@ export async function runEmbeddedAttemptSettledPhase(
           ),
           subscription,
           readLifecycleState: readTerminal,
-          markTimedOutDuringCompaction: () => {
-            state.terminal = mergeAgentRunAttemptTerminal(state.terminal, {
-              kind: "timeout",
-              phase: "compaction",
-              source: "observation",
-            });
-          },
+          markTimedOutDuringCompaction,
           runAbortSignal: input.runAbortController.signal,
           isProbeSession,
           onBlockReplyFlush,
           abortable,
           prePromptMessageCount: sessionRuntimeState.prePromptMessageCount,
-          nestedToolActivities,
+          nestedToolActivityState,
           cache: {
             getObservation: preparedStreamRuntime.cache.getObservation,
             retention: effectivePromptCacheRetention,
@@ -282,11 +283,7 @@ export async function runEmbeddedAttemptSettledPhase(
     // outer teardown still needs the completed stream snapshot and usage state.
     setFailure(settledStream.promptError, settledStream.promptErrorSource);
     if (settledStream.timedOutDuringCompaction) {
-      state.terminal = mergeAgentRunAttemptTerminal(state.terminal, {
-        kind: "timeout",
-        phase: "compaction",
-        source: "observation",
-      });
+      markTimedOutDuringCompaction();
     }
     messagesSnapshot = settledStream.messagesSnapshot;
     sessionIdUsed = settledStream.sessionIdUsed;

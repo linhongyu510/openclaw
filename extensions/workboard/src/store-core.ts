@@ -122,8 +122,8 @@ export class WorkboardCoreStore extends WorkboardBoardStore {
   }
 
   async compensateWorkspaceMutation(before: WorkboardCard, after: WorkboardCard): Promise<void> {
-    await this.enqueueMutation(
-      async () => await this.rollbackUpdatedCard(before, after, invertWorkboardWorkspaceMutation),
+    await this.enqueueMutation(() =>
+      this.rollbackUpdatedCard(before, after, invertWorkboardWorkspaceMutation),
     );
   }
 
@@ -239,11 +239,6 @@ export class WorkboardCoreStore extends WorkboardBoardStore {
     return this.lastNotificationSequence;
   }
 
-  async list(options: WorkboardListOptions = {}): Promise<WorkboardCard[]> {
-    const boardId = normalizeBoardId(options.boardId);
-    return readCards(this.store, boardId === undefined ? undefined : { kind: "board", boardId });
-  }
-
   async stats(input: WorkboardListOptions = {}, now = Date.now()): Promise<WorkboardStatsResult> {
     const boardId = normalizeBoardId(input.boardId);
     const aggregates = await this.store.listStatsAggregates(boardId);
@@ -328,8 +323,7 @@ export class WorkboardCoreStore extends WorkboardBoardStore {
     assertOwnerCurrent?: () => void,
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(
-      async () =>
-        await this.withCardCompensation(async () => await this.createDirect(input, scope)),
+      () => this.withCardCompensation(() => this.createDirect(input, scope)),
       assertOwnerCurrent,
     );
   }
@@ -862,11 +856,10 @@ export class WorkboardCoreStore extends WorkboardBoardStore {
     childId: string,
     scope?: WorkboardMutationScope,
   ): Promise<WorkboardCard> {
-    return await this.enqueueMutation(
-      async () =>
-        await this.withCardCompensation(
-          async () => await this.linkCardsDirect(parentId, childId, Date.now(), { scope }),
-        ),
+    return await this.enqueueMutation(() =>
+      this.withCardCompensation(() =>
+        this.linkCardsDirect(parentId, childId, Date.now(), { scope }),
+      ),
     );
   }
 

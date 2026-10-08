@@ -229,7 +229,7 @@ function futureFixtureVersion(sourceVersion, sequence) {
   return `${release[1]}.${release[2]}.${Number(release[3]) + 1}-first-hop.${sequence}`;
 }
 
-function stampFixtureVersion(packageRoot, version) {
+export function stampFixtureVersion(packageRoot, version) {
   const paths = resolveFixturePaths(packageRoot);
   const packageJson = readJson(paths.packageJson);
   const buildInfo = readJson(paths.buildInfo);
@@ -355,9 +355,9 @@ function packNegativeUpdateFixture(candidateTarball, outputTarball, expectedMiss
 export function packFutureUpdateFixture(candidateTarball, outputTarball, sequence = 0) {
   return {
     method: "candidate-same-schema-self-update-fixture",
-    ...packTransformedFixture(candidateTarball, outputTarball, (root) => {
-      return markFutureUpdateFixture(root, sequence);
-    }),
+    ...packTransformedFixture(candidateTarball, outputTarball, (root) =>
+      markFutureUpdateFixture(root, sequence),
+    ),
   };
 }
 

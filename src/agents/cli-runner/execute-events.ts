@@ -4,6 +4,7 @@ import { emitTrustedDiagnosticEvent } from "../../infra/diagnostic-events.js";
 import { markToolExecutionLivenessDiagnosticEvent } from "../../infra/diagnostic-tool-execution-liveness.js";
 import { projectProgressCardChannelUpdate } from "../../session-cards/progress-card-channel-summary.js";
 import { isAgentPlanProgressToolName } from "../../session-cards/progress-card-input.js";
+import { registerListener } from "../../shared/listeners.js";
 import { projectAgentActivityItem } from "../agent-activity-presentation.js";
 import type {
   CliCompactionDelta,
@@ -18,7 +19,7 @@ import type { ToolSummaryTrace } from "../embedded-agent-runner/types.js";
 import {
   extractToolErrorMessage,
   sanitizeToolArgs,
-  sanitizeToolResult,
+  prepareToolResult,
 } from "../embedded-agent-tool-results.js";
 import { runAgentHarnessAfterToolCallHook } from "../harness/hook-helpers.js";
 import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
@@ -47,8 +48,19 @@ export function createCliEventHandlers(params: {
   let observedCliActivity = false;
   let compactionActive = false;
   const compactionChangeListeners = new Set<() => void>();
-  let signaledToolExecutionStarted = false;
-  let signaledAssistantOutputStarted = false;
+  const signaledPhases = new Set<"tool_execution_started" | "assistant_output_started">();
+  const signalExecutionPhase = (phase: "tool_execution_started" | "assistant_output_started") => {
+    if (signaledPhases.has(phase)) {
+      return;
+    }
+    signaledPhases.add(phase);
+    runParams.onExecutionPhase?.({
+      phase,
+      provider: runParams.provider,
+      model: context.modelId,
+      backend: context.backendResolved.id,
+    });
+  };
   let commentaryCounter = 0;
   const toolSummaryById = new Map<
     string,
@@ -126,15 +138,7 @@ export function createCliEventHandlers(params: {
       startedAt: Date.now(),
     });
     recordToolSummary(event, false);
-    if (!signaledToolExecutionStarted) {
-      signaledToolExecutionStarted = true;
-      runParams.onExecutionPhase?.({
-        phase: "tool_execution_started",
-        provider: runParams.provider,
-        model: context.modelId,
-        backend: context.backendResolved.id,
-      });
-    }
+    signalExecutionPhase("tool_execution_started");
     if (tracked) {
       params.toolTracking.handleCliToolUseStart(event);
     }
@@ -149,6 +153,7 @@ export function createCliEventHandlers(params: {
   };
   const emitToolResult = (event: CliToolResultDelta, tracked: boolean) => {
     observedCliActivity = true;
+    const readResult = prepareToolResult(event.result);
     const summary = recordToolSummary(event, event.isError);
     const firstTerminal = !summary.terminalObserved;
     summary.terminalObserved = true;
@@ -166,7 +171,7 @@ export function createCliEventHandlers(params: {
       !loopbackOutcome &&
       stripOpenClawMcpToolPrefix(event.name) === event.name
     ) {
-      const result = sanitizeToolResult(event.result);
+      const result = readResult();
       void runAgentHarnessAfterToolCallHook({
         toolName: normalizeCliToolName(event.name),
         toolCallId: event.toolCallId,
@@ -215,7 +220,7 @@ export function createCliEventHandlers(params: {
           name: event.name,
           toolCallId: event.toolCallId,
           isError: event.isError,
-          result: sanitizeToolResult(event.result),
+          result: readResult(),
           ...(tracked && startedArgs ? { args: sanitizeToolArgs(startedArgs) } : {}),
           ...(resultContentSource ? { resultContentSource } : {}),
         },
@@ -390,15 +395,7 @@ export function createCliEventHandlers(params: {
   const emitCliAssistantDelta = ({ text, delta }: CliStreamingDelta) => {
     if (text || delta) {
       observedCliActivity = true;
-      if (!signaledAssistantOutputStarted) {
-        signaledAssistantOutputStarted = true;
-        runParams.onExecutionPhase?.({
-          phase: "assistant_output_started",
-          provider: runParams.provider,
-          model: context.modelId,
-          backend: context.backendResolved.id,
-        });
-      }
+      signalExecutionPhase("assistant_output_started");
     }
     emitLiveEvent("assistant", () => ({
       text: applyPluginTextReplacements(text, context.backendResolved.textTransforms?.output),
@@ -438,8 +435,6 @@ export function createCliEventHandlers(params: {
 
   return {
     emitLiveEvents,
-    emitCliToolUseStart: (event: CliToolUseStartDelta) => emitToolUseStart(event, true),
-    emitCliToolResult: (event: CliToolResultDelta) => emitToolResult(event, true),
     // Display-only native events never enter host-tool correlation or delivery accounting.
     emitCliDisplayToolUseStart: (event: CliToolUseStartDelta) => emitToolUseStart(event, false),
     emitCliDisplayToolResult: (event: CliToolResultDelta) => emitToolResult(event, false),
@@ -454,10 +449,8 @@ export function createCliEventHandlers(params: {
     emitCliThinkingProgress,
     hasObservedCliActivity: () => observedCliActivity,
     hasActiveCompaction: () => compactionActive,
-    onCompactionActiveChange: (listener: () => void) => {
-      compactionChangeListeners.add(listener);
-      return () => compactionChangeListeners.delete(listener);
-    },
+    onCompactionActiveChange: (listener: () => void) =>
+      registerListener(compactionChangeListeners, listener),
     activeParsedToolCount: () => activeParsedTools.size,
     isActiveForegroundAgentTool: (toolCallId: string) => {
       const tool = activeParsedTools.get(toolCallId);

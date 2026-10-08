@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
+import {
+  createAgentRunDirectAbortError,
+  createAgentRunRestartAbortError,
+  createAgentRunSupersededAbortError,
+  isAgentRunDirectAbortReason,
+} from "../../agents/run-termination.js";
 import { resetDiagnosticRunActivityForTest } from "../../logging/diagnostic-run-activity.js";
 import { resetCommandQueueStateForTest } from "../../process/command-queue.test-support.js";
 import type { ReplyBackendHandle } from "./reply-run-registry.contracts.js";
@@ -122,23 +127,65 @@ describe("reply run registry cancellation", () => {
   });
 
   it.each([
-    { reason: new Error("caller cancelled"), code: "aborted_by_user", cancelReason: "user_abort" },
+    {
+      reason: undefined,
+      code: "aborted_by_user",
+      cancelReason: "user_abort",
+      direct: false,
+    },
+    {
+      reason: new Error("caller cancelled"),
+      code: "aborted_by_user",
+      cancelReason: "user_abort",
+      direct: false,
+    },
+    {
+      reason: createAgentRunDirectAbortError(),
+      code: "aborted_by_user",
+      cancelReason: "user_abort",
+      direct: true,
+    },
     {
       reason: createAgentRunRestartAbortError(),
       code: "aborted_for_restart",
       cancelReason: "restart",
+      direct: false,
     },
-  ])("records upstream cancellation as $code", ({ reason, code, cancelReason }) => {
-    const upstreamAbort = new AbortController();
-    const { operation, cancel } = createRunningOperation(upstreamAbort.signal);
-    upstreamAbort.abort(reason);
+    {
+      reason: createAgentRunSupersededAbortError(),
+      code: "aborted_for_supersession",
+      cancelReason: "superseded",
+      direct: false,
+    },
+    {
+      reason: createAgentRunRestartAbortError(),
+      code: "aborted_by_user",
+      cancelReason: "user_abort",
+      userFirst: true,
+      direct: true,
+    },
+  ])(
+    "records cancellation once as $code (userFirst=$userFirst)",
+    ({ reason, code, cancelReason, userFirst, direct }) => {
+      const upstreamAbort = new AbortController();
+      const { operation, cancel } = createRunningOperation(upstreamAbort.signal);
+      if (userFirst) {
+        expect(operation.abortByUser()).toBe(true);
+      }
+      upstreamAbort.abort(reason);
 
-    expect(operation.result).toEqual({ kind: "aborted", code });
-    expect(operation.phase).toBe("aborted");
-    expect(operation.abortSignal.aborted).toBe(true);
-    expect(cancel).toHaveBeenCalledWith(cancelReason);
-    operation.complete();
-  });
+      expect(operation.result).toEqual({ kind: "aborted", code });
+      expect(operation.phase).toBe("aborted");
+      expect(operation.abortSignal.aborted).toBe(true);
+      expect(isAgentRunDirectAbortReason(operation.abortSignal.reason)).toBe(direct);
+      if (!userFirst) {
+        expect(operation.abortSignal.reason).toBe(upstreamAbort.signal.reason);
+      }
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(cancel).toHaveBeenCalledWith(cancelReason);
+      operation.complete();
+    },
+  );
 
   it("clears queued ownership when the upstream signal is already aborted", () => {
     const upstreamAbort = new AbortController();
@@ -154,19 +201,6 @@ describe("reply run registry cancellation", () => {
     expect(operation.phase).toBe("aborted");
     expect(operation.abortSignal.aborted).toBe(true);
     expect(replyRunRegistry.isActive("agent:main:already-cancelled")).toBe(false);
-  });
-
-  it("does not cancel the backend twice when upstream abort follows a user abort", () => {
-    const upstreamAbort = new AbortController();
-    const { operation, cancel } = createRunningOperation(upstreamAbort.signal);
-
-    expect(operation.abortByUser()).toBe(true);
-    upstreamAbort.abort(createAgentRunRestartAbortError());
-
-    expect(operation.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
-    expect(cancel).toHaveBeenCalledTimes(1);
-    expect(cancel).toHaveBeenCalledWith("user_abort");
-    operation.complete();
   });
 
   it("rejects aborts while the attached backend is finalizing", () => {

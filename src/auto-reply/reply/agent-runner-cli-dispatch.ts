@@ -15,11 +15,7 @@ import {
   resolveFastModeForElapsed,
   type FastModeAutoProgressState,
 } from "../../agents/fast-mode.js";
-import {
-  isAgentRunRestartAbortReason,
-  resolveAgentRunAbortLifecycleFields,
-  resolveAgentRunErrorLifecycleFields,
-} from "../../agents/run-termination.js";
+import { isAgentRunRestartAbortReason } from "../../agents/run-termination.js";
 import { inferToolMetaFromArgsCore, isCommandBearingToolCall } from "../../agents/tool-display.js";
 import { normalizeAgentPlanSteps } from "../../channels/streaming.js";
 import type { AgentEventPayload } from "../../infra/agent-events.js";
@@ -31,9 +27,8 @@ import type { GetReplyOptions } from "../types.js";
 import {
   createAgentEventBridge,
   createAgentEventDeliveryStartOrder,
+  type AgentEventBridgeParams,
 } from "./agent-event-bridge.js";
-import { resolveAgentLifecycleTerminalMetadata } from "./agent-lifecycle-terminal.js";
-import { createAssistantTextBridge } from "./cli-assistant-bridge.js";
 
 type RunCliAgentInternalParams = RunCliAgentParams & {
   mediaImageLayout?: MediaImageLayout;
@@ -54,6 +49,10 @@ type ReasoningTextPayload = {
   text: string;
   isReasoningSnapshot?: boolean;
 };
+
+type AssistantTextDelivery =
+  | { text: string; completed: false }
+  | { text: string; completed: true; assistantMessageIndex: number };
 
 export function createCliReasoningStreamBridge(
   onReasoningStream: GetReplyOptions["onReasoningStream"] | undefined,
@@ -118,9 +117,6 @@ export function keepCliSessionBindingOnlyWhenReused(params: {
 }
 
 function readToolEventPayload(evt: AgentEventPayload): CliToolEventPayload | undefined {
-  if (evt.stream !== "tool") {
-    return undefined;
-  }
   const phase = evt.data.phase;
   if (phase !== "start" && phase !== "update" && phase !== "result") {
     return undefined;
@@ -208,10 +204,8 @@ export function createCliToolSummaryTracker(params: {
 type RunCliAgentWithLifecycleParams = {
   runId: string;
   lifecycleGeneration?: string;
-  provider: string;
   runParams: RunCliAgentInternalParams;
   startedAt?: number;
-  emitLifecycleTerminal?: boolean;
   onAgentRunStart?: () => void;
   suppressAssistantBridge?: boolean;
   /**
@@ -301,19 +295,16 @@ async function runCliAgentWithLifecycleInternal(
     fastModeAutoProgressState.offAnnounced = true;
     await emitFastModeAutoProgress(next);
   };
-  const emitLifecycleTerminal = params.emitLifecycleTerminal ?? true;
-  const emitLifecycleEvent = ({ phase, ...data }: AgentEventPayload["data"]) =>
-    emitAgentEvent({
-      runId: params.runId,
-      ...(params.runParams.agentId ? { agentId: params.runParams.agentId } : {}),
-      ...(params.runParams.sessionKey ? { sessionKey: params.runParams.sessionKey } : {}),
-      ...(params.runParams.sessionId ? { sessionId: params.runParams.sessionId } : {}),
-      ...(params.lifecycleGeneration ? { lifecycleGeneration: params.lifecycleGeneration } : {}),
-      stream: "lifecycle",
-      data: { phase, startedAt, ...data },
-    });
   params.onAgentRunStart?.();
-  emitLifecycleEvent({ phase: "start" });
+  emitAgentEvent({
+    runId: params.runId,
+    ...(params.runParams.agentId ? { agentId: params.runParams.agentId } : {}),
+    ...(params.runParams.sessionKey ? { sessionKey: params.runParams.sessionKey } : {}),
+    ...(params.runParams.sessionId ? { sessionId: params.runParams.sessionId } : {}),
+    ...(params.lifecycleGeneration ? { lifecycleGeneration: params.lifecycleGeneration } : {}),
+    stream: "lifecycle",
+    data: { phase: "start", startedAt },
+  });
   const progressStartOrder = createAgentEventDeliveryStartOrder({
     preserveCallbackStartOrder: params.preserveProgressCallbackStartOrder === true,
   });
@@ -322,6 +313,17 @@ async function runCliAgentWithLifecycleInternal(
     suppressed: params.suppressAssistantBridge,
     startOrder: progressStartOrder,
   };
+  const createProgressBridge = <T>(
+    stream: AgentEventPayload["stream"],
+    options: Pick<AgentEventBridgeParams<T>, "read" | "deliver" | "waitForEarlierDeliveries">,
+  ) =>
+    createAgentEventBridge({
+      ...progressBridgeParams,
+      ...options,
+      read: (event) => (event.stream === stream ? options.read(event) : undefined),
+    });
+  const { onAssistantText, onCompletedReply } = params;
+  let lastAssistantText: string | undefined;
   let finalReasoningText: string | undefined;
   let lastReasoningText: string | undefined;
   let lastProgressTokens: number | undefined;
@@ -336,17 +338,36 @@ async function runCliAgentWithLifecycleInternal(
           },
         })
       : undefined,
-    createAssistantTextBridge({
-      ...progressBridgeParams,
-      deliver: params.onAssistantText,
-      deliverCompleted: params.onCompletedReply,
-    }),
-    createAgentEventBridge<ReasoningTextPayload>({
-      ...progressBridgeParams,
+    createProgressBridge<AssistantTextDelivery>("assistant", {
+      waitForEarlierDeliveries: (payload) => payload.completed,
+      deliver: async (payload) => {
+        if (payload.completed) {
+          await onCompletedReply?.(payload.text, payload.assistantMessageIndex);
+        } else {
+          await onAssistantText?.(payload.text);
+        }
+      },
       read: (evt) => {
-        if (evt.stream !== "thinking") {
+        if (
+          typeof evt.data.completedText === "string" &&
+          typeof evt.data.assistantMessageIndex === "number"
+        ) {
+          return {
+            text: evt.data.completedText,
+            completed: true,
+            assistantMessageIndex: evt.data.assistantMessageIndex,
+          };
+        }
+        const text = typeof evt.data.text === "string" ? evt.data.text : undefined;
+        if (text === undefined || text === lastAssistantText) {
           return undefined;
         }
+        lastAssistantText = text;
+        return { text, completed: false };
+      },
+    }),
+    createProgressBridge<ReasoningTextPayload>("thinking", {
+      read: (evt) => {
         const text = typeof evt.data.text === "string" ? evt.data.text : undefined;
         if (text === undefined || text === lastReasoningText) {
           return undefined;
@@ -362,12 +383,8 @@ async function runCliAgentWithLifecycleInternal(
         await params.onReasoningText?.(payload);
       },
     }),
-    createAgentEventBridge({
-      ...progressBridgeParams,
+    createProgressBridge("thinking", {
       read: (evt) => {
-        if (evt.stream !== "thinking") {
-          return undefined;
-        }
         const progressTokens = asPositiveFiniteNumber(evt.data.progressTokens);
         if (progressTokens === undefined || progressTokens === lastProgressTokens) {
           return undefined;
@@ -377,8 +394,7 @@ async function runCliAgentWithLifecycleInternal(
       },
       deliver: params.onReasoningProgress,
     }),
-    createAgentEventBridge<{ phase: "start" } | { completed: boolean; phase: "end" }>({
-      ...progressBridgeParams,
+    createProgressBridge<{ phase: "start" } | { completed: boolean; phase: "end" }>("compaction", {
       deliver: async (event) => {
         if (event.phase === "start") {
           await params.onCompactionStart?.();
@@ -387,9 +403,6 @@ async function runCliAgentWithLifecycleInternal(
         }
       },
       read: (evt) => {
-        if (evt.stream !== "compaction") {
-          return undefined;
-        }
         if (evt.data.phase === "start") {
           return { phase: "start" };
         }
@@ -398,16 +411,14 @@ async function runCliAgentWithLifecycleInternal(
           : undefined;
       },
     }),
-    createAgentEventBridge({
-      ...progressBridgeParams,
+    createProgressBridge("tool", {
       deliver: params.onToolEvent,
       read: readToolEventPayload,
     }),
-    createAgentEventBridge<CommentaryTextPayload>({
-      ...progressBridgeParams,
+    createProgressBridge<CommentaryTextPayload>("item", {
       deliver: params.onCommentaryText,
       read: (evt) => {
-        if (evt.stream !== "item" || evt.data.kind !== "preamble") {
+        if (evt.data.kind !== "preamble") {
           return undefined;
         }
         const text = typeof evt.data.progressText === "string" ? evt.data.progressText.trim() : "";
@@ -416,32 +427,23 @@ async function runCliAgentWithLifecycleInternal(
           : undefined;
       },
     }),
-    createAgentEventBridge({
-      ...progressBridgeParams,
+    createProgressBridge("item", {
       read: (evt) =>
-        evt.stream === "item" &&
-        evt.data.kind !== "preamble" &&
-        Value.Check(AgentActivityItemSchema, evt.data)
+        evt.data.kind !== "preamble" && Value.Check(AgentActivityItemSchema, evt.data)
           ? evt.data
           : undefined,
       deliver: params.onItemEvent ? (item) => params.onItemEvent?.(item) : undefined,
     }),
-    createAgentEventBridge({
-      ...progressBridgeParams,
+    createProgressBridge("plan", {
       deliver: params.onPlanUpdate,
-      read: (evt) =>
-        evt.stream === "plan"
-          ? {
-              phase: normalizeOptionalString(evt.data.phase),
-              title: normalizeOptionalString(evt.data.title),
-              explanation: normalizeOptionalString(evt.data.explanation),
-              ...(evt.data.explanationFormat === "plain"
-                ? { explanationFormat: "plain" as const }
-                : {}),
-              steps: normalizeAgentPlanSteps(evt.data.steps),
-              source: normalizeOptionalString(evt.data.source),
-            }
-          : undefined,
+      read: (evt) => ({
+        phase: normalizeOptionalString(evt.data.phase),
+        title: normalizeOptionalString(evt.data.title),
+        explanation: normalizeOptionalString(evt.data.explanation),
+        ...(evt.data.explanationFormat === "plain" ? { explanationFormat: "plain" as const } : {}),
+        steps: normalizeAgentPlanSteps(evt.data.steps),
+        source: normalizeOptionalString(evt.data.source),
+      }),
     }),
     createAgentEventBridge({
       runId: params.runId,
@@ -456,7 +458,6 @@ async function runCliAgentWithLifecycleInternal(
       },
     }),
   ].filter((bridge): bridge is AgentEventBridge => bridge !== undefined);
-  let lifecycleTerminalEmitted = false;
   try {
     const rawResult = await runCliAgent({
       ...params.runParams,
@@ -473,11 +474,10 @@ async function runCliAgentWithLifecycleInternal(
       ? (normalizeOptionalString(result.meta.finalAssistantVisibleText) ??
         normalizeOptionalString(result.payloads[0]?.text))
       : undefined;
-    const durableReasoningText = normalizeOptionalString(finalReasoningText);
-    const resultWithReasoning = durableReasoningText
+    const resultWithReasoning = finalReasoningText
       ? {
           ...result,
-          payloads: [{ text: durableReasoningText, isReasoning: true }, ...(result.payloads ?? [])],
+          payloads: [{ text: finalReasoningText, isReasoning: true }, ...(result.payloads ?? [])],
         }
       : result;
     if (cliText) {
@@ -488,28 +488,10 @@ async function runCliAgentWithLifecycleInternal(
       });
     }
 
-    if (emitLifecycleTerminal) {
-      emitLifecycleEvent({
-        phase: "end",
-        endedAt: Date.now(),
-        ...resolveAgentLifecycleTerminalMetadata(result.meta),
-        ...resolveAgentRunAbortLifecycleFields(params.runParams.abortSignal),
-      });
-      lifecycleTerminalEmitted = true;
-    }
     return resultWithReasoning;
   } catch (err) {
     await stopAgentEventBridges(bridges);
     await params.onErrorBeforeLifecycle?.(err);
-    if (emitLifecycleTerminal) {
-      emitLifecycleEvent({
-        phase: "error",
-        endedAt: Date.now(),
-        error: String(err),
-        ...resolveAgentRunErrorLifecycleFields(err, params.runParams.abortSignal),
-      });
-      lifecycleTerminalEmitted = true;
-    }
     throw err;
   } finally {
     for (const bridge of bridges) {
@@ -526,14 +508,6 @@ async function runCliAgentWithLifecycleInternal(
         enabled: true,
         elapsedSeconds: 0,
         fastAutoOnSeconds: fastModeAutoOnSeconds,
-      });
-    }
-    if (emitLifecycleTerminal && !lifecycleTerminalEmitted) {
-      emitLifecycleEvent({
-        phase: "error",
-        endedAt: Date.now(),
-        error: "CLI run completed without lifecycle terminal event",
-        ...resolveAgentRunAbortLifecycleFields(params.runParams.abortSignal),
       });
     }
   }

@@ -119,18 +119,6 @@ export const handleDiagnosticsCommand: CommandHandler = async (input, allowTextC
   return reply ? { shouldContinue: false, reply } : { shouldContinue: false };
 };
 
-async function buildDiagnosticsReply(
-  params: HandleCommandsParams,
-  args: string,
-  options: {
-    diagnosticsPrivateRouted?: boolean;
-    privateApprovalTarget?: PrivateCommandRouteTarget;
-  } = {},
-): Promise<ReplyPayload | undefined> {
-  const codexDiagnostics = await buildCodexDiagnosticsApprovalIntegration(params, args, options);
-  return await requestGatewayDiagnosticsExportApproval(params, options, codexDiagnostics);
-}
-
 async function deliverGroupDiagnosticsReplyPrivately(
   params: HandleCommandsParams,
   reply: ReplyPayload,
@@ -153,10 +141,10 @@ function parseDiagnosticsArgs(commandBody: string): string | undefined {
   if (trimmed === DIAGNOSTICS_COMMAND) {
     return "";
   }
-  if (trimmed.startsWith(`${DIAGNOSTICS_COMMAND} `)) {
-    return trimmed.slice(DIAGNOSTICS_COMMAND.length + 1).trim();
-  }
-  if (trimmed.startsWith(`${DIAGNOSTICS_COMMAND}:`)) {
+  if (
+    trimmed.startsWith(`${DIAGNOSTICS_COMMAND} `) ||
+    trimmed.startsWith(`${DIAGNOSTICS_COMMAND}:`)
+  ) {
     return trimmed.slice(DIAGNOSTICS_COMMAND.length + 1).trim();
   }
   return undefined;
@@ -191,11 +179,16 @@ function buildGatewayDiagnosticsExportJsonRequest() {
   return buildCurrentOpenClawCliExecRequest(["gateway", "diagnostics", "export", "--json"]);
 }
 
-async function requestGatewayDiagnosticsExportApproval(
+async function buildDiagnosticsReply(
   params: HandleCommandsParams,
-  options: { privateApprovalTarget?: PrivateCommandRouteTarget } = {},
-  codexDiagnostics: CodexDiagnosticsApprovalIntegration = {},
+  args: string,
+  options: {
+    diagnosticsPrivateRouted?: boolean;
+    privateApprovalTarget?: PrivateCommandRouteTarget;
+  } = {},
 ): Promise<ReplyPayload | undefined> {
+  const codexDiagnostics =
+    (await buildCodexDiagnosticsApprovalIntegration(params, args, options)) ?? {};
   const timeoutSec = params.cfg.tools?.exec?.timeoutSeconds;
   const agentId =
     params.agentId ??
@@ -271,40 +264,40 @@ async function buildCodexDiagnosticsApprovalIntegration(
   options: { diagnosticsPrivateRouted?: boolean } = {},
 ): Promise<CodexDiagnosticsApprovalIntegration | undefined> {
   const hasHarnessMetadata = hasCodexHarnessMetadata(params);
+  const renderSection = (result: PluginCommandResult | undefined) => {
+    if (!result) {
+      return hasHarnessMetadata
+        ? {
+            approvalText:
+              "OpenAI Codex harness: selected for this session, but the bundled Codex diagnostics command is not registered.",
+          }
+        : undefined;
+    }
+    const reply = rewriteCodexDiagnosticsResult(result);
+    if (!hasHarnessMetadata && isCodexDiagnosticsUnavailableText(reply.text)) {
+      return undefined;
+    }
+    return {
+      approvalText: reply.text ? ["OpenAI Codex harness:", reply.text].join("\n") : undefined,
+    };
+  };
   const previewResult = await executeCodexDiagnosticsAddon(params, args, {
     ...options,
     diagnosticsPreviewOnly: true,
   });
-  if (!previewResult) {
-    return hasHarnessMetadata
-      ? {
-          approvalText:
-            "OpenAI Codex harness: selected for this session, but the bundled Codex diagnostics command is not registered.",
-        }
-      : undefined;
-  }
-  const preview = rewriteCodexDiagnosticsResult(previewResult);
-  if (!hasHarnessMetadata && isCodexDiagnosticsUnavailableText(preview.text)) {
-    return undefined;
+  const preview = renderSection(previewResult);
+  if (!preview || !previewResult) {
+    return preview;
   }
   return {
-    approvalText: preview.text ? ["OpenAI Codex harness:", preview.text].join("\n") : undefined,
-    approvalFollowup: async () => {
-      const uploadResult = await executeCodexDiagnosticsAddon(params, args, {
-        ...options,
-        diagnosticsUploadApproved: true,
-      });
-      if (!uploadResult) {
-        return hasHarnessMetadata
-          ? "OpenAI Codex harness: selected for this session, but the bundled Codex diagnostics command is not registered."
-          : undefined;
-      }
-      const uploaded = rewriteCodexDiagnosticsResult(uploadResult);
-      if (!hasHarnessMetadata && isCodexDiagnosticsUnavailableText(uploaded.text)) {
-        return undefined;
-      }
-      return uploaded.text ? ["OpenAI Codex harness:", uploaded.text].join("\n") : undefined;
-    },
+    ...preview,
+    approvalFollowup: async () =>
+      renderSection(
+        await executeCodexDiagnosticsAddon(params, args, {
+          ...options,
+          diagnosticsUploadApproved: true,
+        }),
+      )?.approvalText,
   };
 }
 

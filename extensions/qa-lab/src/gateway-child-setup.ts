@@ -29,7 +29,6 @@ import { createQaGatewayCliError, redactQaGatewayDebugText } from "./gateway-log
 import { reserveQaGatewayPort } from "./gateway-port-reservation.js";
 import { createQaGatewayProcessBoundaryController } from "./gateway-process-boundary.js";
 import { splitQaModelRef, type QaProviderMode } from "./model-selection.js";
-import { resolveQaNodeExecPath } from "./node-exec.js";
 import type { QaCliBackendAuthMode } from "./providers/env.js";
 import { DEFAULT_QA_PROVIDER_MODE, getQaProvider } from "./providers/index.js";
 import { readQaLiveProviderConfigOverrides } from "./providers/live-config.js";
@@ -174,7 +173,10 @@ export async function prepareQaGatewayChild(
   lifetime: QaGatewayChildLifecycle,
 ) {
   const tempParentDir = params.command?.tempParentDir ?? resolvePreferredOpenClawTmpDir();
-  const tempRoot = await fs.mkdtemp(path.join(tempParentDir, "openclaw-qa-suite-"));
+  lifetime.tempRoot = await fs.mkdtemp(path.join(tempParentDir, "openclaw-qa-suite-"));
+  // Store discovery returns physical paths; macOS /tmp aliases must not split
+  // the fixture's configured roots from their captured database custody.
+  const tempRoot = await fs.realpath(lifetime.tempRoot);
   lifetime.tempRoot = tempRoot;
   const runtimeCwd = tempRoot;
   const distEntryPath = path.join(params.repoRoot, "dist", "index.js");
@@ -319,7 +321,7 @@ export async function prepareQaGatewayChild(
   let env: NodeJS.ProcessEnv | null = null;
   let packagedMockAuthStaged = false;
 
-  const nodeExecPath = gatewayExecutablePath ?? (await resolveQaNodeExecPath());
+  const nodeExecPath = gatewayExecutablePath ?? process.execPath;
   const cliArgsPrefix = gatewayCommand?.processBoundary
     ? gatewayArgsPrefix
     : gatewayExecutablePath

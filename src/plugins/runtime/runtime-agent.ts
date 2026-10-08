@@ -1,4 +1,3 @@
-// Runtime agent helpers resolve agent-scoped directories and config for plugin execution.
 import { isDeepStrictEqual } from "node:util";
 import { resolveAgentDir, resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../agents/defaults.js";
@@ -149,7 +148,7 @@ async function createSessionEntry(
     import("../../gateway/session-utils.js"),
     import("../../acp/runtime/session-meta-readonly.js"),
     import("../../acp/runtime/session-meta.js"),
-    import("../../gateway/operator-role-policy.js"),
+    import("../../gateway/operator-session-run.js"),
   ]);
   creationOwner.assertCurrent();
   const requiredCreation = resolveSandboxedSessionCreation(
@@ -213,7 +212,7 @@ async function createSessionEntry(
     return isDeepStrictEqual(leftStable, rightStable);
   };
   const identities = new Set([target.canonicalKey, ...target.storeKeys]);
-  return await runExclusiveSessionLifecycleMutation({
+  return await runExclusiveSessionLifecycleMutation("plugin-create", {
     scope: target.storePath,
     identities,
     prepare: async () => {
@@ -283,6 +282,7 @@ async function createSessionEntry(
             }
           },
           { config: params.cfg, agentId: captured.agentId, entry: expected },
+          creationOwner,
         );
         initialization.handle.assertCurrent();
         if (!afterCreate) {
@@ -615,7 +615,6 @@ async function runWithSessionWorkAdmission<T>(
   }
 }
 
-/** Creates the plugin runtime agent facade with lazy embedded-agent/session helpers. */
 export function createRuntimeAgent(): PluginRuntime["agent"] {
   const agentRuntime = {
     defaults: { model: DEFAULT_MODEL, provider: DEFAULT_PROVIDER },

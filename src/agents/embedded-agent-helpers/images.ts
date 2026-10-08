@@ -1,6 +1,3 @@
-/**
- * Sanitizes historical embedded-agent message images and empty content blocks.
- */
 import { replaceCompactionReplayOwnerContent } from "@openclaw/ai/transports";
 import type { ImageSanitizationLimits } from "../image-sanitization.js";
 import type { AgentMessage, AgentToolResult } from "../runtime/index.js";
@@ -32,7 +29,6 @@ function ensureNonEmptyContent<T>(content: T[]): T[] {
   return [{ type: "text", text: EMPTY_CONTENT_PLACEHOLDER }] as T[];
 }
 
-/** Resize/remove unsafe image payloads while keeping transcript turns valid. */
 export async function sanitizeSessionMessagesImages(
   messages: AgentMessage[],
   label: string,
@@ -57,16 +53,16 @@ export async function sanitizeSessionMessagesImages(
   const imageSanitization = {
     maxDimensionPx: options?.maxDimensionPx,
     maxBytes: options?.maxBytes,
+    // Replay does not rewrite stored images, even after a successful reply.
+    verifyDecodability: true,
   };
-  const shouldSanitizeToolCallIds = options?.sanitizeToolCallIds === true;
-  // We sanitize historical session messages because Anthropic can reject a request
-  // if the transcript contains oversized base64 images (default max side 1200px).
-  const sanitizedIds = shouldSanitizeToolCallIds
-    ? sanitizeToolCallIdsForCloudCodeAssist(messages, options.toolCallIdMode, {
-        preserveNativeAnthropicToolUseIds: options?.preserveNativeAnthropicToolUseIds,
-        duplicateToolCallIdStyle: options?.duplicateToolCallIdStyle,
-      })
-    : messages;
+  const sanitizedIds =
+    options?.sanitizeToolCallIds === true
+      ? sanitizeToolCallIdsForCloudCodeAssist(messages, options.toolCallIdMode, {
+          preserveNativeAnthropicToolUseIds: options?.preserveNativeAnthropicToolUseIds,
+          duplicateToolCallIdStyle: options?.duplicateToolCallIdStyle,
+        })
+      : messages;
   const out: AgentMessage[] = [];
   for (const msg of sanitizedIds) {
     if (!msg || typeof msg !== "object") {

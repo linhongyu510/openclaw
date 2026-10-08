@@ -15,11 +15,6 @@ import {
 } from "./embedded-cyber-failover.js";
 import type { EmbeddedAgentRunResult } from "./types.js";
 
-type ProviderErrorPayloadFailoverReason = Extract<
-  FailoverReason,
-  "auth" | "auth_permanent" | "billing" | "rate_limit" | "server_error" | "overloaded" | "timeout"
->;
-
 function isEmbeddedAgentRunResult(value: unknown): value is EmbeddedAgentRunResult {
   return asOptionalObjectRecord(asOptionalObjectRecord(value)?.meta) !== undefined;
 }
@@ -120,38 +115,28 @@ function classifyGenericExternalRunFailurePayload(params: {
   };
 }
 
+const HARNESS_RESULT_FAILURES = new Map<string, readonly [description: string, code: string]>([
+  ["empty", ["without a visible assistant reply", "empty_result"]],
+  ["reasoning-only", ["with reasoning only", "reasoning_only_result"]],
+  ["planning-only", ["with a structured plan but no final answer", "planning_only_result"]],
+]);
+
 function classifyHarnessResult(params: {
   provider: string;
   model: string;
   classification: EmbeddedAgentRunResult["meta"]["agentHarnessResultClassification"];
 }): ModelFallbackResultClassification {
-  switch (params.classification) {
-    case "empty":
-      return {
-        message: `${params.provider}/${params.model} ended without a visible assistant reply`,
+  const failure = params.classification && HARNESS_RESULT_FAILURES.get(params.classification);
+  return failure
+    ? {
+        message: `${params.provider}/${params.model} ended ${failure[0]}`,
         reason: "format",
-        code: "empty_result",
-      };
-    case "reasoning-only":
-      return {
-        message: `${params.provider}/${params.model} ended with reasoning only`,
-        reason: "format",
-        code: "reasoning_only_result",
-      };
-    case "planning-only":
-      return {
-        message: `${params.provider}/${params.model} ended with a structured plan but no final answer`,
-        reason: "format",
-        code: "planning_only_result",
-      };
-    default:
-      return null;
-  }
+        code: failure[1],
+      }
+    : null;
 }
 
-function providerErrorPayloadReason(
-  failoverReason: FailoverReason | null,
-): ProviderErrorPayloadFailoverReason | null {
+function providerErrorPayloadReason(failoverReason: FailoverReason | null) {
   switch (failoverReason) {
     case "auth":
     case "auth_permanent":

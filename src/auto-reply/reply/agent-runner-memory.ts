@@ -4,9 +4,9 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import { prepareSystemAgentRunAdmission } from "../../agents/admitted-run-context.js";
 import { resolveEffectiveCompactionReserveTokens } from "../../agents/agent-compaction-constants.js";
 import { resolveDefaultAgentId } from "../../agents/agent-scope-config.js";
+import { MemoryFlushToolsUnavailableError } from "../../agents/agent-tools.memory-flush.js";
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import { resolveCliBackendConfig } from "../../agents/cli-backends.js";
 import { estimateMessagesTokens } from "../../agents/compaction.js";
@@ -20,7 +20,8 @@ import { isCliRuntimeAliasForProvider } from "../../agents/model-runtime-aliases
 import { isCliProvider } from "../../agents/model-selection.js";
 import { resolveContextConfigProviderForRuntime } from "../../agents/openai-routing.js";
 import type { AgentMessage } from "../../agents/runtime/index.js";
-import { resolveSandboxConfigForAgent, resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
+import { resolveSandboxConfigForAgent } from "../../agents/sandbox.js";
+import { withSandboxRuntimeStatusInWorker } from "../../agents/sandbox/runtime-status.js";
 import { createSessionMaintenanceFollowup } from "../../agents/session-maintenance/run.js";
 import {
   resolvePersistedSessionRuntimeId,
@@ -51,7 +52,7 @@ import { isAbortError } from "../../infra/abort-signal.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
 import { emitAgentRunStatusEvent } from "../../infra/agent-run-status-events.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import { resolveMemoryFlushPlan, type MemoryFlushPlan } from "../../plugins/memory-state.js";
+import { isMemoryFlushPlanNativeProviderOwned } from "../../plugins/memory-state.js";
 import { CommandLane } from "../../process/lanes.js";
 import { isIncognitoSessionKey, isUnscopedSessionKeySentinel } from "../../routing/session-key.js";
 import { resolveSessionPinnedHarnessId } from "../../sessions/agent-harness-session-key.js";
@@ -60,22 +61,27 @@ import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { formatTokenCount } from "../../utils/token-format.js";
 import type { VerboseLevel } from "../thinking.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
+import { createPreflightCompactionError } from "./agent-runner-failure-reply.js";
 import {
   readPreflightTranscriptContextMessages,
   readSessionLogSnapshot,
 } from "./agent-runner-memory-transcript-context.js";
 import {
   buildEmbeddedRunExecutionParams,
-  resolveModelFallbackOptions,
   resolveRunThinkingLevelForFallbackCandidate,
 } from "./agent-runner-utils.js";
 import type { CompactionNoticePhase } from "./compaction-notice.js";
 import {
-  buildMemoryFlushErrorPayload,
   buildVisibleMemoryFlushFailure,
   resolveVisibleMemoryFlushErrorPayloads,
   truncateMemoryFlushErrorMessage,
 } from "./memory-flush-errors.js";
+import {
+  isToolsMemoryFlushPlan,
+  memoryFlushResultIsSilent,
+  resolveMemoryFlushPlanForRun,
+  type MemoryFlushPlanForRunResolution,
+} from "./memory-flush-plan.js";
 import {
   estimatePromptTokensForMemoryFlush,
   hasAlreadyFlushedForCurrentCompaction,
@@ -101,8 +107,8 @@ const memoryFlushLog = createSubsystemLogger("auto-reply/memory-flush");
 const embeddedAgentRuntimeLoader = createLazyImportLoader(
   () => import("../../agents/embedded-agent.js"),
 );
-const memoryFlushSessionRuntimeLoader = createLazyImportLoader(
-  () => import("./memory-flush-session.js"),
+const memoryFlushPreparationLoader = createLazyImportLoader(
+  () => import("./memory-flush-prepare.js"),
 );
 const toolResultTruncationRuntimeLoader = createLazyImportLoader(
   () => import("../../agents/embedded-agent-runner/tool-result-truncation.js"),
@@ -120,40 +126,6 @@ function hasMatchingTranscriptByteCompactionLatch(
     activeBytes >= maxBytes &&
     activeBytes - latch.activeBytes < maxBytes
   );
-}
-
-function resolveMemoryFlushModelFallbackOptions(
-  run: FollowupRun["run"],
-  model?: string,
-  configOverride: FollowupRun["run"]["config"] = run.config,
-) {
-  const options = resolveModelFallbackOptions(run, configOverride);
-  const override = normalizeOptionalString(model);
-  if (!override) {
-    return options;
-  }
-  // A memory-flush maintenance model is an exact override: do not let a failed
-  // local flush silently fall through to the paid active conversation fallback.
-  const slashIdx = override.indexOf("/");
-  if (slashIdx > 0) {
-    const overrideProvider = override.slice(0, slashIdx).trim();
-    const overrideModel = override.slice(slashIdx + 1).trim();
-    if (overrideProvider && overrideModel) {
-      return {
-        ...options,
-        provider: overrideProvider,
-        model: overrideModel,
-        requestedRouteResolution: "raw" as const,
-        fallbacksOverride: [],
-      };
-    }
-  }
-  return {
-    ...options,
-    model: override,
-    requestedRouteResolution: "raw" as const,
-    fallbacksOverride: [],
-  };
 }
 
 type FollowupRuntimeParams = {
@@ -324,45 +296,28 @@ async function estimatePromptTokensFromSessionTranscript({
     }
     const normalizedOutputTokens =
       usage?.outputTokens === undefined ? undefined : Math.ceil(usage.outputTokens);
-    if (hasUsableProviderPromptUsage(usage)) {
-      const promptTokens = await estimateProviderPromptTokens(
-        usage.trailingMessages,
-        params.contextWindowTokens,
-        usage.promptTokens,
-      );
-      if (promptTokens === undefined) {
-        return undefined;
-      }
-      return {
-        promptTokens,
-        promptTokenSource:
-          usage.trailingMessages.length > 0
-            ? "provider_usage_plus_prompt_projection"
-            : "provider_usage",
-        outputTokens: normalizedOutputTokens,
-        transcriptByteSize: snapshot.byteSize,
-      };
-    }
-    const messages = await readPreflightTranscriptContextMessages(
-      {
-        ...params,
-        sessionId,
-      },
-      abortSignal,
-    );
-    const estimatedTokens = await estimateProviderPromptTokens(
+    const providerUsage = hasUsableProviderPromptUsage(usage) ? usage : undefined;
+    const messages = providerUsage
+      ? providerUsage.trailingMessages
+      : await readPreflightTranscriptContextMessages({ ...params, sessionId }, abortSignal);
+    const promptTokens = await estimateProviderPromptTokens(
       messages,
       params.contextWindowTokens,
+      providerUsage?.promptTokens,
     );
-    if (estimatedTokens === undefined) {
+    if (promptTokens === undefined) {
       return undefined;
     }
     return {
-      promptTokens: estimatedTokens,
-      promptTokenSource: "prompt_projection",
+      promptTokens,
+      promptTokenSource: providerUsage
+        ? messages.length > 0
+          ? "provider_usage_plus_prompt_projection"
+          : "provider_usage"
+        : "prompt_projection",
       // Full-message estimation already includes assistant content. Preserve
       // output only for projection against a separate persisted prompt fact.
-      promptIncludesOutput: true,
+      ...(!providerUsage ? { promptIncludesOutput: true } : {}),
       outputTokens: normalizedOutputTokens,
       transcriptByteSize: snapshot.byteSize,
     };
@@ -443,7 +398,10 @@ export async function runSessionCompactionIfNeeded(params: {
   };
 
   const contextWindowTokens = resolveFollowupContextTokens(params, runtimeId);
-  const memoryFlushPlan = resolveMemoryFlushPlan({ cfg: params.cfg, contextWindowTokens });
+  const memoryFlushPlan = resolveMemoryFlushPlanForRun({
+    cfg: params.cfg,
+    contextWindowTokens,
+  })?.plan;
   const reserveTokensFloor =
     memoryFlushPlan?.reserveTokensFloor ??
     resolveEffectiveCompactionReserveTokens({
@@ -604,8 +562,7 @@ export async function runSessionCompactionIfNeeded(params: {
       tokenCount: tokenCountForCompaction,
       threshold,
     });
-  const shouldCompact = shouldCompactByTokens || shouldCompactByTranscriptBytes;
-  if (!shouldCompact) {
+  if (!shouldCompactByTokens && !shouldCompactByTranscriptBytes) {
     return entry;
   }
 
@@ -631,7 +588,9 @@ export async function runSessionCompactionIfNeeded(params: {
 
   assertActive();
   params.onCompactionStart?.();
+  let terminalCompactionNoticeSent = false;
   const notifyCompaction = async (phase: CompactionNoticePhase, text?: string) => {
+    terminalCompactionNoticeSent ||= phase !== "start";
     try {
       if (text) {
         await params.onCompactionNotice?.(phase, text);
@@ -641,14 +600,6 @@ export async function runSessionCompactionIfNeeded(params: {
     } catch (err) {
       logVerbose(`preflightCompaction notice delivery failed: ${String(err)}`);
     }
-  };
-  let terminalCompactionNoticeSent = false;
-  const notifyTerminalCompaction = async (
-    phase: "end" | "incomplete" | "skipped",
-    text?: string,
-  ) => {
-    terminalCompactionNoticeSent = true;
-    await notifyCompaction(phase, text);
   };
   // Provider work can outlive the caller; never account against a replacement session row.
   let expectedSession = entry;
@@ -823,13 +774,13 @@ export async function runSessionCompactionIfNeeded(params: {
       const reason =
         (result?.ok ? normalizeOptionalString(result.reason) : result?.reason) ?? "not_compacted";
       if (result && isBenignCompactionSkipResult(result)) {
-        await notifyTerminalCompaction("skipped");
+        await notifyCompaction("skipped");
         logVerbose(`preflightCompaction skipped: sessionKey=${params.sessionKey} reason=${reason}`);
         return entry;
       }
-      await notifyTerminalCompaction("incomplete");
-      logVerbose(`preflightCompaction failed: sessionKey=${params.sessionKey} reason=${reason}`);
-      throw new Error(`Preflight compaction required but failed: ${reason}`);
+      await notifyCompaction("incomplete");
+      preflightCompactionLog.warn(`preflight compaction failed: ${reason}`);
+      throw createPreflightCompactionError(reason, isCodexRuntime);
     }
 
     if (!hostAccountingCommitted) {
@@ -863,7 +814,7 @@ export async function runSessionCompactionIfNeeded(params: {
       typeof result.result.tokensAfter === "number"
         ? `🧹 Server-side compaction complete (${formatTokenCount(result.result.tokensBefore)} → ${formatTokenCount(result.result.tokensAfter)})`
         : undefined;
-    await notifyTerminalCompaction("end", serverNotice);
+    await notifyCompaction("end", serverNotice);
     assertActive();
     entry = compactionStore[compactionSessionKey] ?? entry;
     const previousSessionId = params.followupRun.run.sessionId;
@@ -917,7 +868,6 @@ export async function runMemoryFlushIfNeeded(params: {
   isHeartbeat: boolean;
   replyOperation?: ReplyOperation;
   abortSignal?: AbortSignal;
-  onVisibleErrorPayloads?: (payloads: ReplyPayload[]) => void;
 }): Promise<MemoryFlushResult> {
   const abortSignal = resolveFollowupAbortSignal({
     abortSignal: params.replyOperation?.abortSignal ?? params.abortSignal,
@@ -927,21 +877,20 @@ export async function runMemoryFlushIfNeeded(params: {
     abortSignal?.throwIfAborted();
     params.followupRun.operatorAuthority?.assertCurrent();
   };
-  const memoryFlushWritable = (() => {
-    if (!params.sessionKey) {
-      return true;
-    }
-    const runtime = resolveSandboxRuntimeStatus({
-      cfg: params.cfg,
-      agentId: params.followupRun.run.agentId,
-      sessionKey: params.sessionKey,
-      classificationSessionKey: params.runtimePolicySessionKey,
-    });
-    const workspaceAccess =
-      runtime.workspaceAccess ??
-      resolveSandboxConfigForAgent(params.cfg, runtime.classificationAgentId).workspaceAccess;
-    return !runtime.sandboxed || workspaceAccess === "rw";
-  })();
+  const memoryFlushWritable =
+    !params.sessionKey ||
+    (await withSandboxRuntimeStatusInWorker(
+      {
+        cfg: params.cfg,
+        agentId: params.followupRun.run.agentId,
+        sessionKey: params.sessionKey,
+        classificationSessionKey: params.runtimePolicySessionKey,
+      },
+      { env: process.env, cwd: process.cwd(), assertCurrent: assertMemoryFlushCurrent },
+      async ({ sandboxed, workspaceAccess: access, classificationAgentId: agentId }) =>
+        !sandboxed ||
+        (access ?? resolveSandboxConfigForAgent(params.cfg, agentId).workspaceAccess) === "rw",
+    ));
 
   let entry =
     params.sessionEntry ??
@@ -954,25 +903,32 @@ export async function runMemoryFlushIfNeeded(params: {
   const isCli =
     followupUsesCliRuntime(runtimeParams, runtimeId) ||
     followupOwnsNativeCompaction(runtimeParams, runtimeId);
-  const canAttemptFlush = memoryFlushWritable && !params.isHeartbeat && !isCli;
+  // Only a native provider's flush can persist without a writable workspace, so other
+  // resolvers are never called for a session whose workspace cannot be written.
+  const canAttemptFlush =
+    (memoryFlushWritable || isMemoryFlushPlanNativeProviderOwned()) &&
+    !params.isHeartbeat &&
+    !isCli;
   if (!canAttemptFlush) {
     return { sessionEntry: entry, outcome: "skipped" };
   }
 
   const flushRunId = crypto.randomUUID();
   let flushRunRegistered = false;
-  let activeSessionEntry = entry;
-  const recordFailure = (error: unknown) =>
-    recordMemoryFlushFailure(error, params, activeSessionEntry);
+  const recordFailure = (error: unknown) => recordMemoryFlushFailure(error, params, entry);
   const contextWindowTokens = resolveFollowupContextTokens(params, runtimeId);
-  let memoryFlushPlan: MemoryFlushPlan | null;
+  let memoryFlushResolution: MemoryFlushPlanForRunResolution | null;
   try {
-    memoryFlushPlan = resolveMemoryFlushPlan({ cfg: params.cfg, contextWindowTokens });
+    memoryFlushResolution = resolveMemoryFlushPlanForRun({ cfg: params.cfg, contextWindowTokens });
   } catch (error) {
     return await recordFailure(error);
   }
-  if (!memoryFlushPlan) {
-    return { sessionEntry: activeSessionEntry, outcome: "skipped" };
+  if (!memoryFlushResolution) {
+    return { sessionEntry: entry, outcome: "skipped" };
+  }
+  const memoryFlushPlan = memoryFlushResolution.plan;
+  if (!isToolsMemoryFlushPlan(memoryFlushPlan) && !memoryFlushWritable) {
+    return { sessionEntry: entry, outcome: "skipped" };
   }
 
   const promptTokenEstimate = estimatePromptTokensForMemoryFlush(
@@ -1125,85 +1081,37 @@ export async function runMemoryFlushIfNeeded(params: {
     `memoryFlush triggered: sessionKey=${params.sessionKey} tokenCount=${tokenCountForFlush ?? "undefined"} threshold=${flushThreshold}`,
   );
 
-  activeSessionEntry = entry;
   params.replyOperation?.setPhase("memory_flushing");
   let bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
-    activeSessionEntry?.systemPromptReport ??
+    entry?.systemPromptReport ??
       (params.sessionKey
         ? params.sessionStore?.[params.sessionKey]?.systemPromptReport
         : undefined),
   );
-  const prepareMemoryFlushAttempt = async () => {
-    assertMemoryFlushCurrent();
-    const plan = resolveMemoryFlushPlan({
-      cfg: params.cfg,
-      nowMs: Date.now(),
-      contextWindowTokens,
-    });
-    if (!plan) {
-      return null;
-    }
-    const writePath = plan.relativePath;
-    if (!params.sessionKey || !activeSessionEntry) {
-      throw new Error("Memory flush has no current transcript target.");
-    }
-    const agentId = params.followupRun.run.agentId ?? resolveDefaultAgentId(params.cfg);
-    const runtime = await memoryFlushSessionRuntimeLoader.load();
-    assertMemoryFlushCurrent();
-    const memorySession = await runtime.prepareMemoryFlushSession({
-      admission: params.preflightAdmission,
-      source: {
-        agentId,
-        sessionId: activeSessionEntry.sessionId,
-        sessionKey: params.sessionKey,
-        storePath: resolveSessionStorePathForScope(
-          { agentId, sessionKey: params.sessionKey, storePath: params.storePath },
-          params.cfg,
-        ),
-      },
-      runId: flushRunId,
-      workspaceDir: params.followupRun.run.workspaceDir,
-      signal: abortSignal,
-    });
-    await runtime.ensureMemoryFlushTargetFile({
-      workspaceDir: params.followupRun.run.workspaceDir,
-      relativePath: writePath,
-      assertCurrent: assertMemoryFlushCurrent,
-    });
-    const systemPrompt = [params.followupRun.run.extraSystemPrompt, plan.systemPrompt]
-      .filter(Boolean)
-      .join("\n\n");
-    const selection = resolveMemoryFlushModelFallbackOptions(
-      params.followupRun.run,
-      plan.model,
-      params.cfg,
-    );
-    abortSignal?.throwIfAborted();
-    const preparedRunAdmission = prepareSystemAgentRunAdmission(
-      params.cfg,
-      flushRunId,
-      params.followupRun.run.agentId,
-      "auto-reply.memory-flush",
-      undefined,
-      params.followupRun.operatorAuthority,
-    );
-    return {
-      plan,
-      writePath,
-      systemPrompt,
-      selection,
-      preparedRunAdmission,
-      memorySession,
-    };
-  };
-  let preparedAttempt: Awaited<ReturnType<typeof prepareMemoryFlushAttempt>>;
+  let persistenceToolCallSucceeded = false;
+  let preparedAttempt: Awaited<
+    ReturnType<typeof import("./memory-flush-prepare.js").prepareMemoryFlushAttempt>
+  >;
   try {
-    preparedAttempt = await prepareMemoryFlushAttempt();
+    assertMemoryFlushCurrent();
+    const runtime = await memoryFlushPreparationLoader.load();
+    preparedAttempt = await runtime.prepareMemoryFlushAttempt({
+      ...params,
+      sessionEntry: entry,
+      flushRunId,
+      contextWindowTokens,
+      memoryFlushWritable,
+      abortSignal,
+      assertCurrent: assertMemoryFlushCurrent,
+      recordPersistenceToolSuccess: () => {
+        persistenceToolCallSucceeded = true;
+      },
+    });
   } catch (error) {
     return await recordFailure(error);
   }
   if (!preparedAttempt) {
-    return { sessionEntry: activeSessionEntry, outcome: "skipped" };
+    return { sessionEntry: entry, outcome: "skipped" };
   }
   const {
     plan: activeMemoryFlushPlan,
@@ -1212,6 +1120,8 @@ export async function runMemoryFlushIfNeeded(params: {
     selection,
     preparedRunAdmission,
     memorySession,
+    memoryAudience: flushMemoryAudience,
+    memoryFlushTools,
   } = preparedAttempt;
   const sourcePolicySessionKey =
     params.runtimePolicySessionKey ??
@@ -1235,7 +1145,7 @@ export async function runMemoryFlushIfNeeded(params: {
     sessionFile: memorySession.sessionFile,
     abortSignal,
   });
-  const flushedCompactionCount = activeSessionEntry?.compactionCount ?? 0;
+  const flushedCompactionCount = entry?.compactionCount ?? 0;
   let visibleErrorPayloads: ReplyPayload[] = [];
   // Only the bounded phase belongs to the parent turn; maintenance content stays private.
   const parentRunId = params.opts?.runId;
@@ -1269,9 +1179,9 @@ export async function runMemoryFlushIfNeeded(params: {
       sessionKey: memorySession.sessionKey,
       sessionId: memorySession.sessionId,
       sourceSessionKey: params.sessionKey,
-      sourceSessionId: activeSessionEntry?.sessionId,
+      sourceSessionId: entry?.sessionId,
     });
-    await runEmbeddedAgentEntry({
+    const flushExecution = await runEmbeddedAgentEntry({
       preparedRunAdmission,
       selection: {
         cfg: selection.cfg,
@@ -1302,7 +1212,7 @@ export async function runMemoryFlushIfNeeded(params: {
         resolveRuntimeOverride: (provider) =>
           resolveSessionRuntimeOverrideForProvider({
             provider,
-            entry: activeSessionEntry,
+            entry,
             cfg: params.cfg,
           }),
       },
@@ -1322,7 +1232,7 @@ export async function runMemoryFlushIfNeeded(params: {
             params.runtimePolicySessionKey ??
             params.followupRun.run.runtimePolicySessionKey ??
             params.sessionKey,
-          sessionEntry: activeSessionEntry,
+          sessionEntry: entry,
           agentRuntime: sessionRuntimeOverride,
         });
         const { embeddedContext, senderContext, runBaseParams } =
@@ -1346,9 +1256,10 @@ export async function runMemoryFlushIfNeeded(params: {
           ...senderContext,
           ...runBaseParams,
           ...memorySession,
-          agentHarnessId: resolveSessionPinnedHarnessId(activeSessionEntry),
+          agentHarnessId: resolveSessionPinnedHarnessId(entry),
           agentHarnessRuntimeOverride: sessionRuntimeOverride,
           sandboxSessionKey: sourcePolicySessionKey,
+          memoryAudience: flushMemoryAudience,
           allowGatewaySubagentBinding: true,
           silentExpected: true,
           allowEmptyAssistantReplyAsSilent: true,
@@ -1356,6 +1267,7 @@ export async function runMemoryFlushIfNeeded(params: {
           trigger: "memory",
           contextTokenBudget: contextWindowTokens,
           memoryFlushWritePath,
+          memoryFlushTools,
           initialTurnTainted:
             !params.followupRun.run.senderIsOwner || sessionLogSnapshot?.turnTainted === true,
           prompt: activeMemoryFlushPlan.prompt,
@@ -1385,6 +1297,13 @@ export async function runMemoryFlushIfNeeded(params: {
       // Do not stamp memory-flush success for a resolved run that returned an error.
       throw buildVisibleMemoryFlushFailure(visibleErrorPayloads);
     }
+    if (
+      memoryFlushTools &&
+      !persistenceToolCallSucceeded &&
+      !memoryFlushResultIsSilent(flushExecution.result)
+    ) {
+      throw new Error("no persistence tool call succeeded");
+    }
     if (params.storePath && params.sessionKey) {
       try {
         const updatedEntry = await updateSessionEntry(
@@ -1395,14 +1314,18 @@ export async function runMemoryFlushIfNeeded(params: {
           { skipMaintenance: true, takeCacheOwnership: true },
         );
         if (updatedEntry) {
-          activeSessionEntry = updatedEntry;
+          entry = updatedEntry;
         }
       } catch (err) {
         logVerbose(`failed to persist memory flush metadata: ${String(err)}`);
       }
     }
-    return { sessionEntry: activeSessionEntry, outcome: "completed" };
+    return { sessionEntry: entry, outcome: "completed" };
   } catch (error) {
+    if (error instanceof MemoryFlushToolsUnavailableError) {
+      memoryFlushLog.warn(error.message);
+      return { sessionEntry: entry, outcome: "skipped" };
+    }
     return await recordFailure(error);
   } finally {
     stopHeartbeat?.();
@@ -1418,6 +1341,7 @@ export async function runMemoryFlushIfNeeded(params: {
       clearAgentRunContext(flushRunId);
     }
     preparedRunAdmission.close();
+    preparedAttempt.release();
   }
 }
 
@@ -1480,22 +1404,12 @@ async function recordMemoryFlushFailure(
           },
         }));
         adoptEntry(exhaustedEntry);
-        run.onVisibleErrorPayloads?.([
-          {
-            text: `⚠️ Memory flush failed after ${MAX_FLUSH_FAILURES} attempts; skipping for this cycle. It will retry after the next compaction.`,
-            isError: true,
-          },
-        ]);
       }
     } catch (persistError) {
       logVerbose(`failed to persist memory flush failure metadata: ${String(persistError)}`);
     }
   } else {
     logVerbose(`memory flush run failed: ${String(error)}`);
-  }
-  const visibleErrorPayload = buildMemoryFlushErrorPayload(error);
-  if (visibleErrorPayload) {
-    run.onVisibleErrorPayloads?.([visibleErrorPayload]);
   }
   return { sessionEntry, outcome };
 }

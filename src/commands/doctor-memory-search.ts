@@ -21,7 +21,6 @@ import { formatCliCommand } from "../cli/command-format.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isSecretRef } from "../config/types.secrets.js";
 import type { HealthCheckContext, HealthFinding } from "../flows/health-checks.js";
-import type { DoctorMemoryEmbeddingRuntimePayload } from "../gateway/server-methods/doctor.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { resolveRememberAcrossConversations } from "../memory-host-sdk/host/config-utils.js";
 import { hasConfiguredMemorySecretInput } from "../memory-host-sdk/secret.js";
@@ -43,6 +42,7 @@ import {
 import { defaultSlotIdForKey } from "../plugins/slots.js";
 import { getProviderEnvVarsCore } from "../secrets/provider-env-vars.js";
 import { resolveUserPath } from "../utils.js";
+import type { probeGatewayMemoryStatus } from "./doctor-gateway-health.js";
 import {
   formatMemoryDoctorAgentMessage,
   resolveMemoryDoctorAgentScopes,
@@ -101,42 +101,16 @@ function isOpenAICompatibleMemoryProvider(providerId: string, cfg: OpenClawConfi
   return !api && Boolean(normalizeOptionalString(providerConfig.baseUrl));
 }
 
-function resolveOpenAICompatibleMemoryBaseUrl(
-  providerId: string,
-  cfg: OpenClawConfig,
-  remoteBaseUrl: string | undefined,
-): string | undefined {
-  return (
-    normalizeOptionalString(remoteBaseUrl) ??
-    normalizeOptionalString(findNormalizedProviderValue(cfg.models?.providers, providerId)?.baseUrl)
-  );
-}
-
-function isKeyOptionalMemoryProvider(providerId: string, cfg: OpenClawConfig): boolean {
-  return (
-    providerId === "local" ||
-    providerId === "ollama" ||
-    providerId === "lmstudio" ||
-    isOpenAICompatibleMemoryProvider(providerId, cfg)
-  );
-}
-
 function hasActiveAlternateMemoryPluginSlot(cfg: OpenClawConfig): boolean {
   const plugins = normalizePluginsConfig(cfg.plugins);
-  if (!plugins.enabled) {
-    return false;
-  }
   const memorySlot = plugins.slots.memory;
-  if (typeof memorySlot !== "string" || memorySlot.length === 0) {
-    return false;
-  }
-  if (memorySlot === defaultSlotIdForKey("memory")) {
-    return false;
-  }
-  if (plugins.deny.includes(memorySlot)) {
-    return false;
-  }
-  if (!Object.hasOwn(plugins.entries, memorySlot)) {
+  if (
+    !plugins.enabled ||
+    !memorySlot ||
+    memorySlot === defaultSlotIdForKey("memory") ||
+    plugins.deny.includes(memorySlot) ||
+    !Object.hasOwn(plugins.entries, memorySlot)
+  ) {
     return false;
   }
   const entry = plugins.entries[memorySlot];
@@ -222,14 +196,10 @@ function inspectRememberAcrossConversationsHealth(params: {
   return true;
 }
 
+type GatewayMemoryProbe = Awaited<ReturnType<typeof probeGatewayMemoryStatus>>;
+
 type MemorySearchHealthOptions = {
-  gatewayMemoryProbe?: {
-    checked: boolean;
-    ready: boolean;
-    error?: string;
-    skipped?: boolean;
-    runtimeFacts?: DoctorMemoryEmbeddingRuntimePayload;
-  };
+  gatewayMemoryProbe?: Pick<GatewayMemoryProbe, "checked" | "ready"> & Partial<GatewayMemoryProbe>;
   includeWorkspaceMemoryHealth?: boolean;
   skipAuthProfileResolution?: boolean;
   env?: NodeJS.ProcessEnv;
@@ -273,7 +243,7 @@ async function inspectMemorySearchHealth(
   const labelAgents = scopes.length > 1;
   for (const scope of scopes) {
     if (opts.includeWorkspaceMemoryHealth !== false) {
-      await noteWorkspaceMemoryHealth(cfg, {
+      await noteWorkspaceMemoryHealth({
         agentId: scope.agentId,
         workspaceDir: scope.workspaceDir,
         labelAgent: labelAgents,
@@ -507,7 +477,7 @@ async function inspectMemorySearchHealthForAgent(
         updateFix
           ? `Installed plugin "${installedOwner.id}" does not provide current local-memory setup diagnostics.`
           : null,
-        gatewayDetail && gatewayDetail !== setupReason ? `Gateway probe: ${gatewayDetail}` : null,
+        gatewayDetail && gatewayDetail !== setupReason ? `Gateway check: ${gatewayDetail}` : null,
         "",
         policyBlock?.fix ??
           updateFix ??
@@ -527,42 +497,36 @@ async function inspectMemorySearchHealthForAgent(
     return;
   }
 
-  if (
-    isOpenAICompatibleMemoryProvider(provider, cfg) &&
-    !resolveOpenAICompatibleMemoryBaseUrl(provider, cfg, resolved.remote?.baseUrl)
-  ) {
+  const openAICompatible = isOpenAICompatibleMemoryProvider(provider, cfg);
+  const missingBaseUrl =
+    openAICompatible &&
+    !(
+      normalizeOptionalString(resolved.remote?.baseUrl) ??
+      normalizeOptionalString(findNormalizedProviderValue(cfg.models?.providers, provider)?.baseUrl)
+    );
+  if (openAICompatible && (missingBaseUrl || !normalizeOptionalString(resolved.model))) {
+    const configPath = missingBaseUrl ? "memory.search.remote.baseUrl" : "memory.search.model";
+    const description = missingBaseUrl ? "embeddings endpoint" : "embedding model";
+    const guidance = missingBaseUrl
+      ? "the /v1 endpoint for your embeddings server"
+      : "the embedding model id your server expects";
+    const example = missingBaseUrl ? "http://127.0.0.1:1234/v1" : "text-embedding-bge-m3";
     report(
       [
-        `Memory search provider is set to "${provider}" but no OpenAI-compatible embeddings endpoint was configured.`,
-        "Set memory.search.remote.baseUrl to the /v1 endpoint for your embeddings server.",
+        `Memory search provider is set to "${provider}" but no OpenAI-compatible ${description} was configured.`,
+        `Set ${configPath} to ${guidance}.`,
         "",
         "Fix:",
-        `- ${formatCliCommand("openclaw config set memory.search.remote.baseUrl http://127.0.0.1:1234/v1")}`,
+        `- ${formatCliCommand(`openclaw config set ${configPath} ${example}`)}`,
         "",
         `Verify: ${formatCliCommand("openclaw memory status --deep")}`,
       ].join("\n"),
-      "memory.search.remote.baseUrl",
+      configPath,
     );
     return;
   }
 
-  if (isOpenAICompatibleMemoryProvider(provider, cfg) && !normalizeOptionalString(resolved.model)) {
-    report(
-      [
-        `Memory search provider is set to "${provider}" but no OpenAI-compatible embedding model was configured.`,
-        "Set memory.search.model to the embedding model id your server expects.",
-        "",
-        "Fix:",
-        `- ${formatCliCommand("openclaw config set memory.search.model text-embedding-bge-m3")}`,
-        "",
-        `Verify: ${formatCliCommand("openclaw memory status --deep")}`,
-      ].join("\n"),
-      "memory.search.model",
-    );
-    return;
-  }
-
-  if (isKeyOptionalMemoryProvider(provider, cfg)) {
+  if (provider === "ollama" || provider === "lmstudio" || openAICompatible) {
     if (opts?.gatewayMemoryProbe?.checked && opts.gatewayMemoryProbe.ready) {
       return;
     }
@@ -695,6 +659,6 @@ function buildGatewayProbeWarning(
   }
   const detail = probe.error?.trim();
   return detail
-    ? `Gateway memory probe for default agent is not ready: ${detail}`
-    : "Gateway memory probe for default agent is not ready.";
+    ? `Gateway memory check for default agent is not ready: ${detail}`
+    : "Gateway memory check for default agent is not ready.";
 }

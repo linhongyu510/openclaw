@@ -27,7 +27,7 @@ import {
   sortWorkspaceEntries,
   statWorkspacePath,
   toUpdatedAtMs,
-  type WorkspaceDirEntry,
+  toWorkspaceBrowserEntry,
   type WorkspaceRoot,
   updateWorkspaceFile,
   type WorkspaceFileUpdateResult,
@@ -96,19 +96,6 @@ export function resolveFileRoot(params: {
   return isPathInside(resolvedRoot, resolvedCwd) ? params.spawnedCwd : params.root;
 }
 
-function mergeRelevance(
-  current: SessionFileRelevance | undefined,
-  next: SessionFileRelevance | undefined,
-): SessionFileRelevance | undefined {
-  if (!current) {
-    return next;
-  }
-  if (!next || current === next) {
-    return current;
-  }
-  return "mixed";
-}
-
 function buildSessionRelevanceMap(
   files: readonly TouchedFile[],
   root: string | undefined,
@@ -131,24 +118,6 @@ function buildSessionRelevanceMap(
   return relevance;
 }
 
-function relevanceForBrowserPath(
-  browserPath: string,
-  kind: "file" | "directory",
-  relevance: ReadonlyMap<string, SessionFileRelevance>,
-): SessionFileRelevance | undefined {
-  if (kind === "file") {
-    return relevance.get(browserPath);
-  }
-  const prefix = browserPath ? `${browserPath}/` : "";
-  let aggregate: SessionFileRelevance | undefined;
-  for (const [filePath, sessionKind] of relevance) {
-    if (filePath.startsWith(prefix) && filePath !== browserPath) {
-      aggregate = mergeRelevance(aggregate, sessionKind);
-    }
-  }
-  return aggregate;
-}
-
 function displayNameForPath(filePath: string): string {
   return path.basename(filePath) || filePath;
 }
@@ -161,7 +130,11 @@ function isDetectedTextMime(mimeType: string): boolean {
   );
 }
 
-function applyInlineFilePreview(entry: SessionFileEntry, buffer: Buffer, mimeType?: string): void {
+export async function populateSessionFilePreview(
+  entry: SessionFileEntry,
+  buffer: Buffer,
+): Promise<void> {
+  const mimeType = await detectMime({ buffer });
   if (mimeType && BROWSER_IMAGE_MIME_TYPES.has(mimeType)) {
     entry.mimeType = mimeType;
     entry.contentEncoding = "base64";
@@ -178,28 +151,6 @@ function applyInlineFilePreview(entry: SessionFileEntry, buffer: Buffer, mimeTyp
     // The hash doubles as the sessions.files.set CAS token. Binary files
     // never receive one, so replacement characters cannot be saved back.
     entry.hash = sha256Hex(buffer);
-    return;
-  }
-  entry.previewKind = "unsupported";
-  if (mimeType) {
-    entry.mimeType = mimeType;
-  }
-}
-
-export async function populateSessionFilePreview(
-  entry: SessionFileEntry,
-  buffer: Buffer,
-): Promise<void> {
-  applyInlineFilePreview(entry, buffer, await detectMime({ buffer }));
-}
-
-function applyOversizedFileMetadata(
-  entry: SessionFileEntry,
-  buffer: Buffer,
-  mimeType?: string,
-): void {
-  const prefixIsText = decodeUtf8Strict(buffer) !== undefined;
-  if ((!mimeType && prefixIsText) || (mimeType && isDetectedTextMime(mimeType) && prefixIsText)) {
     return;
   }
   entry.previewKind = "unsupported";
@@ -271,7 +222,14 @@ async function toSessionFileEntry(
       delete entry.hash;
     }
   } else {
-    applyOversizedFileMetadata(entry, read.buffer, await detectMime({ buffer: read.buffer }));
+    const mimeType = await detectMime({ buffer: read.buffer });
+    const prefixIsText = decodeUtf8Strict(read.buffer) !== undefined;
+    if (!prefixIsText || (mimeType && !isDetectedTextMime(mimeType))) {
+      entry.previewKind = "unsupported";
+      if (mimeType) {
+        entry.mimeType = mimeType;
+      }
+    }
   }
   return entry;
 }
@@ -287,26 +245,6 @@ function resolveSessionFileCandidates(params: {
   ].filter((candidate, index, all): candidate is string => {
     return candidate !== undefined && all.indexOf(candidate) === index;
   });
-}
-
-function toBrowserEntry(
-  browserPath: string,
-  dirent: WorkspaceDirEntry,
-  relevance: ReadonlyMap<string, SessionFileRelevance>,
-): SessionFileBrowserEntry | undefined {
-  const kind = dirent.isFile ? "file" : dirent.isDirectory ? "directory" : null;
-  if (!kind) {
-    return undefined;
-  }
-  const sessionKind = relevanceForBrowserPath(browserPath, kind, relevance);
-  return {
-    path: browserPath,
-    name: dirent.name,
-    kind,
-    ...(kind === "file" ? { size: dirent.size } : {}),
-    updatedAtMs: toUpdatedAtMs(dirent.mtimeMs),
-    ...(sessionKind ? { sessionKind } : {}),
-  };
 }
 
 async function searchBrowserEntries(params: {
@@ -341,7 +279,7 @@ async function searchBrowserEntries(params: {
       visitedEntries += 1;
       const browserPath = dir ? `${dir}/${dirent.name}` : dirent.name;
       if (browserPath.toLowerCase().includes(query)) {
-        const entry = toBrowserEntry(browserPath, dirent, params.relevance);
+        const entry = toWorkspaceBrowserEntry(browserPath, dirent, params.relevance);
         if (entry) {
           entries.push(entry);
         }
@@ -407,7 +345,7 @@ async function buildBrowserResult(params: {
     .slice(0, MAX_BROWSER_ENTRIES + 1)
     .map((dirent) => {
       const entryPath = browserPath ? `${browserPath}/${dirent.name}` : dirent.name;
-      return toBrowserEntry(entryPath, dirent, relevance);
+      return toWorkspaceBrowserEntry(entryPath, dirent, relevance);
     })
     .filter((entry): entry is SessionFileBrowserEntry => Boolean(entry));
   const parent = path.dirname(browserPath);
