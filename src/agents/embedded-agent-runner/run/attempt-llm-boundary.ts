@@ -1,14 +1,22 @@
 import { z } from "zod";
 import { stripInboundMetadata } from "../../../auto-reply/reply/strip-inbound-meta.js";
 import { buildTimestampPrefix } from "../../../gateway/server-methods/agent-timestamp.js";
-import type { ImageContent, UserMessage } from "../../../llm/types.js";
+import {
+  hasLegacyRuntimeContextEnvelope,
+  RUNTIME_CONTEXT_BEGIN_MARKER,
+  RUNTIME_CONTEXT_END_MARKER,
+  type ImageContent,
+  type UserMessage,
+} from "../../../llm/types.js";
 import { INTER_SESSION_PROMPT_PREFIX_BASE } from "../../../sessions/input-provenance.js";
 import { hasPersistedMedia, MEDIA_ONLY_USER_TEXT } from "../../../sessions/user-turn-media.js";
 import { buildLateMediaAttachedProjection } from "../../../sessions/user-turn-transcript.js";
+import { isTextContentBlock } from "../../content-blocks.js";
 import {
   escapeInternalRuntimeContextDelimiters,
   isOpenClawSystemUpdateMessage,
   OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE,
+  projectRuntimeContextFragments,
   resolveRuntimeContextPromptOwner,
   retainRuntimeContextMessageForPrompt,
   stripHistoricalRuntimeContextCustomMessages,
@@ -21,7 +29,6 @@ import {
   contentMatchesTimestampOverride,
   findActiveUserMessageIndex,
   hasNonBlankUserText,
-  isUserTextBlock,
   projectPersistedSenderContext,
   resolveUserTranscriptMessages,
   splitLeadingTimestampEnvelope,
@@ -29,8 +36,7 @@ import {
   type UserTranscriptContext,
 } from "./attempt-history.js";
 import {
-  buildRuntimeContextMessageContent,
-  projectRuntimeContextFragments,
+  materializeSteeringRuntimeContext,
   type RuntimeContextCustomMessage,
 } from "./runtime-context-prompt.js";
 
@@ -98,11 +104,15 @@ function projectRuntimeContextMessages(
     if (message.role === "custom" && message.customType === OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE) {
       const details = runtimeContextDetailsSchema.safeParse(message.details);
       if (details.success) {
-        return Object.assign({}, message, {
-          content: buildRuntimeContextMessageContent(
-            projectRuntimeContextFragments(details.data.fragments),
-          ),
-        });
+        const projected = projectRuntimeContextFragments(details.data.fragments);
+        return {
+          ...message,
+          content:
+            typeof message.content === "string" && hasLegacyRuntimeContextEnvelope(message.content)
+              ? `${RUNTIME_CONTEXT_BEGIN_MARKER}\n${projected}\n${RUNTIME_CONTEXT_END_MARKER}`
+              : projected,
+          details: details.data,
+        };
       }
     }
     if (message.role !== "user" && message.role !== "custom") {
@@ -137,7 +147,9 @@ export function normalizeMessagesForLlmBoundary(
   options?: LlmBoundaryOptions,
 ): AgentMessage[] {
   const normalized = stripUnsafeBlockedRunMetadata(
-    stripToolResultDetails(normalizeAssistantReplayContent(messages)),
+    stripToolResultDetails(
+      normalizeAssistantReplayContent(materializeSteeringRuntimeContext(messages)),
+    ),
   );
   const userTranscriptMessages = resolveUserTranscriptMessages(
     normalized,
@@ -328,6 +340,32 @@ export function installRuntimeContextMessageForPrompt(params: {
   };
 }
 
+function transformUserTextContent(
+  content: unknown,
+  transform: (text: string) => string | undefined,
+  mode: "first" | "all" = "all",
+): { content: unknown; changed: boolean } {
+  if (typeof content === "string") {
+    const replacement = transform(content);
+    return { content: replacement ?? content, changed: replacement !== undefined };
+  }
+  let changed = false;
+  const projected = Array.isArray(content)
+    ? content.map((block) => {
+        if (mode === "first" && changed) {
+          return block;
+        }
+        const text = isTextContentBlock(block) ? transform(block.text) : undefined;
+        if (text === undefined) {
+          return block;
+        }
+        changed = true;
+        return Object.assign({}, block, { text });
+      })
+    : content;
+  return { content: changed ? projected : content, changed };
+}
+
 function replaceUserTextPrompt(params: {
   messages: AgentMessage[];
   userIndex: number;
@@ -340,33 +378,12 @@ function replaceUserTextPrompt(params: {
     return params.messages;
   }
   const content = (message as { content?: unknown }).content;
-  let nextContent: unknown;
-  if (typeof content === "string") {
-    nextContent = params.replace(content);
-    if (nextContent === undefined) {
-      return params.messages;
-    }
-  } else if (Array.isArray(content)) {
-    let replaced = false;
-    nextContent = content.map((block) => {
-      if (replaced || !isUserTextBlock(block)) {
-        return block;
-      }
-      const replacement = params.replace(block.text);
-      if (replacement === undefined) {
-        return block;
-      }
-      replaced = true;
-      return Object.assign({}, block, { text: replacement });
-    });
-    if (!replaced) {
-      return params.messages;
-    }
-  } else {
+  const transformed = transformUserTextContent(content, params.replace, "first");
+  if (!transformed.changed) {
     return params.messages;
   }
   const next = params.messages.slice();
-  next[userIndex] = { ...message, content: nextContent } as AgentMessage;
+  next[userIndex] = { ...message, content: transformed.content } as AgentMessage;
   if (params.transcriptText !== undefined) {
     markTranscriptPromptText(next[userIndex], params.transcriptText);
   }
@@ -484,7 +501,7 @@ function canonicalizeTextOnlyUserContent(content: unknown): unknown {
     return content;
   }
   const block = content[0];
-  return isUserTextBlock(block) ? block.text : content;
+  return isTextContentBlock(block) ? block.text : content;
 }
 
 // Stamp from the message's fixed timestamp so current and historical turns share
@@ -592,45 +609,27 @@ function normalizeUserMessagesForLlmBoundary(
       );
     };
 
-    const canonical = canonicalizeTextOnlyUserContent(content);
-    if (typeof canonical === "string") {
-      const next = transformText(canonical);
-      if (next === content) {
-        return message;
-      }
-      changed = true;
-      return { ...message, content: next } as AgentMessage;
-    }
-
-    if (!Array.isArray(content)) {
-      return message;
-    }
-
     // Stamp only the first text block; strip historical metadata from later blocks.
-    let contentChanged = false;
     let processedFirstText = false;
-    const nextContent = content.map((block) => {
-      if (!isUserTextBlock(block)) {
-        return block;
-      }
-      let nextText: string;
-      if (!processedFirstText) {
-        nextText = transformText(block.text);
+    const transformed = transformUserTextContent(
+      canonicalizeTextOnlyUserContent(content),
+      (text) => {
+        const nextText = !processedFirstText
+          ? transformText(text)
+          : preserveInboundMetadata
+            ? text
+            : stripInboundMetadata(text);
         processedFirstText = true;
-      } else {
-        nextText = preserveInboundMetadata ? block.text : stripInboundMetadata(block.text);
-      }
-      if (nextText === block.text) {
-        return block;
-      }
-      contentChanged = true;
-      return Object.assign({}, block, { text: nextText });
-    });
-    if (!processedFirstText && injectMediaText) {
-      nextContent.unshift({ type: "text", text: transformText("") });
-      contentChanged = true;
+        return nextText === text ? undefined : nextText;
+      },
+    );
+    let nextContent = transformed.content;
+    if (Array.isArray(nextContent) && !processedFirstText && injectMediaText) {
+      const withPlaceholder = nextContent.slice();
+      withPlaceholder.unshift({ type: "text", text: transformText("") });
+      nextContent = withPlaceholder;
     }
-    if (!contentChanged) {
+    if (nextContent === content) {
       return message;
     }
     changed = true;

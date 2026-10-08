@@ -24,14 +24,12 @@ import { logVerbose } from "../../globals.js";
 import { FsSafeError } from "../../infra/fs-safe.js";
 import { collectReplyMediaEntries } from "../../infra/outbound/reply-media-entries.js";
 import { resolveOutboundMediaMaxBytes } from "../../media/configured-max-bytes.js";
+import type { OutboundMediaAccess } from "../../media/load-options.js";
 import { HostReadMediaTypeError, LocalMediaAccessError } from "../../media/local-media-access.js";
 import { normalizeMediaReferenceForComparison } from "../../media/media-reference-comparison.js";
 import { resolveInboundMediaReference } from "../../media/media-reference.js";
 import { resolveOutboundAttachmentFromUrl } from "../../media/outbound-attachment.js";
-import {
-  resolveAgentScopedOutboundMediaAccess,
-  type HostOutboundMediaAccess,
-} from "../../media/read-capability.js";
+import { resolveAgentScopedHostOutboundMediaAccess } from "../../media/read-capability.js";
 import { resolveWebchatAttachmentFromUrl } from "../../media/webchat-attachment.js";
 import {
   appendReplyMediaFailures,
@@ -101,12 +99,8 @@ function createReplyMediaFailure(media: string, index: number, error: unknown): 
 function isLikelyLocalMediaSource(media: string): boolean {
   return (
     FILE_URL_RE.test(media) ||
-    media.startsWith("/") ||
-    media.startsWith("./") ||
-    media.startsWith("../") ||
     media.startsWith("~") ||
     WINDOWS_DRIVE_RE.test(media) ||
-    media.startsWith("\\\\") ||
     (!SCHEME_RE.test(media) &&
       (media.includes("/") || media.includes("\\") || HAS_FILE_EXT_RE.test(media)))
   );
@@ -144,8 +138,8 @@ export function createReplyMediaSourcePreparer(params: {
   requesterSenderE164?: string;
   sandboxRoot?: string;
   sandboxContainerWorkdir?: string;
-  mediaAccess?: HostOutboundMediaAccess;
-  workspaceMediaAccess?: HostOutboundMediaAccess;
+  mediaAccess?: OutboundMediaAccess;
+  workspaceMediaAccess?: OutboundMediaAccess;
   /** Physical remote alias of the captured logical workspace. */
   workspaceMediaRoot?: string;
   /** Streams local audio/video up to this size instead of the channel cap. */
@@ -210,9 +204,6 @@ export function createReplyMediaSourcePreparer(params: {
     sessionWorkspaceDir?: string,
     workspaceDir?: string,
   ): Promise<{ path: string; contentType?: string }> => {
-    if (!isLikelyLocalMediaSource(media)) {
-      return { path: media };
-    }
     const managedMediaPath = await resolveAllowedManagedMediaPath(media);
     if (managedMediaPath) {
       return {
@@ -231,7 +222,7 @@ export function createReplyMediaSourcePreparer(params: {
     if (cached) {
       return await cached;
     }
-    const mediaAccess = resolveAgentScopedOutboundMediaAccess({
+    const mediaAccess = resolveAgentScopedHostOutboundMediaAccess({
       cfg: params.cfg,
       agentId,
       workspaceDir: workspaceDir ?? params.workspaceDir,

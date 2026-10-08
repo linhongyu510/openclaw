@@ -143,6 +143,26 @@ export function createEmbeddedModelState(
       });
     }
   };
+  const recordContextAccounting = (message: AssistantMessage, successful: boolean) =>
+    params.onContextAccountingEvent?.({
+      kind: "model",
+      contextTokens: deriveSessionTotalTokens({ lastCallUsage: normalizeUsage(message.usage) }),
+      successful,
+      // Narrow admission: only a real, non-overflow completed turn renews the
+      // overflow budget. `successful` stays the wide telemetry signal (it reaches
+      // here for a completed stop/toolUse, and via the fallback for every
+      // message_end); `admitted` additionally requires the turn to have been
+      // admitted without silent overflow. We deliberately do NOT gate on nonzero
+      // usage--a provider/proxy can complete a stop/toolUse while omitting
+      // counters. On the fallback (successful=false) admitted collapses to false
+      // automatically, and a `length` truncated reply never emits successful.
+      admitted:
+        successful &&
+        !isContextOverflow(
+          message,
+          params.contextWindowTokens ?? params.session.model?.contextWindow,
+        ),
+    });
 
   return {
     captureModelEvent: (evt: AgentSessionEvent): void => {
@@ -180,26 +200,7 @@ export function createEmbeddedModelState(
             !isProviderRefusalAssistantError(message)
           ) {
             successfulModelResponse = true;
-            params.onContextAccountingEvent?.({
-              kind: "model",
-              contextTokens: deriveSessionTotalTokens({
-                lastCallUsage: normalizeUsage(message.usage),
-              }),
-              successful: true,
-              // Admitted: provider accepted the prompt and completed a usable
-              // non-refusal turn. We deliberately do NOT require nonzero usage:
-              // a provider/proxy can complete a stop/toolUse while omitting
-              // counters, and main renews the budget on any completed turn.
-              // The only false-positive this guards against is silent overflow,
-              // which `isContextOverflow` excludes on its own.
-              // turn_end only reaches here for stop/toolUse (the gate above);
-              // a `length` truncated reply emits no successful accounting event,
-              // matching main--it is not treated as budget-renewing progress.
-              admitted: !isContextOverflow(
-                message,
-                params.contextWindowTokens ?? params.session.model?.contextWindow,
-              ),
-            });
+            recordContextAccounting(message, true);
           }
           return;
         case "message_start":
@@ -228,16 +229,7 @@ export function createEmbeddedModelState(
           completed = applyAssistantDeliveryDirectives(structuredClone(message));
           lastUsage ??= message.stopReason === "error" ? retryUsage : undefined;
           retryUsage = undefined;
-          params.onContextAccountingEvent?.({
-            kind: "model",
-            contextTokens: deriveSessionTotalTokens({
-              lastCallUsage: normalizeUsage(message.usage),
-            }),
-            successful: false,
-            // Admitted is computed at the successful emit point above; at this
-            // fallback emit (every message_end) it defaults to undefined/false.
-            admitted: false,
-          });
+          recordContextAccounting(message, false);
       }
     },
     recordAuxiliaryUsage: (usage: Usage) => recordModelUsage(normalizeUsage(usage)),

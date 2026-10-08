@@ -54,7 +54,6 @@ const DEFAULT_RECONNECT_BACKOFF: BackoffPolicy = {
   jitter: 0.1,
 };
 
-const DEFAULT_ADMISSION_TIMEOUT_MS = DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 type ReadyWaiter = {
@@ -87,7 +86,7 @@ export class WorkerConnection {
   constructor(private readonly options: WorkerConnectionOptions) {
     this.admissionTimeoutMs = resolvePositiveTimeout(
       options.admissionTimeoutMs,
-      DEFAULT_ADMISSION_TIMEOUT_MS,
+      DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS,
     );
     this.admissionDeadlineMs = resolvePositiveTimeout(
       options.admissionDeadlineMs,
@@ -390,7 +389,7 @@ export class WorkerConnection {
     try {
       const response = await this.frames.request("heartbeat", {
         sentAtMs: Date.now(),
-        status: this.options.heartbeatStatus?.() ?? "ready",
+        status: "ready",
       });
       if (response.ok) {
         if (response.payload.ownerEpoch !== this.options.connectParams.admission.ownerEpoch) {

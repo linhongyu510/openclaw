@@ -53,9 +53,7 @@ import {
   enqueueCliRun,
   isClaudeCliBackendId,
   prepareCliPromptImagePayload,
-  resolveCliNoOutputTimeoutMs,
   resolveCliRunQueueKey,
-  resolveCliRunTimeoutOverrideMs,
   resolvePromptInput,
   resolveSessionIdToSend,
   resolveSystemPromptUsage,
@@ -63,6 +61,7 @@ import {
 import { cliBackendLog, CLI_BACKEND_LOG_OUTPUT_ENV } from "./log.js";
 import { createClaudeCliModelCallDiagnostics } from "./model-call-diagnostics.js";
 import { composeCliPromptContext } from "./prompt-context.js";
+import { resolveCliNoOutputTimeoutMs, resolveCliRunTimeoutOverrideMs } from "./reliability.js";
 import type { PreparedCliRunContext } from "./types.js";
 
 function exactToolAvailabilityError(params: {
@@ -329,7 +328,7 @@ export async function executePreparedCliRun(
           provider: params.provider,
           model: context.normalizedModel,
           promptChars: basePrompt.length,
-          trigger: params.trigger,
+          trigger: params.isolatedCompletionPurpose ?? params.trigger,
           useResume,
           cliSessionId: cliSessionIdToUse,
           resolvedSessionId,

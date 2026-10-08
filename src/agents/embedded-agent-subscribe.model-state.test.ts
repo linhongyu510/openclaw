@@ -215,26 +215,32 @@ describe("subscribeEmbeddedAgentSession model state", () => {
         onContextAccountingEvent: (event) => recovery.observeContextAccounting(event),
       });
       const controller = createEmbeddedRunFailoverRetryController({
-        runParams: {
-          sessionId: "async-progress",
-          sessionFile: "unused",
-          runId: "async-progress",
-          workspaceDir: "/tmp/async-progress",
-          prompt: "Continue",
-          timeoutMs: 300_000,
+        runInput: {
+          runParams: {
+            sessionId: "async-progress",
+            sessionFile: "unused",
+            runId: "async-progress",
+            workspaceDir: "/tmp/async-progress",
+            prompt: "Continue",
+            timeoutMs: 300_000,
+          },
+          globalLane: "test",
+          agentDir: "/tmp/async-progress",
+          fallbackConfigured: false,
         },
-        provider: "test-provider",
-        modelId: "usage-model",
-        globalLane: "test",
-        agentDir: "/tmp/async-progress",
-        fallbackConfigured: false,
-        profileFailureStore: { version: 1, profiles: {} },
-        getLastProfileId: () => undefined,
+        preparedRuntime: {
+          provider: "test-provider",
+          modelId: "usage-model",
+          profileFailureStore: { version: 1, profiles: {} },
+          snapshot: () => ({
+            lastProfileId: undefined,
+            pluginHarnessOwnsTransport: false,
+            agentHarness: { id: "embedded" },
+          }),
+          getApiKeyInfo: () => null,
+          advanceAttemptAuthProfile: async () => false,
+        },
         getSessionId: () => "async-progress",
-        harnessOwnsTransport: () => false,
-        getRuntimeAuthOwnerId: () => "embedded",
-        getApiKeyInfo: () => null,
-        advanceAuthProfile: async () => false,
       });
       const messages: string[] = [];
       try {
@@ -646,6 +652,31 @@ describe("subscribeEmbeddedAgentSession model state", () => {
     expect(observed).toEqual([
       { successful: false, admitted: false },
       { successful: true, admitted: true },
+    ]);
+  });
+
+  it("treats a completed stop whose usage already exceeds the window as silent overflow (successful but not admitted)", async () => {
+    const onContextAccountingEvent = vi.fn();
+    const harness = createSubscribedSessionHarness({
+      runId: "run-silent-overflow",
+      lifecycleGeneration: agentEvents.getAgentEventLifecycleGeneration(),
+      contextWindowTokens: 100_000,
+      onContextAccountingEvent,
+    });
+    await runUsageCalls(
+      harness,
+      // Completed stop, but reported input tokens already exceed the 100k window:
+      // broad telemetry still fires, but narrow admission must be false.
+      [{ usage: makeUsage({ input: 200_000 }) }],
+      () => {},
+    );
+    const observed = onContextAccountingEvent.mock.calls.map(([e]) => ({
+      successful: e.successful,
+      admitted: e.admitted,
+    }));
+    expect(observed).toEqual([
+      { successful: false, admitted: false },
+      { successful: true, admitted: false },
     ]);
   });
 });
