@@ -738,9 +738,6 @@ const config = {
     // production uses them through their owning module/controller.
     "ui/src/pages/chat/chat-state-refresh.ts": ["exports"],
     "ui/src/pages/chat/composer-persistence.ts": ["exports"],
-    // Focused reconciliation test exercises this boundary prune seam; production
-    // callers were consolidated into the owning reconciliation module.
-    "ui/src/pages/chat/stream-segment-pruning.ts": ["exports"],
     // Focused media tests consume these explicit seams; production uses the helpers in-module.
     "src/agents/embedded-agent-subscribe.handlers.lifecycle.ts": ["exports"],
     "src/gateway/server-methods/chat-webchat-media.ts": ["exports"],

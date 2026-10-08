@@ -39,7 +39,10 @@ function pruneAccumulatedStreamSegments(
   });
 }
 
-export function discardStreamSegmentIndexes(
+// Private prune seam: callers go through prunePersistedAssistantStreamSegments
+// (and history replacement). Not a public export -- production has no index-based
+// caller and the dead-export ratchet forbids test-only exports.
+function discardStreamSegmentIndexes(
   state: StreamCausalBoundaryState,
   discardedIndexes: readonly number[],
 ): void {

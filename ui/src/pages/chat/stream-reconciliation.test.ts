@@ -9,7 +9,6 @@ import {
   visibleCurrentAssistantStreamTail,
 } from "./stream-reconciliation.ts";
 import {
-  discardStreamSegmentIndexes,
   prunePersistedAssistantStreamSegments,
   prunePersistedToolStreamMessages,
 } from "./stream-segment-pruning.ts";
@@ -285,6 +284,9 @@ describe("stream reconciliation", () => {
           text: "Before steer.",
           ts: 1,
           runId: "active-run",
+          // Equivalent to the private prune seam's output: the replaced earlier
+          // prefix is retained only as a persisted baseline, not rendered live.
+          persisted: true as const,
         },
         {
           text: "Before steer. After steer.",
@@ -293,8 +295,6 @@ describe("stream reconciliation", () => {
         },
       ],
     });
-
-    discardStreamSegmentIndexes(state, [0]);
 
     expect(visibleAssistantStreamParts(state, visibleStreamOptions)).toMatchObject([
       { text: "After steer." },
