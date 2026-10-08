@@ -1,5 +1,17 @@
-// Covers identifier-preservation instructions through single and staged
-// compaction summarization paths.
+// Covers the summarization owner's public emitted-instruction contract through
+// both the single-pass and staged compaction summarization paths.
+//
+// Two layers of regression live in this root:
+//  1. The `*.test-support.js` imports below carry the single-pass eligibility /
+//     transport-budget suites. Vitest discovers only `*.test.ts`, so those modules
+//     have to be imported from a discovered root or their declarations silently
+//     skip in CI. They assert the whole-request fit gate, per-transport budget
+//     narrowing, and terminal-timeout / context-overflow recovery.
+//  2. The inline cases pin what the owner emits when no custom instructions,
+//     custom instructions, or an identifier policy (off / custom / missing) is in
+//     effect. They guard that the single-pass refactor did not drop the
+//     identifier-preservation guidance that main already ships, on both the
+//     single-pass and split+merge paths.
 import "./compaction-planning-single-pass.test-support.js";
 import "./compaction-planning-transport-budget.test-support.js";
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
