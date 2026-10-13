@@ -37,6 +37,14 @@ and the agent's
 The lifecycle owner closes its read scope and drains accepted writes before
 retiring the store.
 
+Complete single-statement effects can use SQLite autocommit through
+`runSqliteSingleStatementSync`. Prepare the result, admission, and commit receipt
+before the statement, then install committed facts before notifying observers.
+Warm participant contributions and non-message audit inserts use this path;
+new participants, audit pruning, and execution bindings retain transactions.
+Each effect still commits separately. PostgreSQL writes retain their adapter's
+transaction custody.
+
 Gateway startup binds existing auth-file observers to its read-only scope and
 spawn broker, including observations retained across an in-process restart.
 New observers capture those resources when admitting a directory. File scans
@@ -459,6 +467,10 @@ and retain them with the existing entry-publication owner. Native and worker wri
 invalidate changed predicates before the next effect check, so those checks need no
 SQLite read on the Gateway. Conversation-bound checks still read the authoritative
 binding until every binding writer publishes its complete derived postimage.
+Source preparation borrows an already-retained entry predicate instead of dispatching
+another exact-entry read. Releasing a mutation's source leaves its selecting reader
+current; releasing that reader revokes every borrower. The destination worker keeps
+its transaction-local source comparison before the effect.
 
 Reply-initialization cohorts reuse those entry facts only when the selected entry
 and its parent are both covered. Cold-archive absence requires a complete actor
@@ -4419,9 +4431,13 @@ file caches only after acknowledged commit. Doctor relocation retains its native
 transaction. Schemas, retention, durability, and update behavior are unchanged.
 
 Session branch summaries retain compact counts, headlines, and their append
-certificate in the host, keyed by physical database identity and the transcript
-rewrite/append watermark. Read workers validate that snapshot before extending
-it, so worker retirement does not discard the cache. Workers also adopt the host's
+certificate in the host, keyed by database path and session key. The database
+owner's write receipt invalidates this cache without main-thread SQLite reads.
+The maintenance worker selects the current session and reads the transcript
+watermark in the same snapshot as the branch graph. It extends prior summaries
+only for the same physical database and transcript, so worker retirement does not
+discard the cache. A concurrent write may finish while a snapshot is being
+delivered; its receipt makes the next lookup refresh. Workers also adopt the host's
 live database validation receipt before canonical admission, preserving pending-row
 checks without repeating whole-store validation. Branch reads share the existing
 maintenance reader's prewarming, five-minute idle window, database custody, and
