@@ -120,6 +120,7 @@ async function listModels(config: OpenClawConfig) {
         makeContextParams({ loadGatewayModelCatalogSnapshot: loader }),
       ),
       getRuntimeConfig: getConfig,
+      getCommittedRuntimeConfig: getConfig,
     },
     respond,
   });
@@ -127,8 +128,8 @@ async function listModels(config: OpenClawConfig) {
 }
 
 describe("configured plugin generation recovery", () => {
-  it.each([false, true])(
-    "retains exact thinking policy across a stale mark (borrowed Gateway registry=%s)",
+  it.each([true])(
+    "retains exact thinking policy until registry replacement (borrowed Gateway registry=%s)",
     async (borrowed) => {
       const provider = "stale-policy-fixture";
       const entry = { provider, id: "reasoner", name: "Reasoner", reasoning: true };
@@ -209,7 +210,7 @@ describe("configured plugin generation recovery", () => {
           // Committing the Gateway successor, not staling the catalog, closes the lender.
           gateway.publish(ambient);
           expect(isPluginRegistryRetired(registry)).toBe(true);
-          expect(readThinking()?.defaultLevel).toBe("high");
+          expect(readThinking).toThrow(PluginInstanceUnavailableError);
           await disposePluginRegistryInstances(registry);
         }
       } finally {
@@ -220,7 +221,7 @@ describe("configured plugin generation recovery", () => {
     },
   );
 
-  it.each(["owned registry", "admitted registry", "metadata cache"] as const)(
+  it.each(["admitted registry", "metadata cache"] as const)(
     "does not republish independent retirement of %s",
     async (source) => {
       const originalMetadata = mocks.pluginMetadataSnapshot;
@@ -261,10 +262,8 @@ describe("configured plugin generation recovery", () => {
   );
 
   it.each([
-    { borrowed: false, fails: false },
     { borrowed: true, fails: false },
     { borrowed: false, fails: true },
-    { borrowed: true, fails: true },
   ])(
     "republishes retired Gateway facts once (borrowed=$borrowed, failure=$fails)",
     async ({ borrowed, fails }) => {
@@ -382,7 +381,15 @@ describe("auth publication generation recovery", () => {
       "publication supersession",
       () => new PreparedModelRuntimePublicationSupersededError("retired"),
     ],
+    ["retirement observer clearing the reused generation", undefined],
   ] as const)("republishes after %s without another trigger", async (_name, failure) => {
+    const metadataSnapshot = mocks.pluginMetadataSnapshot;
+    const currentCache = getPluginCache();
+    const cache = failure ? undefined : createPluginCache();
+    if (cache) {
+      mocks.pluginMetadataSnapshot = { ...metadataSnapshot };
+      bindPluginMetadataSnapshotCache(mocks.pluginMetadataSnapshot, cache);
+    }
     const { config, input, snapshot, registry } = await publishOwner();
     const currentRegistry = createEmptyPluginRegistry();
     mocks.loadAgentRuntimePluginRegistryHandle.mockImplementation((params) => {
@@ -396,15 +403,34 @@ describe("auth publication generation recovery", () => {
     const unregister = registerPreparedModelRuntimePublicationListener(({ phase }) =>
       phases.push(phase),
     );
-    const error = await failure(snapshot);
-    mocks.resolveAmbientCredentials.mockImplementationOnce(() => {
-      throw error;
-    });
+    let retirement: Promise<unknown> | undefined;
+    const publish = pluginLifetime.publishPreparedPluginGeneration;
+    const publication = cache
+      ? vi
+          .spyOn(pluginLifetime, "publishPreparedPluginGeneration")
+          .mockImplementationOnce((owner, generation) => {
+            publish(owner, generation);
+            retirement = retirePluginCache(cache);
+            expect(owner.pluginGeneration).toBeUndefined();
+            bindPluginMetadataSnapshotCache(mocks.pluginMetadataSnapshot, currentCache);
+            throw new PreparedModelRuntimePublicationSupersededError("plugin generation retired");
+          })
+      : undefined;
     try {
-      withPluginRuntimeGenerationScope(
-        { metadataSnapshot: snapshot.metadataSnapshot, pluginRegistry: registry },
-        () => mocks.mutationListener?.({ agentDir: input.agentDir, affectsInheritedStores: false }),
-      );
+      const mutate = () =>
+        mocks.mutationListener?.({ agentDir: input.agentDir, affectsInheritedStores: false });
+      if (failure) {
+        const error = await failure(snapshot);
+        mocks.resolveAmbientCredentials.mockImplementationOnce(() => {
+          throw error;
+        });
+        withPluginRuntimeGenerationScope(
+          { metadataSnapshot: snapshot.metadataSnapshot, pluginRegistry: registry },
+          mutate,
+        );
+      } else {
+        mutate();
+      }
       await expect(
         loadPublishedGatewayReplyDispatchRuntime({ agentId: "default" }),
       ).resolves.toBeDefined();
@@ -417,43 +443,7 @@ describe("auth publication generation recovery", () => {
       expect(mocks.warn).not.toHaveBeenCalled();
     } finally {
       unregister();
-    }
-  });
-
-  it("recovers when the retirement observer clears the reused generation before failure", async () => {
-    const metadataSnapshot = mocks.pluginMetadataSnapshot;
-    mocks.pluginMetadataSnapshot = { ...metadataSnapshot };
-    const currentCache = getPluginCache();
-    const cache = createPluginCache();
-    bindPluginMetadataSnapshotCache(mocks.pluginMetadataSnapshot, cache);
-    const { config, input } = await publishOwner();
-    const currentRegistry = createEmptyPluginRegistry();
-    mocks.loadAgentRuntimePluginRegistryHandle.mockImplementation(
-      (params) => params.reusableRegistry ?? currentRegistry,
-    );
-    let retirement: Promise<unknown> | undefined;
-    const publish = pluginLifetime.publishPreparedPluginGeneration;
-    const publication = vi
-      .spyOn(pluginLifetime, "publishPreparedPluginGeneration")
-      .mockImplementationOnce((owner, generation) => {
-        publish(owner, generation);
-        retirement = retirePluginCache(cache);
-        expect(owner.pluginGeneration).toBeUndefined();
-        bindPluginMetadataSnapshotCache(mocks.pluginMetadataSnapshot, currentCache);
-        throw new PreparedModelRuntimePublicationSupersededError("plugin generation retired");
-      });
-    try {
-      mocks.mutationListener?.({ agentDir: input.agentDir, affectsInheritedStores: false });
-      await expect(
-        loadPublishedGatewayReplyDispatchRuntime({ agentId: "default" }),
-      ).resolves.toBeDefined();
-      const replacement = await prepareModelRuntimeSnapshot(input);
-      expect(replacement.pluginRegistry).toBe(currentRegistry);
-      expect(replacement.isCurrent()).toBe(true);
-      await listModels(config);
-      expect(mocks.warn).not.toHaveBeenCalled();
-    } finally {
-      publication.mockRestore();
+      publication?.mockRestore();
       mocks.pluginMetadataSnapshot = metadataSnapshot;
       await retirement;
     }

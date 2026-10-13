@@ -27,6 +27,7 @@ import { emitAgentEvent } from "../infra/agent-events.js";
 import { withPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import { acquireTestPortBlock } from "../test-utils/port-claims.js";
+import { refusePendingInputCommit } from "./pending-input-commit.test-support.js";
 import { createSyntheticPluginRuntimeClient } from "./server-plugin-runtime-client.js";
 import {
   agentCommandMock,
@@ -112,6 +113,8 @@ async function arrangeAuthorityProof(name: string) {
   await registerSubagentRun({
     runId: previousRunId,
     childSessionKey: child,
+    childAgentId: "main",
+    sessionEntry: { sessionId },
     controllerSessionKey: parent,
     requesterSessionKey: parent,
     requesterDisplayKey: parent,
@@ -222,7 +225,9 @@ it.each([
     expect(result.details).toMatchObject({ status: "error", error });
     proof.expectUnadopted();
     expect(await listSessionPendingInputs(proof.scope)).toEqual({ items: [], total: 0 });
-    expect(listSessionPendingInputReceipts(proof.scope, { runIds: [proof.runId] })).toEqual([]);
+    expect(await listSessionPendingInputReceipts(proof.scope, { runIds: [proof.runId] })).toEqual(
+      [],
+    );
     expect(agentCommandMock).not.toHaveBeenCalled();
     expect(announce).not.toHaveBeenCalled();
   } finally {
@@ -230,9 +235,29 @@ it.each([
   }
 });
 
-it("rejects parent authority revoked while durable input preparation awaits", async ({
-  signal,
-}) => {
+it.for([
+  {
+    name: "revoked-parent",
+    error: "agent tool caller authority is no longer active",
+    revokeParent: true,
+    abortSuccessor: false,
+    refuseFinish: false,
+  },
+  {
+    name: "aborted-successor",
+    error: "Gateway did not confirm the task resume",
+    revokeParent: false,
+    abortSuccessor: true,
+    refuseFinish: false,
+  },
+  {
+    name: "revoked-parent-after-stop",
+    error: "agent tool caller authority is no longer active",
+    revokeParent: true,
+    abortSuccessor: true,
+    refuseFinish: true,
+  },
+])("rejects $name while durable input preparation awaits", async (scenario, { signal }) => {
   const prepared = createDeferred();
   const release = createDeferred();
   const releasePreparation = () => release.resolve();
@@ -249,9 +274,10 @@ it("rejects parent authority revoked while durable input preparation awaits", as
       return input;
     });
   const announce = await mockSubagentAnnounce();
+  let refusedFinish: ReturnType<typeof refusePendingInputCommit> | undefined;
   let sending: ReturnType<Awaited<ReturnType<typeof arrangeAuthorityProof>>["send"]> | undefined;
   try {
-    const proof = await arrangeAuthorityProof("revoked-parent");
+    const proof = await arrangeAuthorityProof(scenario.name);
     sending = proof.send(proof.parent, parentAuthority.signal);
     await prepared.promise;
     expect(preparation).toHaveBeenCalledTimes(1);
@@ -260,26 +286,57 @@ it("rejects parent authority revoked while durable input preparation awaits", as
       items: [{ runId: proof.runId, state: "queued" }],
     });
     proof.expectUnadopted();
-    parentAuthority.abort();
+    if (scenario.refuseFinish) {
+      refusedFinish = refusePendingInputCommit({
+        operation: "finish",
+        message: "Synthetic pending input finish refusal",
+        sessionId: proof.scope.sessionId,
+        runId: proof.runId,
+      });
+    }
+    if (scenario.revokeParent) {
+      parentAuthority.abort();
+    }
+    if (scenario.abortSuccessor) {
+      const entry = expectDefined(
+        kernel.gatewayRequestContext.chatAbortControllers.get(proof.runId),
+        "preparing successor abort controller",
+      );
+      entry.abortStopReason = "rpc";
+      entry.controller.abort();
+    }
     release.resolve();
     const result = await sending;
     expect(result.details).toMatchObject({
       status: "error",
-      error: expect.stringContaining("agent tool caller authority is no longer active"),
+      error: expect.stringContaining(scenario.error),
     });
     proof.expectUnadopted();
-    expect(await listSessionPendingInputs(proof.scope)).toMatchObject({
-      total: 1,
-      items: [{ runId: proof.runId, state: "cancelled" }],
-    });
-    expect(listSessionPendingInputReceipts(proof.scope, { runIds: [proof.runId] })).toEqual([
-      { runId: proof.runId, state: "pending", cancelled: true },
-    ]);
+    if (scenario.refuseFinish) {
+      const retry = await proof.send();
+      expect(retry.details).toMatchObject({
+        status: "error",
+        error: expect.stringContaining("Pending input ownership ended"),
+      });
+      proof.expectUnadopted();
+      expect(await listSessionPendingInputReceipts(proof.scope, { runIds: [proof.runId] })).toEqual(
+        [{ runId: proof.runId, state: "pending" }],
+      );
+    } else {
+      expect(await listSessionPendingInputs(proof.scope)).toMatchObject({
+        total: 1,
+        items: [{ runId: proof.runId, state: "cancelled" }],
+      });
+      expect(await listSessionPendingInputReceipts(proof.scope, { runIds: [proof.runId] })).toEqual(
+        [{ runId: proof.runId, state: "pending", cancelled: true }],
+      );
+    }
     expect(agentCommandMock).not.toHaveBeenCalled();
     expect(announce).not.toHaveBeenCalled();
   } finally {
     release.resolve();
     await Promise.allSettled([sending]);
+    refusedFinish?.mockRestore();
     preparation.mockRestore();
     announce.mockRestore();
     signal.removeEventListener("abort", releasePreparation);
@@ -360,7 +417,7 @@ it("fences a cancelled successor after adoption before queued input consumption"
       total: 1,
       items: [{ runId: proof.runId, state: "interrupted" }],
     });
-    expect(listSessionPendingInputReceipts(proof.scope, { runIds: [proof.runId] })).toEqual([
+    expect(await listSessionPendingInputReceipts(proof.scope, { runIds: [proof.runId] })).toEqual([
       { runId: proof.runId, state: "pending" },
     ]);
     expect(agentCommandMock).not.toHaveBeenCalled();
@@ -403,6 +460,8 @@ it.each(["explicit", "automatic"] as const)(
       await registerSubagentRun({
         runId: previousRunId,
         childSessionKey: child,
+        childAgentId: "main",
+        sessionEntry: { sessionId: `resume-${mode}-child` },
         controllerSessionKey: parent,
         requesterSessionKey: parent,
         requesterDisplayKey: parent,

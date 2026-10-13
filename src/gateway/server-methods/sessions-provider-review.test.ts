@@ -28,10 +28,14 @@ vi.mock("../session-sharing.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../session-sharing.js")>();
   return {
     ...actual,
-    resolveSessionSharingTarget: mocks.resolveTarget,
-    resolveSessionMutationAuthorization: mocks.resolveAuthorization,
+    resolveSessionSharingTargetAsync: async (...args: unknown[]) => mocks.resolveTarget(...args),
   };
 });
+// mock-isolation: Provider-review tests control authorization changes while the review is awaited.
+vi.mock("../session-sharing-authorization-async.js", () => ({
+  resolveSessionMutationAuthorizationAsync: (...args: unknown[]) =>
+    mocks.resolveAuthorization(...args),
+}));
 
 const sessionKey = "agent:main:provider-review";
 const sessionId = "session-a";
@@ -144,7 +148,7 @@ describe("registered provider review continuation", () => {
       deliver: false,
     });
     expect(readProviderReviewAcknowledgment(acknowledgment).review.id).toBe("review-a");
-    const normalized = normalizeChatSendRequest({
+    const normalized = await normalizeChatSendRequest({
       params: chatOptions.params,
       client: chatOptions.client,
       providerReviewAcknowledgment: acknowledgment,
@@ -183,31 +187,28 @@ describe("registered provider review continuation", () => {
     },
   );
 
-  it("rejects client-supplied continuation authority", async () => {
-    const options = request({ providerReviewAcknowledgment: {} });
-    await coreGatewayHandlers["sessions.providerReview.continue"]!(options);
-    expect(mocks.read).not.toHaveBeenCalled();
-    expectRejected(options);
-  });
-
-  it("rejects agent-authored synthetic UI calls before reading the findings", async () => {
-    const options = request();
-    options.client!.internal = { syntheticClient: true };
-    await coreGatewayHandlers["sessions.providerReview.continue"]!(options);
-    expect(mocks.read).not.toHaveBeenCalled();
-    expectRejected(options);
-  });
-
-  it("shows ordinary API findings without offering or dispatching continuation", async () => {
-    Object.assign(entry.providerReview!, { runtimeId: "openclaw", api: "openai-responses" });
-    expect(projectSessionProviderReview(entry, sessionKey)).toEqual({
-      id: "review-a",
-      runId: "failed-run",
-      explanation: "Review the proposed operation.",
-      canContinue: false,
-    });
-    const options = request();
-    await coreGatewayHandlers["sessions.providerReview.continue"]!(options);
-    expectRejected(options);
-  });
+  it.each(["client-supplied authority", "synthetic UI", "ordinary API"])(
+    "rejects continuation from %s",
+    async (source) => {
+      const options = request(
+        source === "client-supplied authority" ? { providerReviewAcknowledgment: {} } : {},
+      );
+      if (source === "synthetic UI") {
+        options.client!.internal = { syntheticClient: true };
+      } else if (source === "ordinary API") {
+        Object.assign(entry.providerReview!, { runtimeId: "openclaw", api: "openai-responses" });
+        expect(projectSessionProviderReview(entry, sessionKey)).toEqual({
+          id: "review-a",
+          runId: "failed-run",
+          explanation: "Review the proposed operation.",
+          canContinue: false,
+        });
+      }
+      await coreGatewayHandlers["sessions.providerReview.continue"]!(options);
+      if (source !== "ordinary API") {
+        expect(mocks.read).not.toHaveBeenCalled();
+      }
+      expectRejected(options);
+    },
+  );
 });

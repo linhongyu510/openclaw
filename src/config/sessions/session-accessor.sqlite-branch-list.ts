@@ -2,17 +2,19 @@ import { createDeferredCore } from "../../shared/deferred.js";
 import { getOrCreatePromise } from "../../shared/lazy-promise.js";
 import { retainOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-resources.js";
+import { getOpenClawAgentDatabaseValidation } from "../../state/openclaw-agent-db-validation-cache.js";
 import {
   cacheSessionBranchSummaries,
   cloneSessionBranchSummaries,
   readCachedSessionBranchSummaries,
-  readSessionBranchSnapshot,
   type SessionBranchSummaryReadResult,
 } from "./session-accessor.sqlite-branches.js";
 import { readSessionEntryRow } from "./session-accessor.sqlite-entry-read.js";
+import { resolveSqliteSessionKey } from "./session-accessor.sqlite-scope-helpers.js";
 import { resolveSqliteScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
 import { readSessionTranscriptHotWatermark } from "./session-accessor.sqlite-transcript-watermark-read.js";
 import type { SessionBranchListParams, SessionBranchListResult } from "./session-accessor.types.js";
+import { captureSessionActorStorageOwner } from "./session-actor-storage-binding.js";
 import { readRestoredSessionTranscript } from "./session-cold-storage-read.js";
 import { SessionTranscriptColdError } from "./session-cold-storage-state.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
@@ -23,6 +25,32 @@ export async function listSessionBranches(
   params: SessionBranchListParams,
 ): Promise<SessionBranchListResult> {
   const sourceKey = normalizeStoreSessionKey(params.sessionStoreKey ?? params.sessionKey);
+  const memory = captureSessionActorStorageOwner(
+    { ...params, sessionKey: sourceKey },
+    { assertCurrent() {}, authorize() {} },
+  );
+  if (memory) {
+    const assertCurrent = () => {
+      memory.binding?.actor.assertReadable();
+      memory.authority.assertCurrent();
+    };
+    const actor = await memory.owner?.acquireExisting(
+      resolveSqliteSessionKey(sourceKey, memory.agentId),
+      { assertCurrent, assertReadable: assertCurrent },
+    );
+    if (!actor) {
+      return { status: "missing-session" };
+    }
+    try {
+      const result = await actor.storage!.read(
+        { type: "session.history.branches", input: {} },
+        { ...memory.authority, assertCurrent },
+      );
+      return result.status === "ok" ? { status: "ok", branches: result.branches } : result;
+    } finally {
+      await actor.release();
+    }
+  }
   const resolved = resolveSqliteScope({
     ...(params.agentId ? { agentId: params.agentId } : {}),
     ...(params.env ? { env: params.env } : {}),
@@ -39,7 +67,7 @@ export async function listSessionBranches(
     const controller = new AbortController();
     let unregister = () => {};
     try {
-      const selected = readSessionEntryRow(database, sourceKey)?.entry;
+      const selected = readSessionEntryRow(database, sourceKey, "list")?.entry;
       if (!selected?.sessionId) {
         return { status: "missing-session" };
       }
@@ -61,15 +89,13 @@ export async function listSessionBranches(
       const watermark = readSessionTranscriptHotWatermark(database, selected.sessionId);
       const cached = readCachedSessionBranchSummaries(database, selected.sessionId, watermark);
       let snapshot: SessionBranchSummaryReadResult;
-      if (cached) {
-        snapshot = { status: "ok", ...watermark, branches: cached.branches };
-      } else if (typeof claim.identity === "symbol") {
-        // Incognito transcripts live only in this process's in-memory database.
-        snapshot = readSessionBranchSnapshot(database, expected);
+      if (cached?.maxSeq === watermark.maxSeq) {
+        snapshot = { status: "ok", ...cached };
       } else {
         const request = {
           database: { agentId: database.agentId, path: database.path },
           databaseIdentity: claim.identity,
+          validation: getOpenClawAgentDatabaseValidation(database),
           ...expected,
         };
         // New transcripts, lifecycles, or database claims must never join an older snapshot.
@@ -79,10 +105,13 @@ export async function listSessionBranches(
           key,
           async () => {
             const { runSessionBranchSummaryWorkerRequest } =
-              await import("./session-transcript-read-worker-runtime.js");
+              await import("./session-transcript-worker-runtime.js");
             const read = () => {
               assertCurrent();
-              return runSessionBranchSummaryWorkerRequest(request, controller.signal);
+              return runSessionBranchSummaryWorkerRequest(
+                { ...request, previous: cached },
+                controller.signal,
+              );
             };
             try {
               return await read();
@@ -102,7 +131,7 @@ export async function listSessionBranches(
         );
       }
       assertCurrent();
-      const current = readSessionEntryRow(database, sourceKey)?.entry;
+      const current = readSessionEntryRow(database, sourceKey, "list")?.entry;
       if (
         current?.sessionId !== expected.sessionId ||
         current.lifecycleRevision !== expected.lifecycleRevision

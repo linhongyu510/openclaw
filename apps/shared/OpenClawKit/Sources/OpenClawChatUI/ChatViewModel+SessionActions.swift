@@ -62,6 +62,11 @@ extension OpenClawChatViewModel {
             (entry.agentId ?? self.currentSessionSnapshot().deliveryAgentID) == target.agentID
     }
 
+    func mainSessionKey(for session: OpenClawChatSessionEntry) -> String {
+        let agentID = ChatSessionSidebarModel.sidebarAgentID(session) ?? self.selectedAgentID
+        return agentID.map { self.mainSessionKey(forAgent: $0) } ?? self.resolvedMainSessionKey
+    }
+
     public var canRequestSessionCompact: Bool {
         !self.isCompacting &&
             !self.isSending &&
@@ -265,7 +270,7 @@ extension OpenClawChatViewModel {
         // sessions.groups.put, so memberships survive. Accepted tradeoff until the
         // gateway grows a revisioned groups API.
         let current = try await self.fetchSessionGroups(using: routeLease)
-        let response = try await routeLease.putGroups(names: current.map(\.name) + [name])
+        let response = try await routeLease.putGroups(current.map(\.name) + [name])
         self.sessionGroupsRevision += 1
         return response.groups
     }
@@ -278,7 +283,7 @@ extension OpenClawChatViewModel {
     {
         let nextName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !nextName.isEmpty else { return try await self.fetchSessionGroups(using: routeLease) }
-        let response = try await routeLease.renameGroup(name: name, to: nextName)
+        let response = try await routeLease.renameGroup(name, nextName)
         self.sessionGroupsRevision += 1
         self.refreshSessions(limit: Self.sessionListFetchLimit)
         return response.groups
@@ -289,7 +294,7 @@ extension OpenClawChatViewModel {
         _ name: String,
         using routeLease: OpenClawChatSessionGroupsRouteLease) async throws -> [OpenClawChatSessionGroup]
     {
-        let response = try await routeLease.deleteGroup(name: name)
+        let response = try await routeLease.deleteGroup(name)
         self.sessionGroupsRevision += 1
         self.refreshSessions(limit: Self.sessionListFetchLimit)
         return response.groups
@@ -330,7 +335,8 @@ extension OpenClawChatViewModel {
         })
         let owner = self.sidebarData
         let epoch = owner?.scopeRevision
-        let mainSessionKey = self.resolvedMainSessionKey
+        // A manager may target another agent without switching the active conversation.
+        let mainSessionKeys = entries.mapValues { self.mainSessionKey(for: $0) }
         let attachmentBlockedKeys = self.isAttachmentOwnerPinned
             ? Set(selectedSessions.filter {
                 self.matchesCurrentSessionKey(incoming: $0.key, current: self.sessionKey)
@@ -345,7 +351,7 @@ extension OpenClawChatViewModel {
                 }))
         }
         let result = await ChatSessionBatchMutationRunner.run(keys: orderedKeys) { @MainActor key in
-            if let entry = entries[key] {
+            if let entry = entries[key], let mainSessionKey = mainSessionKeys[key] {
                 switch action {
                 case .archive where !ChatSessionSidebarModel.canArchiveSession(
                     entry,
@@ -429,7 +435,11 @@ extension OpenClawChatViewModel {
         Task { await self.performCompact() }
     }
 
-    public func fetchSessionList(search: String?, archived: Bool) async -> [OpenClawChatSessionEntry] {
+    public func fetchSessionList(
+        search: String?,
+        archived: Bool,
+        agentID: String? = nil) async -> [OpenClawChatSessionEntry]
+    {
         let session = self.currentSessionSnapshot()
         let query = ChatPayloadDecoding.trimmedNonEmptyString(search)
         do {
@@ -437,7 +447,7 @@ extension OpenClawChatViewModel {
                 limit: Self.sessionListFetchLimit,
                 search: query,
                 archived: archived,
-                agentID: session.deliveryAgentID)
+                agentID: agentID ?? session.deliveryAgentID)
             guard self.isCurrentSession(session) else { return [] }
             return OpenClawChatSessionListOrganizer.organize(res.sessions)
         } catch {
@@ -446,8 +456,17 @@ extension OpenClawChatViewModel {
             // Task.isCancelled before applying results.
             guard self.isCurrentSession(session), !(error is CancellationError), !Task.isCancelled else { return [] }
             guard !archived else { return [] }
-            guard let query else { return self.sessions }
-            return OpenClawChatSessionListOrganizer.filter(self.sessions, search: query)
+            // sidebar-agent-roster.ts:203 opens management for its agent without changing the conversation.
+            let cached = agentID.map { agent in
+                (self.sidebarData?.rows ?? self.sessions).filter {
+                    !$0.isArchived && ChatSessionSidebarModel.isSessionInActiveAgentScope(
+                        key: $0.key,
+                        agentID: $0.agentId,
+                        activeAgentID: agent)
+                }
+            } ?? self.sessions
+            guard let query else { return cached }
+            return OpenClawChatSessionListOrganizer.filter(cached, search: query)
         }
     }
 
@@ -662,10 +681,10 @@ extension OpenClawChatViewModel {
                 }
             case .reconcile:
                 guard await self.reconcileOutboxBranchScope(
-                    session,
+                    self.outboxBranchScope(for: session),
                     branches: response.branches,
                     previousState: previousState,
-                    connectionGeneration: connectionGeneration)
+                    capturedSession: session)
                 else {
                     self.pauseOutboxBranchScope(session)
                     return false

@@ -6,16 +6,19 @@ import {
 import { mutateSubagentRuns } from "../agents/subagents/registry/subagent-registry-persistence.js";
 import { clearSubagentRunsReadCacheForTest } from "../agents/subagents/registry/subagent-registry-state.js";
 import type { SubagentRunRecord } from "../agents/subagents/registry/subagent-registry.types.js";
-import { setRuntimeConfigSnapshot } from "../config/io.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import {
   deleteSessionEntryLifecycle,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { onSessionLifecycleEvent } from "../sessions/session-lifecycle-events.js";
+import { prepareUserProfileCatalog } from "../state/user-profile-list.js";
+import { ensureUserProfileRoleSchema } from "../state/user-profiles-schema.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { boardStore } from "./board-store.js";
+import { prepareGatewayRecipientProfile } from "./expected-profile.js";
 import { progressCardStore } from "./progress-card-store.js";
 import { createGatewayBroadcaster } from "./server-broadcast.js";
 import { makeClient } from "./server-broadcast.test-helpers.js";
@@ -78,7 +81,11 @@ describe("board and progress event session ownership", () => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
         const cfg: OpenClawConfig = {
           ...rolePolicyConfig(),
-          agents: { list: [{ id: "main", default: true }, { id: "work" }] },
+          agents: {
+            ownership: "explicit",
+            defaults: { systemAgent: { agentId: "main" } },
+            entries: { main: {}, work: {} },
+          },
           session: { scope },
           tools: { exec: { mode: "ask" } },
         };
@@ -269,6 +276,8 @@ describe("board and progress event session ownership", () => {
 describe("collaboration event scope guards", () => {
   it("revalidates an authoritative session-generation creator replacement before socket I/O", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const cfg: OpenClawConfig = {};
+      setRuntimeConfigSnapshot(cfg);
       const sessionKey = "agent:main:draft-owner-filter";
       const ownerActor = {
         type: "human" as const,
@@ -304,7 +313,6 @@ describe("collaboration event scope guards", () => {
           updatedAt: 1,
         };
       }
-      const cfg: OpenClawConfig = {};
       const filter = vi.fn(
         (
           client: GatewayWsClient,
@@ -384,6 +392,7 @@ describe("collaboration event scope guards", () => {
   it("rechecks incognito visibility only for subscription recipients", async () => {
     const hidden = { visibility: "shared" as const, incognito: true as const };
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      ensureUserProfileRoleSchema({});
       const cfg = rolePolicyConfig();
       setRuntimeConfigSnapshot(cfg, cfg);
       const sessionKey = "agent:main:subscription-filter";
@@ -403,8 +412,10 @@ describe("collaboration event scope guards", () => {
       const unscoped = makeClient("unscoped", "operator", ["operator.read"]);
       const peers = [subscribed, ...unrelated, unscoped];
       const identity = roleClient("view", "reader");
+      using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
       for (const peer of peers) {
         Object.assign(peer.client, identity, { connect: { ...identity.connect } });
+        prepareGatewayRecipientProfile(peer.client);
       }
       const subscribers = createSessionMessageSubscriberRegistry();
       for (const peer of [subscribed, ...unrelated]) {
@@ -514,8 +525,13 @@ describe("collaboration event scope guards", () => {
       subscribers,
       sessionEventSubscribers,
       isVisible: () => true,
-      getConfig: () =>
-        ({ agents: { list: [{ id: "main", default: true }, { id: "work" }] } }) as OpenClawConfig,
+      getConfig: () => ({
+        agents: {
+          ownership: "explicit",
+          defaults: { systemAgent: { agentId: "main" } },
+          entries: { main: {}, work: {} },
+        },
+      }),
     });
     const { broadcastToConnIds } = createGatewayBroadcaster({
       clients: new GatewayClientRegistry([message.client, eventOnly.client, unrelated.client]),
@@ -642,6 +658,7 @@ describe("collaboration event scope guards", () => {
 
 it("delivers committed collector updates to a parent-only cross-agent viewer", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    ensureUserProfileRoleSchema({});
     const cfg: OpenClawConfig = {
       ...rolePolicyConfig(),
       agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
@@ -668,6 +685,7 @@ it("delivers committed collector updates to a parent-only cross-agent viewer", a
       });
     }
     invalidateSessionSharingSnapshot();
+    using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
     expect(
       canReceiveSessionEventForClient({
         cfg,
@@ -779,4 +797,99 @@ it("delivers committed collector updates to a parent-only cross-agent viewer", a
       invalidateSessionSharingSnapshot();
     }
   });
+});
+
+const readScopes = ["read", "write", "admin"];
+
+describe("operator event scope guards", () => {
+  it.each([
+    { event: "skills.changed", payload: { reason: "remote-node" }, allowed: readScopes },
+    { event: "plugins.changed", payload: { generation: 1 }, allowed: readScopes },
+    { event: "mcp.app.resourceUpdated", payload: { reason: "remote-node" }, allowed: readScopes },
+    {
+      event: "mcp.app.hostContextChanged",
+      payload: { reason: "remote-node" },
+      allowed: readScopes,
+    },
+    {
+      event: "talk.voice.change",
+      payload: {
+        phase: "requested",
+        changeId: "change-1",
+        voiceSessionId: "voice-1",
+        sessionKey: "main",
+        voice: "ember",
+      },
+      allowed: ["talk", "write", "admin"],
+      targeted: true,
+      nodeScope: "talk",
+    },
+    {
+      event: "update.run.changed",
+      payload: { runId: "run", phase: "staging", status: "running", updatedAtMs: 1 },
+      allowed: ["admin"],
+      nodeScope: "admin",
+    },
+    {
+      event: "plugins.install.progress",
+      payload: {
+        activityId: "install-activity",
+        stage: "runtime",
+        status: "started",
+        requestId: "install-request",
+      },
+      allowed: ["admin"],
+      targeted: true,
+      nodeScope: "admin",
+    },
+    {
+      event: "device.pair.setup.completed",
+      payload: { setupId: "setup-123", deviceId: "device-123", access: "limited", ts: 1 },
+      allowed: ["pairing", "admin"],
+    },
+  ])(
+    "delivers $event only to authorized recipients",
+    ({ event, payload, allowed, targeted, nodeScope }) => {
+      const operators = ["pairing", "read", "write", "admin", "talk"].map((scope) =>
+        makeClient(scope, "operator", [`operator.${scope}`]),
+      );
+      const session = makeClient("session", "operator", [
+        "operator.sessions.read",
+        "operator.sessions.write",
+      ]);
+      const node = makeClient("node", "node", [`operator.${nodeScope ?? "read"}`]);
+      const targets = [...operators, session, node];
+      const observer = makeClient("observer", "operator", [`operator.${allowed[0]}`]);
+      const broadcaster = createGatewayBroadcaster({
+        clients: new GatewayClientRegistry(
+          (targeted ? [...targets, observer] : targets).map(({ client }) => client),
+        ),
+      });
+      if (targeted) {
+        broadcaster.broadcastToConnIds(
+          event,
+          payload,
+          new Set(targets.map(({ client }) => client.connId)),
+        );
+        expect(observer.socket.send).not.toHaveBeenCalled();
+      } else {
+        broadcaster.broadcast(event, payload);
+      }
+      for (const { client, socket } of targets) {
+        if (allowed.includes(client.connId)) {
+          expect(socket.events).toEqual([event]);
+          expect(socket.send).toHaveBeenCalledOnce();
+          expect(JSON.parse(socket.send.mock.calls[0]![0])).toEqual({
+            type: "event",
+            event,
+            seq: 1,
+            payload,
+          });
+        } else {
+          expect(socket.events).toEqual([]);
+          expect(socket.send).not.toHaveBeenCalled();
+        }
+      }
+    },
+  );
 });

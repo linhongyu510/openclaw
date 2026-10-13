@@ -49,12 +49,24 @@ export function isRequesterSettleWakeForRun(params: {
 }): boolean {
   const { entry, requesterSessionKey, requesterAgentId } = params;
   const wake = entry.requesterSettleWake;
-  const pauseNotice = entry.pauseReason === "sessions_yield" && wake?.pauseNotice;
-  const batchRunIds = pauseNotice ? [entry.runId] : wake?.batchRunIds;
+  if (!wake) {
+    return false;
+  }
+  const pauseNotice = entry.pauseReason === "sessions_yield" && wake.pauseNotice;
+  // Dispatch selects the surviving members of its frozen generation. Retired
+  // rows no longer contribute to the admitted wake's identity.
+  const batchRunIds = pauseNotice
+    ? [entry.runId]
+    : wake.batchRunIds?.filter((id) => {
+        const member = params.runsById.get(id);
+        return (
+          member?.requesterSettleWake !== undefined &&
+          member.requesterSettleWake.rearmGeneration === wake.rearmGeneration
+        );
+      });
   if (
     entry.requesterSessionKey !== requesterSessionKey ||
     (entry.requesterAgentId && entry.requesterAgentId !== requesterAgentId) ||
-    !wake ||
     wake.attemptCount < 1 ||
     !isSameSubagentRun(params.runsById.get(entry.runId), entry) ||
     !batchRunIds?.includes(entry.runId)
@@ -111,6 +123,16 @@ export function captureRequesterSettleRunIdentity(entry: SubagentRunRecord) {
   };
 }
 
+export function sameRequesterSettleRunIdentity(
+  left: SubagentRunRecord,
+  right: SubagentRunRecord,
+): boolean {
+  return isDeepStrictEqual(
+    captureRequesterSettleRunIdentity(left),
+    captureRequesterSettleRunIdentity(right),
+  );
+}
+
 /** Wake decisions retain their observed progress; retirement/presentation metadata is carried forward. */
 export function captureRequesterSettleWakeProgress(entry: SubagentRunRecord) {
   const wake = entry.requesterSettleWake;
@@ -132,22 +154,6 @@ export function captureRequesterSettleWakeProgress(entry: SubagentRunRecord) {
   );
 }
 
-/** A retained delivery callback cannot adopt another requester claim or frozen reply policy. */
-function isRequesterSettleRunBindingCurrent(
-  current: SubagentRunRecord,
-  expected: SubagentRunRecord,
-): boolean {
-  return (
-    isSameSubagentRunOwner(current, expected) &&
-    isDeepStrictEqual(
-      captureRequesterSettleRunIdentity(current),
-      captureRequesterSettleRunIdentity(expected),
-    ) &&
-    (current.requesterSettleWake?.yieldedFinalDeliverable === true) ===
-      (expected.requesterSettleWake?.yieldedFinalDeliverable === true)
-  );
-}
-
 /** Completion custody can outlive a requester that finished without explicitly yielding. */
 export function hasRequesterCompletionCohort(entry: SubagentRunRecord): boolean {
   const wake = entry.requesterSettleWake;
@@ -157,7 +163,13 @@ export function hasRequesterCompletionCohort(entry: SubagentRunRecord): boolean 
   );
 }
 
-/** A newer task cannot revoke another task's exact completion custody. */
+/**
+ * A newer task cannot revoke another task's exact completion custody. A
+ * yield-paused run holds no result, only its continuation: a newer execution of
+ * its session without its own completion audience continues it, so the pause
+ * notice no longer owes a wake. A sibling that owes its own delivery is
+ * independent and leaves the paused task resumable.
+ */
 export function isRequesterCompletionCohortCurrent(
   entry: SubagentRunRecord,
   latestForSession: (
@@ -167,14 +179,17 @@ export function isRequesterCompletionCohortCurrent(
   ) => SubagentRunRecord | null,
 ): boolean {
   const taskRunId = entry.taskRunId ?? entry.runId;
-  const task = latestForSession(
+  const paused = entry.pauseReason === "sessions_yield";
+  const owner = latestForSession(
     entry.childSessionKey,
-    (candidate) => (candidate.taskRunId ?? candidate.runId) === taskRunId,
+    (candidate) =>
+      (candidate.taskRunId ?? candidate.runId) === taskRunId ||
+      (paused && candidate.expectsCompletionMessage !== true),
     entry.childAgentId,
   );
   return (
     entry.killReconciliation?.supersededAt === undefined &&
-    (!task || compareSubagentRunGeneration(task, entry) <= 0)
+    (!owner || compareSubagentRunGeneration(owner, entry) <= 0)
   );
 }
 
@@ -258,7 +273,9 @@ export function resolveCurrentRequesterSettleWakeBatch(params: {
     if (
       !entry ||
       (entry.expectsCompletionMessage === true && entry.requesterTurnRunId) ||
-      !isRequesterSettleRunBindingCurrent(entry, observed) ||
+      !sameRequesterSettleRunIdentity(entry, observed) ||
+      (wake?.yieldedFinalDeliverable === true) !==
+        (observed.requesterSettleWake?.yieldedFinalDeliverable === true) ||
       !wake ||
       wake.rearmGeneration !== params.rearmGeneration ||
       (params.pause

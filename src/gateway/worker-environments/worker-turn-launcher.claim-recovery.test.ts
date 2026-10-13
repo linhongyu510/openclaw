@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { resolveEmbeddedSessionLane } from "../../agents/embedded-agent-runner/lanes.js";
 import { createEmbeddedRunLaneController } from "../../agents/embedded-agent-runner/run/lane-controller.js";
@@ -19,6 +19,7 @@ import {
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import { recoverStuckDiagnosticSession } from "../../logging/diagnostic-stuck-session-recovery.runtime.js";
 import { getCommandLaneSnapshot } from "../../process/command-queue.js";
+import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
 import {
   advancePlacementFixtureToActive,
   writePlacementEnvironmentFixture,
@@ -26,7 +27,6 @@ import {
 import { createWorkerSessionPlacementGate } from "./placement-worker-gate.js";
 import { canRedispatchFailedWorkerPlacement } from "./session-placement-lifecycle.js";
 import type { WorkerTurnTunnelHandle } from "./tunnel-contract.js";
-import * as workerGitHubBinding from "./worker-github-binding.js";
 import { createWorkerPlacementRedispatch } from "./worker-placement-redispatch.js";
 import {
   ENVIRONMENT_ID,
@@ -51,6 +51,8 @@ import {
 } from "./worker-turn-launcher.test-support.js";
 import { createWorkerWorkspaceOperationCoordinator } from "./workspace-operation-coordinator.js";
 
+afterAll(closeStateDatabaseForTest);
+
 function createLane(initialParams: SessionPlacementTurnParams) {
   let params = initialParams;
   let generation = getAgentEventLifecycleGeneration();
@@ -71,7 +73,7 @@ function createLane(initialParams: SessionPlacementTurnParams) {
 
 describe("local claim recovery before backend registration", () => {
   beforeEach(setupWorkerTurnLauncherTest);
-  afterEach(cleanupWorkerTurnLauncherTest);
+  afterEach(() => cleanupWorkerTurnLauncherTest({ reuseReadWorkers: true }));
 
   it.each(["local", "standalone", "remote"] as const)(
     "admits a queued %s child after its inherited parent claim closes",
@@ -133,7 +135,7 @@ describe("local claim recovery before backend registration", () => {
         });
         expect(localTask).toHaveBeenCalledTimes(execution === "remote" ? 0 : 1);
         expect(remoteTask).toHaveBeenCalledTimes(execution === "remote" ? 1 : 0);
-        expect(placements.get(SESSION_ID)?.turnClaim ?? null).toBeNull();
+        expect((await placements.getAsync(SESSION_ID))?.turnClaim ?? null).toBeNull();
       } finally {
         gate.resolve();
         await Promise.allSettled([child]);
@@ -299,12 +301,11 @@ describe("local claim recovery before backend registration", () => {
 
 describe("worker pre-launch claim recovery", () => {
   beforeEach(setupWorkerTurnLauncherTest);
-  afterEach(cleanupWorkerTurnLauncherTest);
+  afterEach(() => cleanupWorkerTurnLauncherTest({ reuseReadWorkers: true }));
 
   it.each([
     "workspace resolution",
     "workspace queue",
-    "GitHub binding",
     "execution-start publication",
     "workspace mutation",
     "dispatch",
@@ -324,7 +325,7 @@ describe("worker pre-launch claim recovery", () => {
       request.onDispatchReady?.();
       if (blockSecond) {
         if (stage === "pending result") {
-          placements.markWorkspaceResultPending(request.turnClaim);
+          await placements.markWorkspaceResultPending(request.turnClaim);
         }
         entered.resolve();
         await resume.promise;
@@ -343,7 +344,9 @@ describe("worker pre-launch claim recovery", () => {
           "node cancellation unconfirmed",
         );
       }
-      const leafId = (await openSessionManager()).appendMessage(
+      const leafId = await (
+        await openSessionManager()
+      ).appendMessageAsync(
         makeAgentAssistantMessage({
           content: [{ type: "text", text: "First turn complete" }],
           timestamp: 41,
@@ -354,7 +357,7 @@ describe("worker pre-launch claim recovery", () => {
         transcriptSeq: 2,
         liveSeq: 1,
       });
-      placements.markWorkspaceResultPending(request.turnClaim);
+      await placements.markWorkspaceResultPending(request.turnClaim);
       return {
         stdout: JSON.stringify({
           status: "completed",
@@ -526,7 +529,6 @@ describe("worker pre-launch claim recovery", () => {
         }
       },
     };
-    let github: MockInstance<typeof workerGitHubBinding.prepareWorkerGitHubBinding> | undefined;
     let blocked: Promise<unknown> | undefined;
     let successor: Promise<unknown> | undefined;
     let recovery: Promise<unknown> | undefined;
@@ -536,18 +538,10 @@ describe("worker pre-launch claim recovery", () => {
           throw new Error("unexpected local execution");
         }),
       ).resolves.toMatchObject({ payloads: [{ text: "First turn complete" }] });
+      await placements.waitForTurnClaimRelease(SESSION_ID, {});
       expect(placements.get(SESSION_ID)).toMatchObject({ state: "active", turnClaim: null });
-      expect(placements.listPendingWorkspaceResults()).toEqual([]);
+      expect(await placements.listPendingWorkspaceResultsAsync()).toEqual([]);
       blockSecond = true;
-      if (stage === "GitHub binding") {
-        github = vi
-          .spyOn(workerGitHubBinding, "prepareWorkerGitHubBinding")
-          .mockImplementationOnce(async () => {
-            entered.resolve();
-            await resume.promise;
-            return undefined;
-          });
-      }
       if (stage === "workspace queue") {
         queuedBlocker = coordinator.run(ENVIRONMENT_ID, () => resume.promise);
       }
@@ -561,7 +555,7 @@ describe("worker pre-launch claim recovery", () => {
       await entered.promise;
       const oldClaim = placements.get(SESSION_ID)?.turnClaim;
       expect(oldClaim?.runId).toBe("blocked-second");
-      expect(placements.listPendingWorkspaceResults()).toHaveLength(
+      expect(await placements.listPendingWorkspaceResultsAsync()).toHaveLength(
         stage === "pending result" ? 1 : 0,
       );
       const dispatched =
@@ -621,6 +615,7 @@ describe("worker pre-launch claim recovery", () => {
             }),
           ),
         ).resolves.toMatchObject({ payloads: [{ text: "First turn complete" }] });
+        await placements.waitForTurnClaimRelease(SESSION_ID, {});
         expect(placements.get(SESSION_ID)).toMatchObject({
           state: "active",
           environmentId: `${ENVIRONMENT_ID}-recovered`,
@@ -633,7 +628,7 @@ describe("worker pre-launch claim recovery", () => {
       }
       if (stage === "pending result") {
         expect(placements.get(SESSION_ID)?.turnClaim).toEqual(oldClaim);
-        const pending = placements.listPendingWorkspaceResults()[0]!;
+        const pending = (await placements.listPendingWorkspaceResultsAsync())[0]!;
         expect(pending.claimId).toBe(oldClaim?.claimId);
         expect(pending.recoveryRequestedAtMs).not.toBeNull();
         expect(environments.destroy).not.toHaveBeenCalled();
@@ -670,7 +665,6 @@ describe("worker pre-launch claim recovery", () => {
       resume.resolve();
       finishSuccessor.resolve();
       await Promise.allSettled([blocked, successor, queuedBlocker, recovery]);
-      github?.mockRestore();
       operation.complete();
       first.preparedRunAdmission.close();
       second.preparedRunAdmission.close();
