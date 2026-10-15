@@ -3,7 +3,6 @@ import { flattenTranslations } from "../../../../scripts/lib/control-ui-i18n-syn
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ChannelAccountSnapshot, CronJob } from "../../api/types.ts";
 import type { ApplicationContext } from "../../app/context.ts";
-import type { MultiSelect } from "../../components/multi-select.ts";
 import { i18n, t } from "../../i18n/index.ts";
 import { zh_CN } from "../../i18n/locales/zh-CN.ts";
 import { createInitialCronState, loadCronJobsPage } from "../../lib/cron/index.ts";
@@ -95,7 +94,7 @@ function directText(element: Element | null | undefined): string | undefined {
 
 function expectAgentTab(container: Element, text: string): HTMLElement & { disabled: boolean } {
   const button = Array.from(
-    container.querySelectorAll<HTMLElement & { disabled: boolean }>("wa-tab.hub-tab"),
+    container.querySelectorAll<HTMLElement & { disabled: boolean }>(".hub-tab"),
   ).find((candidate) => directText(candidate) === text);
   if (!(button instanceof HTMLElement)) {
     throw new Error(`Expected agent tab "${text}"`);
@@ -444,8 +443,9 @@ describe("renderAgents", () => {
       container,
     );
 
-    const field = container.querySelector<MultiSelect>("openclaw-multi-select.agent-fallbacks");
-    expect(field?.value).toEqual([]);
+    const field = container.querySelector<HTMLElement>("openclaw-multi-select.agent-fallbacks");
+    expect(field).not.toBeNull();
+    expect(field?.querySelectorAll(".multi-select__chip")).toHaveLength(0);
   });
 
   it("shows the skills count only for the selected agent's report", async () => {

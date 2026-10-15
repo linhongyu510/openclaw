@@ -7,15 +7,36 @@ import {
   clearNativeGatewayTestState,
   setNativeGatewayTestState,
 } from "../../../test-helpers/native-gateways.ts";
-import "./chat-detail-panel.ts";
+import "./chat-detail-panel.tsx";
 import type { SidebarContent } from "./chat-sidebar-content-types.ts";
 import { createChatSidebarContainer } from "./chat-sidebar.test-support.ts";
+import type { FileEditorViewHandle } from "./file-editor-view.ts";
+
+// mock-isolation: These sidebar contracts exclude CodeMirror's browser layout and language loading.
+vi.mock("./file-editor-view.ts", () => ({
+  createFileEditorView: async ({ content }: { content: string }) => {
+    let text = content;
+    return {
+      destroy() {},
+      setContent(next: string) {
+        text = next;
+      },
+      contentEquals: (next: string) => text === next,
+      getContent: () => text,
+      setEditable() {},
+      setLineWrapping() {},
+      setDecorations() {},
+      scrollToLine() {},
+      onDocChanged() {},
+      focus() {},
+    } satisfies FileEditorViewHandle;
+  },
+}));
 
 type DetailPanel = HTMLElement & {
   content: unknown;
   basePath?: string;
   execNode: string | null;
-  ensureFileEditor: () => Promise<void>;
   updateComplete: Promise<unknown>;
   onOpenWorkspaceFile?: (target: { path: string; line?: number | null }) => void;
   onOpenSessionLink?: (target: { sessionKey: string; agentId: string }) => void;
@@ -65,26 +86,6 @@ describe("file sidebar editor locality", () => {
     clearNativeGatewayTestState();
   });
 
-  it("offers editors for native-local files", async () => {
-    setNativeGatewayTestState("local");
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    panel.execNode = null;
-    panel.content = {
-      kind: "file",
-      path: "src/example.ts",
-      name: "example.ts",
-      root: "/workspace",
-      content: "const answer = 42;",
-    };
-    vi.spyOn(panel, "ensureFileEditor").mockResolvedValue();
-    container.append(panel);
-    await panel.updateComplete;
-
-    expect(panel.querySelector('[aria-label="Open in editor"]')).not.toBeNull();
-    expect(panel.querySelectorAll(".sidebar-file-view__editor-item")).toHaveLength(4);
-    expect(panel.querySelector(".sidebar-file-view__editor")).not.toBeNull();
-  });
-
   it("removes editor controls when the native gateway switches to remote", async () => {
     setNativeGatewayTestState("local");
     const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
@@ -95,10 +96,11 @@ describe("file sidebar editor locality", () => {
       root: "/workspace",
       content: "const answer = 42;",
     };
-    vi.spyOn(panel, "ensureFileEditor").mockResolvedValue();
     container.append(panel);
     await panel.updateComplete;
     expect(panel.querySelector('[aria-label="Open in editor"]')).not.toBeNull();
+    expect(panel.querySelectorAll(".sidebar-file-view__editor-item")).toHaveLength(4);
+    expect(panel.querySelector(".sidebar-file-view__editor")).not.toBeNull();
 
     setNativeGatewayTestState("remote");
     await panel.updateComplete;
@@ -117,8 +119,6 @@ describe("markdown sidebar", () => {
       ["Intro", "", "```ts", "const x = 1;", "```", "", "**literal after**"].join("\n") +
       (testCase.trailingNewline ? "\n" : "");
     const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    const editorLoad =
-      testCase.kind === "file" ? vi.spyOn(panel, "ensureFileEditor").mockResolvedValue() : null;
     panel.content =
       testCase.kind === "markdown"
         ? { kind: "markdown", content: "Rendered summary", rawText: source }
@@ -171,7 +171,6 @@ describe("markdown sidebar", () => {
         }
       }
       schedule.mockRestore();
-      editorLoad?.mockRestore();
       panel.remove();
     }
   });
@@ -200,18 +199,6 @@ describe("markdown sidebar", () => {
       panel.remove();
     },
   );
-
-  it.each([
-    ["a Hebrew heading behind Markdown punctuation as rtl", "## כותרת ראשית", "rtl"],
-  ] as const)("renders %s", async (_name, markdown, expected) => {
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    panel.content = { kind: "markdown", content: markdown };
-    container.append(panel);
-    await panel.updateComplete;
-
-    expect(panel.querySelector(".sidebar-markdown-reader")?.getAttribute("dir")).toBe(expected);
-    panel.remove();
-  });
 
   it("opens focused markdown preview file links with Enter", async () => {
     const key = "Enter";
@@ -403,6 +390,7 @@ describe("markdown sidebar", () => {
   });
 
   it.each([
+    ["bundle.zip", "https://files.example/bundle.zip", "application/zip"],
     ["external.html", "https://files.example/external.html", "text/html"],
     ["external.pdf", "https://files.example/external.pdf", "application/pdf"],
   ] as const)(
@@ -429,6 +417,7 @@ describe("markdown sidebar", () => {
       expect(download?.getAttribute("href")).toBe(src);
       expect(download?.target).toBe("_blank");
       expect(download?.rel).toBe("noreferrer");
+      expect(download?.textContent).toContain("Download");
       expect(fetchMock).not.toHaveBeenCalled();
       panel.remove();
     },
@@ -520,20 +509,30 @@ describe("markdown sidebar", () => {
     const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
     panel.embedSandboxMode = "trusted";
     panel.canvasPluginSurfaceUrl = "https://canvas.example";
-    panel.content = {
+    const content = {
       kind: "canvas",
       docId: "preview-1",
       title: "Preview",
       entryUrl: "https://canvas.example/previews/preview-1",
       sandbox: "scripts",
-    };
+    } satisfies SidebarContent;
+    panel.content = content;
     container.append(panel);
     await panel.updateComplete;
 
-    expect(panel.querySelector("iframe")?.getAttribute("sandbox")).toBe("allow-scripts");
-    expect(panel.querySelector("iframe")?.getAttribute("sandbox")).not.toContain(
-      "allow-same-origin",
-    );
+    const frame = panel.querySelector("iframe");
+    expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame?.getAttribute("sandbox")).not.toContain("allow-same-origin");
+
+    panel.content = { ...content, title: "Renamed preview" };
+    await panel.updateComplete;
+    expect(panel.querySelector("iframe")).toBe(frame);
+    expect(frame?.title).toBe("Renamed preview");
+
+    panel.content = { ...content, sandbox: "strict" };
+    await panel.updateComplete;
+    expect(panel.querySelector("iframe")).not.toBe(frame);
+    expect(panel.querySelector("iframe")?.getAttribute("sandbox")).toBe("");
     panel.remove();
   });
 });
@@ -543,7 +542,6 @@ describe("file sidebar clipboard feedback", () => {
 
   type FilePanel = HTMLElement & {
     content: unknown;
-    ensureFileEditor: () => Promise<void>;
     updateComplete: Promise<unknown>;
   };
 
@@ -555,7 +553,6 @@ describe("file sidebar clipboard feedback", () => {
       name: "example.ts",
       content: "const answer = 42;",
     };
-    vi.spyOn(panel, "ensureFileEditor").mockResolvedValue();
     container.append(panel);
     await panel.updateComplete;
     return panel;
@@ -712,11 +709,12 @@ describe("file sidebar clipboard feedback", () => {
     await vi.waitFor(() => expect(button.getAttribute("aria-label")).toBe("Copied!"));
 
     panel.remove();
+    // Let the bridge retire the disconnected root before reconnecting this host.
+    await Promise.resolve();
     container.append(panel);
     await panel.updateComplete;
 
-    expect(findCopyButton(panel, label)).toBe(button);
-    expect(button.classList.contains("copied")).toBe(false);
+    expect(findCopyButton(panel, label).classList.contains("copied")).toBe(false);
     expect(panel.querySelector('[role="alert"]')).toBeNull();
   });
 
@@ -736,6 +734,7 @@ describe("file sidebar clipboard feedback", () => {
 
     button.click();
     panel.remove();
+    await Promise.resolve();
     container.append(panel);
     await panel.updateComplete;
     finishCopy();
@@ -743,7 +742,7 @@ describe("file sidebar clipboard feedback", () => {
     await Promise.resolve();
     await panel.updateComplete;
 
-    expect(button.getAttribute("aria-label")).toBe(label);
+    expect(findCopyButton(panel, label).getAttribute("aria-label")).toBe(label);
     expect(timers.schedule.mock.calls.some(([, delay]) => delay === 1_500)).toBe(false);
     expect(panel.querySelector('[role="alert"]')).toBeNull();
   });

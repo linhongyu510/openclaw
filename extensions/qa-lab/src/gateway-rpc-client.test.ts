@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type GatewayRequestOptions = {
   expectFinal?: boolean;
-  onSent?: () => void;
   timeoutMs?: number;
 };
 
@@ -153,27 +152,6 @@ describe("startQaGatewayRpcClient", () => {
     await expect(firstRequest).resolves.toEqual({ ok: true });
   });
 
-  it("clamps request timeout to the remaining absolute deadline", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
-    const client = await startQaGatewayRpcClient({
-      wsUrl: "ws://127.0.0.1:18789",
-      token: "qa-token",
-      logs: () => "qa logs",
-    });
-
-    await client.request("status", {}, { deadlineMs: 1_250, timeoutMs: 5_000 });
-
-    expect(gatewayRpcMock.request).toHaveBeenCalledWith(
-      "status",
-      {},
-      expect.objectContaining({
-        expectFinal: undefined,
-        timeoutMs: 250,
-      }),
-    );
-  });
-
   it("bounds startup when readiness completes but the Gateway never sends hello", async () => {
     vi.useFakeTimers();
     gatewayRpcMock.startGatewayClientWhenEventLoopReady.mockResolvedValueOnce({
@@ -251,11 +229,8 @@ describe("startQaGatewayRpcClient", () => {
     expect(gatewayRpcMock.request).not.toHaveBeenCalled();
   });
 
-  it("does not retry a sent request whose Gateway error says it is not connected", async () => {
-    gatewayRpcMock.request.mockImplementationOnce(async (_method, _params, options) => {
-      options.onSent?.();
-      throw new Error("gateway not connected");
-    });
+  it("does not replay a request whose Gateway error says it is not connected", async () => {
+    gatewayRpcMock.request.mockRejectedValueOnce(new Error("gateway not connected"));
     const client = await startQaGatewayRpcClient({
       wsUrl: "ws://127.0.0.1:18789",
       token: "qa-token",
@@ -292,28 +267,5 @@ describe("startQaGatewayRpcClient", () => {
     await client.stop();
 
     await expect(request).rejects.toThrow("gateway rpc client stopped\nGateway logs:\nqa logs");
-  });
-
-  it("does not create a new reconnect waiter after stop races a pre-dispatch rejection", async () => {
-    let rejectRequest!: (error: Error) => void;
-    gatewayRpcMock.request.mockImplementationOnce(
-      async () =>
-        await new Promise((_resolve, reject) => {
-          rejectRequest = reject;
-        }),
-    );
-    const client = await startQaGatewayRpcClient({
-      wsUrl: "ws://127.0.0.1:18789",
-      token: "qa-token",
-      logs: () => "qa logs",
-    });
-    const request = client.request("agent.run");
-    await vi.waitFor(() => expect(gatewayRpcMock.request).toHaveBeenCalledOnce());
-
-    await client.stop();
-    rejectRequest(new Error("gateway not connected"));
-
-    await expect(request).rejects.toThrow("gateway rpc client already stopped");
-    expect(gatewayRpcMock.request).toHaveBeenCalledOnce();
   });
 });

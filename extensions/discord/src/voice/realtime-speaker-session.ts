@@ -14,16 +14,13 @@ import {
   type RealtimeVoiceSelectionInfo,
   type RealtimeVoiceTranscriptEntry,
   type RealtimeVoiceSessionHarness,
+  type ResolvedRealtimeVoiceProvider,
 } from "openclaw/plugin-sdk/realtime-voice";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
 import { sliceUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { DiscordVoiceIngressContext } from "./ingress.js";
-import {
-  formatVoiceLogPreview,
-  formatRealtimeInfoLog,
-  shouldLogRealtimeVerboseEvent,
-} from "./log-preview.js";
+import { formatRealtimeInfoLog, shouldLogRealtimeVerboseEvent } from "./log-preview.js";
 import { DiscordRealtimeConsults, type AgentProxyConsultState } from "./realtime-consults.js";
 import { DiscordRealtimePlayback } from "./realtime-playback.js";
 import type { DiscordRealtimePlayer } from "./realtime-player.js";
@@ -37,7 +34,6 @@ import {
   logVoiceVerbose,
   type DiscordVoiceMode,
   type VoiceRealtimeAgentTurnParams,
-  type VoiceRealtimeSession,
   type VoiceRealtimeSpeakerContext,
   type VoiceRealtimeSpeakerTurn,
   type VoiceSessionEntry,
@@ -62,7 +58,7 @@ export type DiscordRealtimeSessionParams = {
   resolveSpeakerContext: (userId: string) => Promise<DiscordVoiceIngressContext | null>;
 };
 
-export class DiscordRealtimeSpeakerSession implements VoiceRealtimeSession {
+export class DiscordRealtimeSpeakerSession {
   private bridge: RealtimeVoiceBridgeSession | null = null;
   private readonly harness: RealtimeVoiceSessionHarness<AgentProxyConsultState>;
   private readonly playback: DiscordRealtimePlayback<AgentProxyConsultState>;
@@ -102,7 +98,7 @@ export class DiscordRealtimeSpeakerSession implements VoiceRealtimeSession {
     private readonly params: DiscordRealtimeSessionParams & {
       player: DiscordRealtimePlayer;
       sessionId: string;
-      voiceOverride?: string;
+      preparedProvider: ResolvedRealtimeVoiceProvider;
       standby?: boolean;
       conversationHistory?: readonly RealtimeVoiceTranscriptEntry[];
     },
@@ -214,7 +210,7 @@ export class DiscordRealtimeSpeakerSession implements VoiceRealtimeSession {
       realtimeConfig: this.realtimeConfig,
       isAgentProxy: this.params.mode === "agent-proxy",
       bootstrapContextInstructions: this.params.bootstrapContextInstructions,
-      voiceOverride: this.params.voiceOverride,
+      preparedProvider: this.params.preparedProvider,
       conversationHistory: this.params.conversationHistory,
     });
     this.realtimeProviderId = resolved.provider.id;
@@ -286,9 +282,7 @@ export class DiscordRealtimeSpeakerSession implements VoiceRealtimeSession {
         }
         this.markProviderGenerationObserved();
         if (isFinal && text.trim()) {
-          logger.info(
-            `discord voice: realtime ${role} transcript (${text.length} chars): ${formatVoiceLogPreview(text)}`,
-          );
+          logger.info(`discord voice: realtime ${role} transcript (${text.length} chars)`);
         }
         if (isFinal && role === "assistant") {
           this.playback.suppressDuplicateControlSpeech(text);

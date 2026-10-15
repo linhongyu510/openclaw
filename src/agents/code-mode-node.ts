@@ -41,6 +41,7 @@ import {
 } from "./code-mode-worker-types.js";
 
 type NodePool = {
+  id: string;
   tasks: WorkerTaskPool<NodeWorkerInput, CodeModeWorkerThreadResult<undefined>>;
   url: string;
   memoryLimitBytes: number;
@@ -177,6 +178,7 @@ async function takePool(memoryLimitBytes: number, signal: AbortSignal): Promise<
     }
   }
   const owner: NodePool = {
+    id: `code-mode-node:${++nextPoolId}`,
     lifetime,
     url: workerUrl.href,
     memoryLimitBytes,
@@ -284,6 +286,7 @@ async function run(
   startedAt = performance.now(),
 ): Promise<CodeModeWorkerResult> {
   const inlineHost = options.inlineHost;
+  inlineHost?.onWorkerAssigned?.(pool.id);
   const progress = new CodeModeNodeProgress(input.config.maxOutputBytes);
   const deadline = new AbortController();
   const signal = options.signal
@@ -307,6 +310,7 @@ async function run(
           ...prepareInput(input),
           progress: progress.buffer,
           inlineHost: Boolean(inlineHost),
+          gcAttribution: { workerId: pool.id, ...inlineHost?.gcAttribution },
           config: { ...input.config, timeoutMs: admittedTimeoutMs },
         };
       },
@@ -314,9 +318,22 @@ async function run(
         timeoutMs: Math.min(options.timeoutMs, input.config.timeoutMs) - preparationMs,
         hostTimeout: "owner",
         signal,
+        onNotification: (value) => {
+          if (isRecord(value) && value.status === "failure") {
+            inlineHost?.onFailure?.(
+              value.error,
+              value.failurePhase === "bridge" ||
+                value.failurePhase === "guest" ||
+                value.failurePhase === "input"
+                ? value.failurePhase
+                : "host",
+              pool.id,
+            );
+          }
+        },
         inputBytes: input.kind === "exec" ? input.source.length * 2 : 0,
         onInputConsumed: () => {
-          if (input.kind === "exec") {
+          if (input.kind === "exec" && progress.deadline > 0) {
             timer = setTimeout(
               () => deadline.abort(new CodeModeHeadlessTimeoutError()),
               Math.max(0, progress.deadline - performance.timeOrigin - performance.now()),
@@ -359,29 +376,47 @@ async function run(
       retained = true;
       return { ...result, continuation: continuation(pool) };
     }
-    if (result.status === "completed") {
-      await releasePool(pool);
-      retained = true;
-    }
+    await releasePool(pool);
+    retained = true;
     return result;
   } catch (error) {
     const reason = signal.aborted ? signal.reason : error;
-    if (
+    const timedOut =
       reason instanceof CodeModeHeadlessTimeoutError ||
-      (error instanceof WorkerTaskError && error.code === "timeout")
-    ) {
+      (error instanceof WorkerTaskError && error.code === "timeout");
+    const failurePhase = timedOut && progress.deadline ? "guest" : "host";
+    inlineHost?.onFailure?.(error, failurePhase, pool.id);
+    if (timedOut) {
       if (progress.networkContentObserved) {
         inlineHost?.onNetworkContent?.();
       }
       return {
         ...failure("code mode timeout exceeded", "timeout"),
-        failurePhase: progress.deadline ? "guest" : "host",
+        failurePhase,
         output: progress.output(),
         ...(progress.networkContentObserved ? { networkContentObserved: true } : {}),
       };
     }
     if (options.signal?.aborted || reason instanceof CodeModeHeadlessAbortError) {
       return failure("code mode execution aborted", "aborted");
+    }
+    if (
+      error instanceof WorkerTaskError &&
+      isRecord(error.cause) &&
+      (error.cause.code === "ERR_WORKER_OUT_OF_MEMORY" ||
+        error.cause.code === "ERR_CODE_MODE_GC_THRASH")
+    ) {
+      if (progress.networkContentObserved) {
+        inlineHost?.onNetworkContent?.();
+      }
+      return {
+        ...failure(
+          `${error.cause.code === "ERR_CODE_MODE_GC_THRASH" ? "Code Mode worker stopped after sustained garbage collection near its JavaScript heap limit" : `Code Mode worker exhausted its ${Math.floor(pool.memoryLimitBytes / (1024 * 1024))} MiB JavaScript heap`}. Paginate or narrow tool results and avoid retaining large arrays. Inspect any completed actions before retrying.`,
+          "runtime_unavailable",
+        ),
+        output: progress.output(),
+        ...(progress.networkContentObserved ? { networkContentObserved: true } : {}),
+      };
     }
     return failure(
       error,

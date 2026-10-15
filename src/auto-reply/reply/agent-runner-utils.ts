@@ -37,6 +37,11 @@ import {
   mintMessageActionTurnCapability,
   resolveMessageActionTurnCapabilityLifetime,
 } from "../../gateway/message-action-turn-capability.js";
+import {
+  buildAgentHookContextChannelFields,
+  buildAgentHookContextIdentityFields,
+} from "../../plugins/hook-agent-context.js";
+import type { PluginHookAgentContext } from "../../plugins/hook-types.js";
 import { readUserTurnPromptReactionSource } from "../../sessions/user-turn-transcript-admission.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../utils/provider-utils.js";
@@ -226,7 +231,7 @@ export function resolveRunFastModeForFallbackCandidate(params: {
     sessionEntry: params.sessionEntry,
   });
   return {
-    fastMode: params.run.fastModeOverride ? params.run.fastMode : state.mode,
+    fastMode: params.run.fastModeOverride ? params.run.fastMode : state.requestMode,
     fastModeAutoOnSeconds: params.run.fastModeAutoOnSecondsOverride
       ? params.run.fastModeAutoOnSeconds
       : state.fastAutoOnSeconds,
@@ -314,6 +319,25 @@ function buildTemplateSenderContext(sessionCtx: TemplateContext) {
     senderName: normalizeOptionalString(sessionCtx.SenderName),
     senderUsername: normalizeOptionalString(sessionCtx.SenderUsername),
     senderE164: normalizeOptionalString(sessionCtx.SenderE164),
+  };
+}
+
+/** Reuse the candidate's channel and sender projection for early model routing. */
+export function buildModelResolveContext(
+  params: Parameters<typeof buildEmbeddedContextFromTemplate>[0] & {
+    trigger: PluginHookAgentContext["trigger"];
+  },
+) {
+  const context = {
+    ...buildEmbeddedContextFromTemplate(params),
+    ...buildTemplateSenderContext(params.sessionCtx),
+    ...buildReplyRunStateParams(params.run),
+    trigger: params.trigger,
+  };
+  return {
+    trigger: context.trigger,
+    ...buildAgentHookContextChannelFields(context),
+    ...buildAgentHookContextIdentityFields(context),
   };
 }
 
@@ -489,6 +513,7 @@ export async function buildEmbeddedRunExecutionParams(params: {
     modelFallbacksOverride,
     ...authProfile,
     thinkLevel: snapshot.run.thinkLevel,
+    thinkingExplicit: snapshot.run.thinkingExplicit,
     fastMode: snapshot.run.fastMode,
     fastModeAutoOnSeconds: snapshot.run.fastModeAutoOnSeconds,
     verboseLevel: snapshot.run.verboseLevel,

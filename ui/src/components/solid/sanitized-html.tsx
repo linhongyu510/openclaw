@@ -1,17 +1,27 @@
-import { untrack } from "solid-js";
+import { dynamic, type JSX } from "@solidjs/web";
 
 /** Only accepts HTML escaped or sanitized by the caller's content owner. */
-export function SanitizedHtml(props: { html: string; tag: "code" | "div"; class?: string }) {
-  const tag = untrack(() => props.tag);
+export function SanitizedHtml(props: {
+  html: string;
+  tag?: "article" | "code" | "div" | "pre";
+  class?: JSX.HTMLAttributes<HTMLElement>["class"];
+  style?: JSX.HTMLAttributes<HTMLElement>["style"];
+  onClick?: JSX.EventHandler<HTMLElement, MouseEvent>;
+  role?: JSX.HTMLAttributes<HTMLElement>["role"];
+  "aria-label"?: string;
+  tabindex?: number;
+}) {
+  const Container = dynamic(() => props.tag ?? "div");
   return (
-    <>
-      {tag === "code" ? (
-        // eslint-disable-next-line solid/no-innerhtml -- Highlighted code is escaped by highlightCodeHtml.
-        <code class={props.class} innerHTML={props.html} />
-      ) : (
-        // eslint-disable-next-line solid/no-innerhtml -- Markdown is sanitized by toSanitizedMarkdownHtml.
-        <div class={props.class} innerHTML={props.html} />
-      )}
-    </>
+    <Container
+      class={props.class}
+      style={props.style}
+      onClick={props.onClick}
+      role={props.role}
+      aria-label={props["aria-label"]}
+      tabindex={props.tabindex}
+      // eslint-disable-next-line solid/no-innerhtml -- Content is escaped or sanitized by the caller's canonical owner.
+      innerHTML={props.html}
+    />
   );
 }

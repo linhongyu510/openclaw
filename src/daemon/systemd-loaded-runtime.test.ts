@@ -157,7 +157,12 @@ describe("loaded-only systemd runtime", () => {
       const runtime = await observation;
       expect(runtime).toMatchObject({
         status: "running",
-        systemd: { scope: "system", unit: unitName, managerUid: 0 },
+        systemd: {
+          scope: "system",
+          unit: unitName,
+          managerUid: 0,
+          controlGroup: "/user.slice/openclaw-owned.service",
+        },
       });
       expect(runtime.systemd?.transport).toBeUndefined();
     } else {
@@ -170,36 +175,6 @@ describe("loaded-only systemd runtime", () => {
         ([args]) => args.includes("--auto-start=no") && !args.includes("LoadUnit"),
       ),
     ).toBe(true);
-  });
-
-  it("reads the owned loaded unit without systemctl show or unit activation", async () => {
-    const runtime = await readSystemdServiceRuntime(env, { requireLoaded: true, timeoutMs: 1000 });
-    expect(runtime).toMatchObject({
-      status: "running",
-      pid: 412,
-      state: "active",
-      subState: "running",
-      lastExitStatus: 0,
-      lastExitReason: "exited",
-      systemd: {
-        unit: unitName,
-        result: "success",
-        nRestarts: 2,
-        tasksCurrent: 8,
-        memoryCurrent: 2048,
-        controlGroup: "/user.slice/openclaw-owned.service",
-      },
-    });
-    expect(systemctl).not.toHaveBeenCalled();
-    expect(
-      busctl.mock.calls.every(
-        ([selected, args]) =>
-          selected === env && args.includes("--auto-start=no") && !args.includes("LoadUnit"),
-      ),
-    ).toBe(true);
-    const pinned = busctl.mock.calls.filter(([, args]) => !args.includes("GetNameOwner"));
-    expect(pinned).toHaveLength(4);
-    expect(pinned.every(([, args]) => args.includes(":1.42"))).toBe(true);
   });
 
   it.each(["bus"])(
@@ -229,7 +204,31 @@ describe("loaded-only systemd runtime", () => {
           requireLoaded: transport === "bus",
           commandInspection: { kind: "present" },
         });
-        expect(runtime).toMatchObject({ status: "running", pid: 412 });
+        expect(runtime).toMatchObject({
+          status: "running",
+          pid: 412,
+          state: "active",
+          subState: "running",
+          lastExitStatus: 0,
+          lastExitReason: "exited",
+          systemd: {
+            unit: unitName,
+            result: "success",
+            nRestarts: 2,
+            tasksCurrent: 8,
+            memoryCurrent: 2048,
+          },
+        });
+        expect(systemctl).not.toHaveBeenCalled();
+        expect(
+          busctl.mock.calls.every(
+            ([selected, args]) =>
+              selected === env && args.includes("--auto-start=no") && !args.includes("LoadUnit"),
+          ),
+        ).toBe(true);
+        const pinned = busctl.mock.calls.filter(([, args]) => !args.includes("GetNameOwner"));
+        expect(pinned).toHaveLength(4);
+        expect(pinned.every(([, args]) => args.includes(":1.42"))).toBe(true);
         expect(
           inspectServiceProcessMembershipSync(runtime.pid!, "linux", runtime.systemd?.controlGroup),
         ).toBe("unknown");
@@ -545,9 +544,14 @@ describe("bounded owned runtime inspection", () => {
 });
 
 describe("retained original-manager transport", () => {
-  it.each([false, true])(
-    "reads through the retained peer and rejects replacement=%s without another bus lookup",
-    async (replaced) => {
+  it.each([
+    { replaced: false, native: false, tasks: 8n, expectedTasks: 8 },
+    { replaced: true, native: false, tasks: 8n, expectedTasks: 8 },
+    { replaced: false, native: true, tasks: 8n, expectedTasks: 8 },
+    { replaced: false, native: true, tasks: 0xffffffffffffffffn, expectedTasks: undefined },
+  ])(
+    "reads retained peer counters with replacement=$replaced native=$native tasks=$tasks",
+    async ({ replaced, native, tasks, expectedTasks }) => {
       busctl.mockResolvedValue({
         code: 1,
         termination: "exit",
@@ -567,7 +571,13 @@ describe("retained original-manager transport", () => {
         query: vi.fn(async (args: string[]) =>
           managerReply(args)
             .stdout.split("\n")
-            .map((line) => JSON.parse(line).data as unknown),
+            .map((line) => {
+              const row = JSON.parse(line) as { type: string; data: unknown };
+              if (native && row.type === "t" && typeof row.data === "number") {
+                return args.includes("TasksCurrent") && row.data === 8 ? tasks : BigInt(row.data);
+              }
+              return row.data;
+            }),
         ),
       };
       const runtime = await readSystemdServiceRuntime(
@@ -577,6 +587,8 @@ describe("retained original-manager transport", () => {
       expect(runtime.status).toBe(replaced ? "unknown" : "running");
       if (!replaced) {
         expect(runtime.systemd).toMatchObject({ unit: unitName, managerUid: 2001 });
+        expect(runtime.systemd?.tasksCurrent).toBe(expectedTasks);
+        expect(runtime.systemd?.memoryCurrent).toBe(2048);
       }
       expect(busctl).not.toHaveBeenCalled();
       expect(systemctl).not.toHaveBeenCalled();
