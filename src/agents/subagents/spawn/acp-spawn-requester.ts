@@ -12,6 +12,7 @@ import { normalizeDeliveryContext } from "../../../utils/delivery-context.shared
 import {
   resolveRequesterOriginForChild,
   resolveSpawnRequesterConversationTarget,
+  type SpawnRequesterConversationSource,
 } from "../../spawn-requester-origin.js";
 import {
   resolveInternalSessionKey,
@@ -22,15 +23,9 @@ import {
   isHeartbeatEnabledForSessionAgent,
 } from "./acp-spawn-heartbeat.js";
 
-type AcpSpawnRequesterContext = {
+type AcpSpawnRequesterContext = SpawnRequesterConversationSource & {
   agentChannel?: string;
   agentAccountId?: string;
-  agentTo?: string;
-  agentThreadId?: string | number;
-  currentMessagingTarget?: string;
-  currentChannelId?: string;
-  currentThreadTs?: string | number;
-  currentConversationOrigin?: import("../../../gateway/mcp-grant-store.js").McpCurrentConversationOrigin;
   agentGroupSpace?: string | null;
   agentMemberRoleIds?: string[];
 };
@@ -103,18 +98,11 @@ export async function resolveAcpSpawnRequesterState(params: {
       : false,
   ]);
   params.assertActive?.();
-  const hasThreadContext =
-    typeof params.ctx.agentThreadId === "string"
-      ? Boolean(normalizeOptionalString(params.ctx.agentThreadId))
-      : params.ctx.agentThreadId != null;
-  // ACP thread binding uses the same requester-conversation resolution as native
-  // spawn: an explicit agentTo wins, and CLI runtimes without `agentTo` fall
-  // back to currentMessagingTarget/currentChannelId/currentThreadTs (issue #158945).
   const requesterConversation = resolveSpawnRequesterConversationTarget(params.ctx);
   return {
     isSubagentSession,
     hasActiveSubagentBinding,
-    hasThreadContext,
+    hasThreadContext: requesterConversation.threadId != null,
     heartbeatEnabled: isHeartbeatEnabledForSessionAgent({
       cfg: params.cfg,
       requesterAgentId: params.requesterAgentId,

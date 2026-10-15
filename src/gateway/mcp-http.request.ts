@@ -16,7 +16,6 @@ import { getHeader } from "./http-header-value.js";
 import {
   resolveAttachGrant,
   resolveMcpLoopbackClientGrant,
-  type McpCurrentConversationOrigin,
   type McpLoopbackRequestContext,
 } from "./mcp-grant-store.js";
 import { isLoopbackAddress } from "./net.js";
@@ -276,7 +275,7 @@ export function resolveMcpRequestContext(
     // session, channel, capability, or ownership headers.
     return {
       ...structuredClone(auth.boundClientGrant.context),
-      currentConversationOrigin: "run-bound-grant" satisfies McpCurrentConversationOrigin,
+      currentConversationOrigin: "run-bound-grant",
     };
   }
   // Grant-authenticated callers get only their server-bound session and optional
@@ -291,7 +290,7 @@ export function resolveMcpRequestContext(
       currentChannelId: undefined,
       currentThreadTs: undefined,
       currentMessageId: undefined,
-      currentConversationOrigin: "server-session" satisfies McpCurrentConversationOrigin,
+      currentConversationOrigin: "server-session",
       currentInboundAudio: undefined,
       accountId: undefined,
       inboundEventKind: undefined,
@@ -313,7 +312,7 @@ export function resolveMcpRequestContext(
     currentThreadTs: normalizeOptionalString(getHeader(req, "x-openclaw-current-thread-ts")),
     currentMessageId: normalizeOptionalString(getHeader(req, "x-openclaw-current-message-id")),
     // Caller-writable generic-token headers are not authority for thread binding.
-    currentConversationOrigin: "caller-token" satisfies McpCurrentConversationOrigin,
+    currentConversationOrigin: "caller-token",
     currentInboundAudio: normalizeMcpBooleanHeader(
       getHeader(req, "x-openclaw-current-inbound-audio"),
     ),
