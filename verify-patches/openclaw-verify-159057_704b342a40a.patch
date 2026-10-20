@@ -1,0 +1,145 @@
+commit 704b342a40a618481c104ca62f56b9eead534a57
+Author: linhongyu510 <linhongyu.16@bytedance.com>
+Date:   Sun Sep 27 12:20:57 2026 +0800
+
+    harden terminal-oneshot metadata-only close with trusted maintenance flag and running-state guard
+
+diff --git a/src/acp/control-plane/manager.close-session-terminal-oneshot.test.ts b/src/acp/control-plane/manager.close-session-terminal-oneshot.test.ts
+index d2709c02be4..5e1850847f8 100644
+--- a/src/acp/control-plane/manager.close-session-terminal-oneshot.test.ts
++++ b/src/acp/control-plane/manager.close-session-terminal-oneshot.test.ts
+@@ -29,6 +29,7 @@ const MAINTENANCE_CLOSE = {
+   clearMeta: true,
+   allowBackendUnavailable: true,
+   requireAcpSession: false,
++  terminalOneshotMaintenanceClose: true,
+ } as const;
+ 
+ /**
+@@ -150,6 +151,56 @@ describe("runManagerCloseSession terminal oneshot metadata-only cleanup", () =>
+     expect(result.runtimeNotice).toBeUndefined();
+   });
+ 
++  it("never takes the metadata-only path for a running oneshot, even with the trusted flag and deletion pair", async () => {
++    // In-layer terminal invariant: a running in-flight oneshot must real-close.
++    const h = harness(readySessionMeta({ mode: "oneshot", state: "running" }));
++    const result = await h.close({
++      cfg: baseCfg,
++      sessionKey: "x",
++      reason: "terminal-task-cleanup",
++      ...MAINTENANCE_CLOSE,
++    });
++    expect(h.runtimeState.ensureSession).toHaveBeenCalledTimes(1);
++    expect(h.runtimeState.close).toHaveBeenCalledTimes(1);
++    expect(result.runtimeClosed).toBe(true);
++    expect(result.metaCleared).toBe(true);
++  });
++
++  it("refuses the metadata-only path when the trusted maintenance flag is absent, even with discard+clear", async () => {
++    // Security regression: the deletion flag pair alone must never authorize the
++    // runtime-close bypass for a future/manual caller; only the trusted flag set
++    // by the task-registry maintenance closer can.
++    const h = harness(readySessionMeta({ mode: "oneshot", state: "idle" }));
++    const result = await h.close({
++      cfg: baseCfg,
++      sessionKey: "x",
++      reason: "manual-close",
++      discardPersistentState: true,
++      clearMeta: true,
++      allowBackendUnavailable: true,
++    });
++    expect(h.runtimeState.ensureSession).toHaveBeenCalledTimes(1);
++    expect(h.runtimeState.close).toHaveBeenCalledTimes(1);
++    expect(result.runtimeClosed).toBe(true);
++  });
++
++  it("does not metadata-only close a discard-only reset (clearMeta unset) even for an uncached oneshot", async () => {
++    // Mirrors session-reset: discardPersistentState without clearMeta must keep
++    // the real runtime close path (the pair is what authorizes metadata-only).
++    const h = harness(readySessionMeta({ mode: "oneshot", state: "idle" }));
++    const result = await h.close({
++      cfg: baseCfg,
++      sessionKey: "x",
++      reason: "reset",
++      discardPersistentState: true,
++      allowBackendUnavailable: true,
++    });
++    expect(h.runtimeState.ensureSession).toHaveBeenCalledTimes(1);
++    expect(h.runtimeState.close).toHaveBeenCalledTimes(1);
++    expect(result.runtimeClosed).toBe(true);
++    expect(result.metaCleared).toBe(false);
++  });
++
+   it("does not metadata-only close a manual oneshot close without clear/discard", async () => {
+     const h = harness(readySessionMeta({ mode: "oneshot", state: "idle" }));
+     const result = await h.close({
+diff --git a/src/acp/control-plane/manager.close-session.ts b/src/acp/control-plane/manager.close-session.ts
+index 0e41ae4cbae..2abff020964 100644
+--- a/src/acp/control-plane/manager.close-session.ts
++++ b/src/acp/control-plane/manager.close-session.ts
+@@ -69,17 +69,29 @@ export async function runManagerCloseSession(params: {
+   // already closed and evicted its runtime handle (`oneshot-complete` in the turn
+   // runner). There is nothing live to close: re-ensuring here would launch a new
+   // prompt-less runtime session only to close it (and leave an orphan if that
+-  // close fails). Gate strictly on the maintenance discard+clear contract and an
+-  // empty cache, so manual closes, persistent sessions, and any live handle keep
+-  // the real runtime close below. Never call ensureRuntimeHandle to detect this.
++  // close fails).
++  //
++  // The trusted maintenance flag is set only by the task-registry closer, after
++  // that closer independently verifies a terminal, parent-owned oneshot with no
++  // active task. Defense in depth: we ALSO require an in-layer terminal session
++  // state here (`state !== "running"` — turn success/failure both leave "idle"/
++  // "error", never "running"), so the bypass can never apply to an in-flight
++  // oneshot even if a future caller supplied the deletion flags. We additionally
++  // require the irrevocable deletion contract (`discardPersistentState +
++  // clearMeta`, which destroys persisted state and the resume identity) and a
++  // oneshot mode; the runtime close is skipped only when the cache is empty
++  // (checked non-mutatingly, never via ensureRuntimeHandle). Manual close, reset,
++  // and config reconfigure never set the flag and keep the real runtime close.
+   const liveRuntimeHandle = params.runtimeHandles.get(
+     resolveAcpSessionTarget({ cfg: input.cfg, sessionKey, agentId }),
+   );
+   const shouldMetadataOnlyCloseTerminalOneshot =
+     !shouldSkipRuntimeClose &&
++    input.terminalOneshotMaintenanceClose === true &&
+     input.clearMeta === true &&
+     input.discardPersistentState === true &&
+     meta.mode === "oneshot" &&
++    meta.state !== "running" &&
+     liveRuntimeHandle === null;
+   if (shouldMetadataOnlyCloseTerminalOneshot) {
+     if (!params.isCurrentActor()) {
+diff --git a/src/acp/control-plane/manager.types.ts b/src/acp/control-plane/manager.types.ts
+index abc602a204b..f7ea28e61d5 100644
+--- a/src/acp/control-plane/manager.types.ts
++++ b/src/acp/control-plane/manager.types.ts
+@@ -104,6 +104,14 @@ export type AcpCloseSessionInput = {
+   clearMeta?: boolean;
+   allowBackendUnavailable?: boolean;
+   requireAcpSession?: boolean;
++  /**
++   * Trusted assertion, set only by the task-registry terminal ACP maintenance
++   * closer, that the caller has already verified the session is a terminal,
++   * parent-owned oneshot with no active task. It authorizes a metadata-only
++   * close when no live runtime handle is cached, avoiding a redundant runtime
++   * relaunch. Never set this from interactive/manual/reset call paths.
++   */
++  terminalOneshotMaintenanceClose?: boolean;
+ };
+ 
+ export type AcpCloseSessionResult = {
+diff --git a/src/tasks/task-registry-acp-cleanup.ts b/src/tasks/task-registry-acp-cleanup.ts
+index 684afd87df8..74f1b1a7066 100644
+--- a/src/tasks/task-registry-acp-cleanup.ts
++++ b/src/tasks/task-registry-acp-cleanup.ts
+@@ -41,6 +41,9 @@ export async function loadTaskAcpSessionCloser(): Promise<CloseAcpSession> {
+       clearMeta: true,
+       allowBackendUnavailable: true,
+       requireAcpSession: false,
++      // This closer has already verified a terminal, parent-owned oneshot with no
++      // active task; authorize a metadata-only close when no live handle remains.
++      terminalOneshotMaintenanceClose: true,
+     });
+   };
+ }
