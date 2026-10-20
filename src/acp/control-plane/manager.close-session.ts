@@ -71,23 +71,27 @@ export async function runManagerCloseSession(params: {
   // prompt-less runtime session only to close it (and leave an orphan if that
   // close fails).
   //
-  // The `discardPersistentState + clearMeta` pair is the irrevocable deletion
-  // contract: it destroys the persisted state and the resume identity, so the
-  // backend session is intentionally non-resumable regardless of cache state.
-  // The task-registry ACP maintenance closer is the only production caller that
-  // passes both (and only after its terminal-task predicate); manual close passes
-  // clearMeta without discard, reset passes discard without clearMeta, and config
-  // reconfigure passes neither — all keep the real runtime close below. Combined
-  // with an empty cache (checked non-mutatingly; never via ensureRuntimeHandle),
-  // the narrow oneshot case here has no live backend session left to close.
+  // The trusted maintenance flag is set only by the task-registry closer, after
+  // that closer independently verifies a terminal, parent-owned oneshot with no
+  // active task. Defense in depth: we ALSO require an in-layer terminal session
+  // state here (`state !== "running"` — turn success/failure both leave "idle"/
+  // "error", never "running"), so the bypass can never apply to an in-flight
+  // oneshot even if a future caller supplied the deletion flags. We additionally
+  // require the irrevocable deletion contract (`discardPersistentState +
+  // clearMeta`, which destroys persisted state and the resume identity) and a
+  // oneshot mode; the runtime close is skipped only when the cache is empty
+  // (checked non-mutatingly, never via ensureRuntimeHandle). Manual close, reset,
+  // and config reconfigure never set the flag and keep the real runtime close.
   const liveRuntimeHandle = params.runtimeHandles.get(
     resolveAcpSessionTarget({ cfg: input.cfg, sessionKey, agentId }),
   );
   const shouldMetadataOnlyCloseTerminalOneshot =
     !shouldSkipRuntimeClose &&
+    input.terminalOneshotMaintenanceClose === true &&
     input.clearMeta === true &&
     input.discardPersistentState === true &&
     meta.mode === "oneshot" &&
+    meta.state !== "running" &&
     liveRuntimeHandle === null;
   if (shouldMetadataOnlyCloseTerminalOneshot) {
     if (!params.isCurrentActor()) {

@@ -29,6 +29,7 @@ const MAINTENANCE_CLOSE = {
   clearMeta: true,
   allowBackendUnavailable: true,
   requireAcpSession: false,
+  terminalOneshotMaintenanceClose: true,
 } as const;
 
 /**
@@ -148,6 +149,39 @@ describe("runManagerCloseSession terminal oneshot metadata-only cleanup", () => 
     expect(h.runtimeState.close).toHaveBeenCalled();
     expect(result.runtimeClosed).toBe(true);
     expect(result.runtimeNotice).toBeUndefined();
+  });
+
+  it("never takes the metadata-only path for a running oneshot, even with the trusted flag and deletion pair", async () => {
+    // In-layer terminal invariant: a running in-flight oneshot must real-close.
+    const h = harness(readySessionMeta({ mode: "oneshot", state: "running" }));
+    const result = await h.close({
+      cfg: baseCfg,
+      sessionKey: "x",
+      reason: "terminal-task-cleanup",
+      ...MAINTENANCE_CLOSE,
+    });
+    expect(h.runtimeState.ensureSession).toHaveBeenCalledTimes(1);
+    expect(h.runtimeState.close).toHaveBeenCalledTimes(1);
+    expect(result.runtimeClosed).toBe(true);
+    expect(result.metaCleared).toBe(true);
+  });
+
+  it("refuses the metadata-only path when the trusted maintenance flag is absent, even with discard+clear", async () => {
+    // Security regression: the deletion flag pair alone must never authorize the
+    // runtime-close bypass for a future/manual caller; only the trusted flag set
+    // by the task-registry maintenance closer can.
+    const h = harness(readySessionMeta({ mode: "oneshot", state: "idle" }));
+    const result = await h.close({
+      cfg: baseCfg,
+      sessionKey: "x",
+      reason: "manual-close",
+      discardPersistentState: true,
+      clearMeta: true,
+      allowBackendUnavailable: true,
+    });
+    expect(h.runtimeState.ensureSession).toHaveBeenCalledTimes(1);
+    expect(h.runtimeState.close).toHaveBeenCalledTimes(1);
+    expect(result.runtimeClosed).toBe(true);
   });
 
   it("does not metadata-only close a discard-only reset (clearMeta unset) even for an uncached oneshot", async () => {

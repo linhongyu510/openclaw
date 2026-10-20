@@ -104,6 +104,14 @@ export type AcpCloseSessionInput = {
   clearMeta?: boolean;
   allowBackendUnavailable?: boolean;
   requireAcpSession?: boolean;
+  /**
+   * Trusted assertion, set only by the task-registry terminal ACP maintenance
+   * closer, that the caller has already verified the session is a terminal,
+   * parent-owned oneshot with no active task. It authorizes a metadata-only
+   * close when no live runtime handle is cached, avoiding a redundant runtime
+   * relaunch. Never set this from interactive/manual/reset call paths.
+   */
+  terminalOneshotMaintenanceClose?: boolean;
 };
 
 export type AcpCloseSessionResult = {

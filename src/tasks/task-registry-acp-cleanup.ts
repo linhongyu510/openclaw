@@ -41,6 +41,9 @@ export async function loadTaskAcpSessionCloser(): Promise<CloseAcpSession> {
       clearMeta: true,
       allowBackendUnavailable: true,
       requireAcpSession: false,
+      // This closer has already verified a terminal, parent-owned oneshot with no
+      // active task; authorize a metadata-only close when no live handle remains.
+      terminalOneshotMaintenanceClose: true,
     });
   };
 }
