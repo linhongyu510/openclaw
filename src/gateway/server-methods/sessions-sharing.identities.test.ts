@@ -1,7 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { Value } from "typebox/value";
 import { afterEach, expect, it, vi } from "vitest";
-import { SessionMembersListEvidenceResultSchema } from "../../../packages/gateway-protocol/src/index.js";
+import {
+  ErrorCodes,
+  SessionMembersListEvidenceResultSchema,
+} from "../../../packages/gateway-protocol/src/index.js";
 import type { SessionMemberPermissionLevel } from "../../../packages/gateway-protocol/src/schema/sessions-sharing.js";
 import { awaitGateBeforeSettlement, withinTest } from "../../../test/helpers/promise.js";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
@@ -718,4 +721,76 @@ it("projects current participation and exact choices through the sharing handler
     );
     const legacy = await invoke("session.members.list");
     expect(legacy[0]?.[1]).not.toHaveProperty("permissions");
+  }));
+
+it("rejects channel actors as members while keeping legacy rows removable", () =>
+  withState(async () => {
+    const owner = ensureProfileForEmail("channel-actor-owner@example.test");
+    const cfg: OpenClawConfig = {
+      gateway: {
+        roles: {
+          default: "baseline",
+          definitions: {
+            baseline: {
+              sessions: { others: "write" },
+              agents: "*",
+              scopes: ["operator.read", "operator.write"],
+            },
+          },
+        },
+      },
+    };
+    setRuntimeConfigSnapshot(cfg);
+    const sessionKey = "agent:main:channel-actor-member";
+    const channelActorId = "slack:channel:C012345";
+    await seed(sessionKey, "session-channel-actor-member", {
+      visibility: "shared",
+      createdActor: { type: "human", source: "profile", id: owner.id },
+    });
+    await seed("agent:main:slack-channel", "session-slack-channel", {
+      createdActor: { type: "human", source: "channel", id: channelActorId },
+    });
+    const requestContext = context(vi.fn(), cfg);
+    const client = identifiedClient(owner.id);
+    const invoke = (method: Parameters<typeof call>[0], params: Record<string, unknown> = {}) =>
+      call(method, { sessionKey, ...params }, requestContext, client);
+
+    // A channel-sourced human is not an account the operator can grant access
+    // to, so it must not be offered by the picker...
+    const listed = await invoke("session.members.list");
+    expect(listed[0]?.[1]).toMatchObject({
+      identities: expect.not.arrayContaining([expect.objectContaining({ id: channelActorId })]),
+    });
+    // ...nor accepted if a client asks for it directly.
+    expect(await invoke("session.members.add", { identityId: channelActorId })).toEqual([
+      [
+        false,
+        undefined,
+        expect.objectContaining({
+          code: ErrorCodes.INVALID_REQUEST,
+          message: "unknown identity",
+        }),
+      ],
+    ]);
+    expect((await readSessionMembersInWorker({ agentId: "main", sessionKey })).members).toEqual([]);
+
+    // A row written before this rule must stay listable and removable,
+    // otherwise the fix would strand existing members.
+    expect(
+      addSessionMember(
+        { agentId: "main", sessionKey },
+        { identityId: channelActorId, addedBy: "legacy-owner", addedAt: 1 },
+      ).inserted,
+    ).toBe(true);
+    const legacyListed = await invoke("session.members.list");
+    expect(legacyListed[0]?.[1]).toMatchObject({
+      members: [expect.objectContaining({ identityId: channelActorId })],
+      identities: expect.arrayContaining([
+        expect.objectContaining({ type: "human", id: channelActorId }),
+      ]),
+    });
+    expect(await invoke("session.members.remove", { identityId: channelActorId })).toEqual([
+      [true, { ok: true, sessionKey, identityId: channelActorId }, undefined],
+    ]);
+    expect((await readSessionMembersInWorker({ agentId: "main", sessionKey })).members).toEqual([]);
   }));

@@ -7,7 +7,10 @@ import {
 import { isInternalSessionEffectsKey } from "../config/sessions/internal-session-key.js";
 import { memorySessionActorOwners } from "../config/sessions/session-actor-memory-owner.js";
 import { captureSessionActorStorageOwner } from "../config/sessions/session-actor-storage-binding.js";
-import { resolveSessionCreatorActor } from "../config/sessions/session-entry-provenance.js";
+import {
+  resolveSessionCreatorActor,
+  sessionCreatorProfileId,
+} from "../config/sessions/session-entry-provenance.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import {
   first,
@@ -38,8 +41,12 @@ export function createSessionRowCreatorIndex() {
   }
   return {
     update(previous: Row | undefined, next?: Row) {
-      const before = resolveSessionCreatorActor(previous?.entry?.createdActor);
-      const after = resolveSessionCreatorActor(next?.entry?.createdActor);
+      // Only a profile-sourced human creator may become a sharing identity. A
+      // channel/unknown human or an agent/system creator is not an account the
+      // operator can grant access to, so admitting it offers a target that
+      // cannot be authorized.
+      const before = shareableCreator(previous);
+      const after = shareableCreator(next);
       if (
         Boolean(previous?.entry) === Boolean(next?.entry) &&
         before?.id === after?.id &&
@@ -140,7 +147,11 @@ export function createSessionRowCreatorIndex() {
           ...(memory
             ? (memory.owner?.listSessions(memory.authority).flatMap(({ entry }) => {
                 const actor = resolveSessionCreatorActor(entry?.createdActor);
-                return entry?.incognito && actor?.id ? [actor] : [];
+                return entry?.incognito &&
+                  actor?.id &&
+                  (actor.type !== "human" || sessionCreatorProfileId(actor))
+                  ? [actor]
+                  : [];
               }) ?? [])
             : memorySessionActorOwners.list().flatMap((owner) =>
                 owner
@@ -150,7 +161,11 @@ export function createSessionRowCreatorIndex() {
                   })
                   .flatMap(({ entry }) => {
                     const actor = resolveSessionCreatorActor(entry?.createdActor);
-                    return entry?.incognito && actor?.id ? [actor] : [];
+                    return entry?.incognito &&
+                      actor?.id &&
+                      (actor.type !== "human" || sessionCreatorProfileId(actor))
+                      ? [actor]
+                      : [];
                   }),
               )),
         ];
@@ -164,6 +179,18 @@ export function createSessionRowCreatorIndex() {
       paths = undefined;
     },
   };
+}
+
+/** A row's creator, unless it is a human whose identity is not a Gateway profile. */
+function shareableCreator(row: Row | undefined) {
+  const actor = resolveSessionCreatorActor(row?.entry?.createdActor);
+  if (!actor) {
+    return undefined;
+  }
+  // Agent and system creators stay eligible; only a *human* creator needs a
+  // profile, because a channel/unknown human id is a chat handle rather than an
+  // account the operator can grant access to.
+  return actor.type !== "human" || sessionCreatorProfileId(actor) ? actor : undefined;
 }
 
 /** Capability policy consumes only the receipt-updated metadata projection. */
